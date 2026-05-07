@@ -1,0 +1,249 @@
+$ ctxgrd --root examples
+error[core.required-headings]: missing required H2 heading 'Decision'
+  --> adrs/ADR-099-broken-demo.md
+
+  help: add a `## Decision` section to the document body
+  note: required H2 headings: Status, Context, Decision, Consequences
+
+error[core.allowed-values]: metadata key 'status' has value 'cooking' not in allowed set [draft, accepted, rejected, superseded]
+  --> adrs/ADR-099-broken-demo.md:4:0
+      |
+    4 | status: cooking
+      | ^
+      |
+  help: change `status` to one of: draft, accepted, rejected, superseded
+
+error[core.dep-resolved]: depends_on entry 'PRD-999' does not resolve to a document in the run
+  --> adrs/ADR-099-broken-demo.md:5:0
+      |
+    5 | depends_on:
+      | ^
+      |
+  help: create the missing document (`ctxgrd new PRD "..."`) or remove `PRD-999` from `depends_on`
+
+error[core.cross-ref]: cross-reference 'ADR-042' does not resolve to a known document
+  --> adrs/ADR-099-broken-demo.md:18:5
+      |
+   18 | See ADR-042 for background — though ADR-042 does not exist in this
+      |     ^^^^^^^
+      |
+  help: use an existing ID, wrap in backticks `` `ADR-042` `` for a literal example,
+        or mark retired with `~~ADR-042~~`
+
+error[adr.consequences-non-empty]: ## Consequences section is empty or contains no bullet items
+  --> adrs/ADR-099-broken-demo.md:25:0
+      |
+   25 | ## Consequences
+      | ^
+      |
+
+error[core.cross-ref]: cross-reference 'ADR-7777' does not resolve to a known document
+  --> refs/Cargo.toml:12:15
+
+  help: use an existing ID, or add `ctxgrd: ignore-line` / `ctxgrd: ignore-next`
+        to suppress this match without disabling the rule
+
+error[core.cross-ref]: cross-reference 'ADR-8888' does not resolve to a known document
+  --> refs/lib.rs:10:38
+
+  help: use an existing ID, or add `ctxgrd: ignore-line` / `ctxgrd: ignore-next`
+        to suppress this match without disabling the rule
+
+error[core.cross-ref]: cross-reference 'ADR-9999' does not resolve to a known document
+  --> refs/main.go:10:22
+
+  help: use an existing ID, or add `ctxgrd: ignore-line` / `ctxgrd: ignore-next`
+        to suppress this match without disabling the rule
+
+found: 8 errors · 0 warnings
+$ echo $?
+1
+
+(Tip: `ctxgrd --format simple` emits the one-line `<loc>:<line>:<col>:
+<sev>: [<code>] <msg>` form for grep/awk pipelines. `--format json`
+emits a structured `{exit_code, diagnostics, kernel_messages,
+warnings}` object for tooling consumers. `rich` is the default,
+shown above.)
+
+───────────────────────────────────────────────────────────────────────────
+  Diagnostic walk-through — what each line means
+───────────────────────────────────────────────────────────────────────────
+
+ADR-099-broken-demo.md fires five diagnostics. The reference scanner
+fires three more from refs/. The reporter sorts by
+(location, line, col, code) per REP-001 — all eight appear grouped by
+file, then by line.
+
+┌─ Line 0 ──────────────────────────────────────────────────────────────┐
+│  core.required-headings                                               │
+│                                                                       │
+│  The kernel checked the ADR's H2 headings against the configured list │
+│  ["Status", "Context", "Decision", "Consequences"]. "Decision" is not │
+│  present. Emitted at line 0 because the missing heading has no line.  │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌─ Line 4 ──────────────────────────────────────────────────────────────┐
+│  core.allowed-values                                                  │
+│                                                                       │
+│  The unified metadata map (frontmatter ∪ source `extra`) has          │
+│  `status: cooking`, which is not in the configured allow-list         │
+│  {draft, accepted, rejected, superseded}. The rule reports at the     │
+│  line of the offending key. The same rule fires identically whether   │
+│  `status` came from YAML frontmatter (as here) or from a source-      │
+│  provided `extra` field (e.g. a JIRA ticket).                         │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌─ Line 5 ──────────────────────────────────────────────────────────────┐
+│  core.dep-resolved                                                    │
+│                                                                       │
+│  `depends_on` contains PRD-999 which is not among the documents in    │
+│  this run. ctxgrd cannot tell if PRD-999 was deleted, renamed, or     │
+│  never existed — only that nothing emits it.                          │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌─ Line 18 ─────────────────────────────────────────────────────────────┐
+│  core.cross-ref                                                       │
+│                                                                       │
+│  The body contains the token `ADR-042` (in "See ADR-042 for           │
+│  background"). No document in the run has id ADR-042. The rule        │
+│  reports at the token's line and column (18:5, anchored at the        │
+│  first occurrence — repeated mentions of the same missing id in       │
+│  the same body are deduped into one diagnostic).                      │
+│                                                                       │
+│  Note that the nearby `~~ADR-404~~` does NOT fire a diagnostic. It    │
+│  is wrapped in a code span (backticks), so the AST marks it `in_code` │
+│  and core.cross-ref skips it. A strikethrough `~~ADR-404~~` (without  │
+│  backticks) would also suppress the check — use that for retired       │
+│  references, backticks for literal examples in prose.                 │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌─ Line 25 ─────────────────────────────────────────────────────────────┐
+│  adr.consequences-non-empty                                           │
+│                                                                       │
+│  The `## Consequences` heading is present (so core.required-headings  │
+│  is satisfied for this heading), but the section contains no bullet   │
+│  or numbered list items. The external rule at                         │
+│  rules/adr/consequences-non-empty/run emitted the diagnostic and the  │
+│  host attached the rule code from the directory path.                 │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌─ Reference scanner: refs/Cargo.toml, refs/lib.rs, refs/main.go ───────┐
+│  core.cross-ref (via ADR-001 § REF-002 reference scanner)             │
+│                                                                       │
+│  ctxgrd.toml's `[references]\nscan = ["refs/**/*.toml", ...]` block   │
+│  walks non-markdown files for tokens of the form `<NS>-<number>`.     │
+│  Three tokens point at non-existent documents and fire core.cross-ref:│
+│                                                                       │
+│    refs/Cargo.toml:12:15  →  ADR-7777                                 │
+│    refs/lib.rs:10:38      →  ADR-8888                                 │
+│    refs/main.go:10:22     →  ADR-9999                                 │
+│                                                                       │
+│  Suppression: refs/main.go also contains `ADR-1234` on line 8, but    │
+│  the line above (line 7) is `// ctxgrd: ignore-next`, so the scanner  │
+│  drops it before emitting (REF-007). HTTP-style identifiers in        │
+│  refs/lib.rs are silently ignored because the HTTP namespace is not   │
+│  declared in ctxgrd.toml (REF-005's namespace-prefix filter).         │
+│                                                                       │
+│  Resolved references (PRD-001 in Cargo.toml, PMR-001 in lib.rs,       │
+│  ADR-001 in main.go) pass silently — they all resolve to documents    │
+│  found by the markdown walker.                                        │
+└───────────────────────────────────────────────────────────────────────┘
+
+───────────────────────────────────────────────────────────────────────────
+  Clean run (ADR-099 removed or fixed; refs/ deleted)
+───────────────────────────────────────────────────────────────────────────
+
+$ rm adrs/ADR-099-broken-demo.md
+$ rm -rf refs
+$ ctxgrd --root examples
+$ echo $?
+0
+
+ctxgrd emits no output on a clean run; exit 0 is the only signal.
+(If you only delete ADR-099 but keep refs/, you still see the three
+scanner diagnostics for the dangling references in that directory.)
+
+───────────────────────────────────────────────────────────────────────────
+  Zero-config run (ctxgrd.toml deleted)
+───────────────────────────────────────────────────────────────────────────
+
+$ mv ctxgrd.toml ctxgrd.toml.bak
+$ ctxgrd --root examples
+error[core.dep-resolved]: depends_on entry 'PRD-999' does not resolve to a document in the run
+  --> adrs/ADR-099-broken-demo.md:5:0
+      |
+    5 | depends_on:
+      | ^
+      |
+  help: create the missing document (`ctxgrd new PRD "..."`) or remove `PRD-999` from `depends_on`
+
+error[core.cross-ref]: cross-reference 'ADR-042' does not resolve to a known document
+  --> adrs/ADR-099-broken-demo.md:18:5
+      |
+   18 | See ADR-042 for background — though ADR-042 does not exist in this
+      |     ^^^^^^^
+      |
+  help: use an existing ID, wrap in backticks `` `ADR-042` `` for a literal example,
+        or mark retired with `~~ADR-042~~`
+
+found: 2 errors · 0 warnings
+$ echo $?
+1
+
+Without configuration, only the six non-parameterized core rules apply
+(frontmatter, id, id-unique, dep-resolved, dep-cycle, cross-ref). The
+parameterized rules (required-headings, required-metadata,
+allowed-values) and the external rules (adr.consequences-non-empty,
+adr.supersession-consistent) all sit out. ADR-099 still trips the two
+graph-integrity checks.
+
+───────────────────────────────────────────────────────────────────────────
+  Scaffold a new document
+───────────────────────────────────────────────────────────────────────────
+
+$ ctxgrd new ADR "Switch to append-only object storage"
+adrs/ADR-100-switch-to-append-only-object-storage.md
+
+The scaffolder reads [ADR] from ctxgrd.toml, picks the next unused ID
+(ADR-100: max of existing ADR-001 and ADR-099 is 99, so next is 100),
+stubs the required-metadata keys (id, title, status), and lays out an
+empty section per required-headings entry. The writer fills in the body.
+
+───────────────────────────────────────────────────────────────────────────
+  Rules introspection
+───────────────────────────────────────────────────────────────────────────
+
+$ ctxgrd rules --namespace ADR
+namespace  rule                         source    params
+ADR        adr.consequences-non-empty   ext:repo  {}
+ADR        adr.supersession-consistent  ext:repo  {}
+ADR        core.allowed-values          core      {"status":["draft","accepted","rejected","superseded"]}
+ADR        core.cross-ref               core      {}
+ADR        core.dep-cycle               core      {}
+ADR        core.dep-resolved            core      {}
+ADR        core.frontmatter             core      {}
+ADR        core.id                      core      {}
+ADR        core.id-unique               core      {}
+ADR        core.required-headings       core      {"headings":["Status","Context","Decision","Consequences"]}
+ADR        core.required-metadata       core      {"keys":["id","title","status"]}
+$ echo $?
+0
+
+───────────────────────────────────────────────────────────────────────────
+  Kernel error example (malformed config)
+───────────────────────────────────────────────────────────────────────────
+
+$ cat > ctxgrd.toml <<'EOF'
+[ADR]
+rules = ["core.required-headings"]
+
+[ADR."core.required-headings"]
+headings = 42
+EOF
+$ ctxgrd --root examples
+error: [cfg.rule-params-invalid] [ADR."core.required-headings"] params invalid: `headings` expected array of strings, got integer
+$ echo $?
+2
+
+Schema validation runs at startup before any document is read. A bad
+param shape produces exit code 2 — a kernel error, not a lint failure.

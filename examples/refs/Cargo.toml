@@ -1,0 +1,15 @@
+# Demo TOML file for the reference scanner.
+#
+# Two pointer mentions below: the resolved one passes silently
+# (PRD-001 exists at examples/prds/), the dangling one fires.
+
+[package]
+name = "audit-trail"
+version = "0.1.0"
+
+# Implements the requirements in PRD-001.
+# TODO: ship the deferred-replay subsystem (depends on the rejected
+# proposal at ADR-7777).
+
+[dependencies]
+serde = "1"

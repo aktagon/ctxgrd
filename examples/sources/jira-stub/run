@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# jira-stub source
+#
+# Emits two synthetic JIRA tickets as JSONL documents on stdout. A real
+# JIRA source would read CTXGRD_SOURCE_PARAMS (JSON) to get credentials
+# and a JQL query, then call the JIRA REST API. This stub exists to
+# demonstrate the wire contract without network access.
+#
+# Contract:
+#   - argv: none
+#   - env:  CTXGRD_SOURCE_PARAMS, CTXGRD_SOURCE_NAME
+#   - stdout: JSONL; one document envelope per line
+#   - exit 0: ran cleanly
+#   - exit non-zero: runtime error
+
+set -euo pipefail
+
+# In a real source this would be read from the config.
+project="$(printf '%s' "${CTXGRD_SOURCE_PARAMS:-{\}}" | jq -r '.project // "UNKNOWN"')"
+
+# Two canned tickets. Note `body` has no frontmatter fence — the kernel uses
+# the envelope `id` / `depends_on` directly for JIRA documents.
+cat <<EOF
+{"id":"JIRA-100","depends_on":["PRD-001"],"body":"# Fix audit retention cutoff\n\nThe retention worker (see ADR-001) drops events older than 7 years on a rolling basis, but the day-boundary off-by-one means Jan 1 events get dropped on Dec 31.\n","location":"https://jira.example.com/browse/JIRA-100","extra":{"project":"$project","status":"Open","assignee":"alice"}}
+{"id":"JIRA-101","depends_on":[],"body":"# Investigate projection lag after schema change\n\nRebuild takes ~4h at current event volume; see PMR-001 for a recent example.\n","location":"https://jira.example.com/browse/JIRA-101","extra":{"project":"$project","status":"In Progress","assignee":"bob"}}
+EOF

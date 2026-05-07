@@ -1,0 +1,124 @@
+# ctxgrd.toml — example configuration for the examples/ tree
+#
+# Each [<NAMESPACE>] heading assigns a flat list of rules to documents
+# whose id begins with that namespace. Sub-tables supply rule params.
+# Parameterized core.* rules read from the unified metadata map
+# (frontmatter ∪ source `extra`, frontmatter wins), so the same rule
+# works for local markdown docs and JIRA-sourced docs alike.
+
+# ───────────────────────── Sources ─────────────────────────
+
+# Activates the jira-stub source discovered at sources/jira-stub/run.
+# Without this table, the source exists on disk but is not invoked.
+[sources.jira-stub]
+project = "AUDIT"
+
+# ───────────────────────── References (ADR-001 § REF-002) ─────────────────────────
+
+# The reference scanner walks files matching `scan` for
+# `<NAMESPACE>-<number>` tokens. Each match becomes an anonymous
+# pointer that core.cross-ref checks against the document graph.
+# REF-004: do NOT include `**/*.md` here — markdown documents are
+# already tokenised by the markdown walker.
+[references]
+scan = [
+  "refs/**/*.toml",
+  "refs/**/*.go",
+  "refs/**/*.rs",
+]
+
+# ───────────────────────── ADR ─────────────────────────
+
+[ADR]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "adr.consequences-non-empty",
+  "adr.supersession-consistent",
+]
+
+[ADR."core.required-headings"]
+headings = ["Status", "Context", "Decision", "Consequences"]
+
+[ADR."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[ADR."core.allowed-values"]
+status = ["draft", "accepted", "rejected", "superseded"]
+
+# ───────────────────────── PRD ─────────────────────────
+
+[PRD]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[PRD."core.required-headings"]
+headings = ["Overview", "Goals", "Requirements", "Success metrics"]
+
+[PRD."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[PRD."core.allowed-values"]
+status = ["draft", "accepted", "rejected"]
+
+# ───────────────────────── PMR ─────────────────────────
+
+# post-mortem reports: same core rules but `incident_date` is a required
+# metadata key — demonstrating that required-metadata is not limited to
+# the standard keys (id/title/status).
+
+[PMR]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+]
+
+[PMR."core.required-headings"]
+headings = ["Summary", "Impact", "Timeline", "Root Cause", "Action Items"]
+
+[PMR."core.required-metadata"]
+keys = ["id", "title", "status", "incident_date"]
+
+# ───────────────────────── JIRA (via jira-stub source) ─────────────────────────
+
+# JIRA tickets come from the source envelope — no body frontmatter — but
+# their `extra` fields (status, assignee, …) flow into the unified
+# metadata map, so `core.required-metadata` and `core.allowed-values`
+# work the same way they do for file-based ADRs.
+[JIRA]
+rules = [
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[JIRA."core.required-metadata"]
+keys = ["status", "assignee"]
+
+[JIRA."core.allowed-values"]
+status = ["Open", "In Progress", "Closed"]

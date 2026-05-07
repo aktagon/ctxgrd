@@ -1,0 +1,13 @@
+# Deliberately overlapping [<NS>].paths to exercise ADR-007 § DOC-007
+# (cross-namespace path-conflict resolution). Both ADR and PRD claim
+# every file under docs/. A document with `id: ADR-001` resolves the
+# conflict via id-claim; a document without an id triggers a
+# `cfg.path-conflict` KernelMessage.
+
+[ADR]
+paths = ["docs/**"]
+rules = ["core.frontmatter", "core.id"]
+
+[PRD]
+paths = ["docs/**"]
+rules = ["core.frontmatter", "core.id"]

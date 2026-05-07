@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# adr.consequences-non-empty
+#
+# Emits an error diagnostic when an ADR's `## Consequences` section exists
+# but contains no bullet or numbered list item.
+#
+# Contract (ADR-002 batch mode):
+#   - stdin:  JSONL document records, one per line. Each line is
+#             {"path": "<abs path to body>", "context": {...}}.
+#   - argv:   none.
+#   - env:    CTXGRD_RULE_PARAMS (rule sub-table from ctxgrd.toml).
+#   - stdout: zero or more JSONL diagnostic records. Each record MUST
+#             include a "path" field matching one of the input paths.
+#             DO NOT emit a "code" field — the host attaches it from
+#             the rule directory.
+#   - exit 0: ran cleanly (with or without diagnostics)
+#   - exit non-zero: runtime error
+
+set -euo pipefail
+
+while IFS= read -r line; do
+  path=$(printf '%s' "$line" | jq -r '.path')
+
+  # Locate the line of the `## Consequences` heading, if any.
+  heading_line=$(grep -nE '^## Consequences[[:space:]]*$' "$path" | head -n 1 | cut -d: -f1 || true)
+
+  # If the heading is absent, core.required-headings will flag it —
+  # this rule only cares whether the section, when present, is empty.
+  if [ -z "$heading_line" ]; then
+    continue
+  fi
+
+  # Extract lines strictly below the heading up to the next `## ` heading or EOF.
+  section=$(awk '
+    NR > start && /^## / { exit }
+    NR > start          { print }
+  ' start="$heading_line" "$path")
+
+  # Any non-empty bullet (`-`, `*`, or numbered) satisfies the rule.
+  if printf '%s\n' "$section" | grep -qE '^[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+\S'; then
+    continue
+  fi
+
+  printf '{"path":%s,"severity":"error","message":"## Consequences section is empty or contains no bullet items","line":%s,"col":0}\n' \
+    "$(printf '%s' "$path" | jq -Rs .)" "$heading_line"
+done

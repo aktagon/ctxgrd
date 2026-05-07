@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# adr.supersession-consistent
+#
+# If a document's `status` is `superseded`, a `superseded_by` key MUST be
+# present in the metadata and MUST be a well-formed `<NAMESPACE>-<number>` ID.
+#
+# Reads the unified metadata map from the per-document context that
+# arrives inline on stdin. The kernel has already merged frontmatter +
+# source `extra`, so this rule works equally for local ADRs and
+# source-derived ADRs.
+#
+# The rule does NOT check that the superseded_by target exists — if the
+# writer lists the new doc in `depends_on`, `core.dep-resolved` handles
+# existence and `core.dep-cycle` handles cycles.
+#
+# Contract (ADR-002 batch mode):
+#   - stdin:  JSONL records of {"path": ..., "context": {...}} per doc.
+#   - argv:   none.
+#   - env:    CTXGRD_RULE_PARAMS.
+#   - stdout: JSONL diagnostics with a "path" field; no "code" field
+#             (the host attaches it).
+#   - exit 0: ran cleanly.
+
+set -euo pipefail
+
+while IFS= read -r line; do
+  path=$(printf '%s' "$line" | jq -r '.path')
+  status=$(printf '%s' "$line" | jq -r '.context.metadata.status // ""')
+  superseded_by=$(printf '%s' "$line" | jq -r '.context.metadata.superseded_by // ""')
+
+  # The rule only fires when status is exactly "superseded".
+  if [ "$status" != "superseded" ]; then
+    continue
+  fi
+
+  if [ -z "$superseded_by" ]; then
+    status_line=$(grep -n '^status:' "$path" 2>/dev/null | head -n 1 | cut -d: -f1 || true)
+    printf '{"path":%s,"severity":"error","message":"status is '\''superseded'\'' but metadata key '\''superseded_by'\'' is missing","line":%s,"col":0}\n' \
+      "$(printf '%s' "$path" | jq -Rs .)" "${status_line:-0}"
+    continue
+  fi
+
+  if ! printf '%s' "$superseded_by" | grep -qE '^[A-Z][A-Z0-9]*-[0-9]+$'; then
+    sb_line=$(grep -n '^superseded_by:' "$path" 2>/dev/null | head -n 1 | cut -d: -f1 || true)
+    printf '{"path":%s,"severity":"error","message":"superseded_by value %s is not a valid <NAMESPACE>-<number> ID","line":%s,"col":0}\n' \
+      "$(printf '%s' "$path" | jq -Rs .)" "$(printf '%s' "$superseded_by" | jq -Rs .)" "${sb_line:-0}"
+  fi
+done
