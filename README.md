@@ -6,6 +6,8 @@ A command-line linter for the structured markdown your team writes — ADRs, PRD
 
 ctxgrd checks the contracts between those documents. Cross-references that don't resolve. Dependency cycles. Frontmatter that doesn't match the schema. Broken IDs after a renumber. The kind of drift that nobody notices until an LLM reads it back.
 
+![ctxgrd demo](assets/demo.svg)
+
 ## How it works
 
 You write ADRs and PRDs. Files reference each other (`see ADR-007 § REF-005`). Source code references documents (`// per ADR-001`). Over time, those references rot.
