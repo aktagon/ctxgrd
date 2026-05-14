@@ -3,6 +3,10 @@
   "name": "ctxgrd",
   "version": "1.0.0",
   "description": "Official ctxgrd plugins for Claude Code.",
+  "owner": {
+    "name": "Aktagon",
+    "email": "christian@aktagon.com"
+  },
   "plugins": [
     {
       "name": "ctxgrd",

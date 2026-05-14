@@ -9,26 +9,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.0] — 2026-05-14
 
+> Headline: **Real-time document intelligence.** Connect editors to
+> the document graph. Diagnostics, go-to-definition, and completion
+> are supported in Neovim and Helix.
+
 ### Added
-- Language Server Protocol (LSP) server implementation (ADR-008). Provides real-time diagnostics, go-to-definition, and completion for the document graph via the `ctxgrd lsp` subcommand.
-- Neovim plugin. Includes a minimal Lua integration (`editors/nvim/lua/ctxgrd.lua`) to connect Neovim's LSP client to the `ctxgrd` server.
-- Claude Code plugin integration (`.claude-plugin/marketplace.json`). Extends the agent with `lint`, `new`, and `refs` skills.
-- `llms.txt` documentation index to improve discovery for LLMs and automated agents.
+
+- **LSP server implementation (ADR-008).** Provides real-time diagnostics and
+  navigation capabilities. Integrated via the `ctxgrd lsp` subcommand.
+- **Neovim plugin.** A minimal Lua integration bridging the Neovim LSP
+  client to the server.
+- **Claude Code plugin.** An official integration extending the agent with
+  `lint`, `new`, and `refs` skills.
+- **`llms.txt` index.** Provides a centralized discovery point for LLMs and automated agents.
+
+### Changed
+
+- **Nothing yet.**
 
 ## [0.4.0] — 2026-05-07
 
+> Headline: **first-touch is silent.** Integrate `ctxgrd` into any repository (e.g., Hugo,
+> Jekyll, design tokens, prompt files) without triggering false-positives on
+> non-document markdown. A `.md` file is evaluated as a document only when
+> it demonstrates explicit intent—either through an `id: <NS>-<N>` frontmatter field or a
+> `[<NS>].paths` glob match.
+
 ### Added
-- Intent-based document classification (ADR-007 § DOC-001). Markdown files are now classified as document candidates only if they contain an `id` matching `<NAMESPACE>-<number>` or if their file path matches a configured `[<NS>].paths` glob pattern. Other markdown files are skipped without producing diagnostics.
-- `[<NS>].paths` configuration setting. Accepts a list of gitignore-style glob patterns to map file locations to specific namespaces.
-- Auto-detection of paths in `ctxgrd init`. The command now searches for conventional directories (e.g., `docs/adrs/`) and pre-fills `[<NS>].paths` in the generated configuration, emitting a summary to `stderr`.
-- `cfg.path-conflict` diagnostic (DOC-007). Emits a configuration error if multiple namespaces claim the same file via path globs and the file lacks an explicit `id` frontmatter field. The file is excluded from rule execution.
-- Migration documentation stub at `docs/migration/body-headers-to-frontmatter.md` to resolve the initialization advisory link.
+
+- **Intent-based document classification (ADR-007 § DOC-001).** A `.md`
+  file is classified as a document candidate if and only if it has an `id` matching
+  `<NAMESPACE>-<number>` for a configured namespace, OR its location
+  matches a configured namespace's `[<NS>].paths` glob. Files
+  satisfying neither condition are skipped without triggering `core.frontmatter`,
+  `core.id`, or other diagnostics.
+- **`[<NS>].paths` configuration.** A list of gitignore-style globs
+  that declare which files belong to a namespace based on their location. This utilizes set
+  semantics and is order-independent.
+- **`ctxgrd init` paths pre-fill.** The `init` command identifies conventional
+  directories (e.g., `docs/adrs/`, `adrs/`) and pre-fills
+  `[<NS>].paths` for detected matches. It reports detected paths on
+  stderr.
+- **`cfg.path-conflict` `KernelMessage` (DOC-007).** When overlapping
+  `[<NS>].paths` globs from multiple namespaces claim the same file, ctxgrd
+  resolves the conflict using an explicit id-claim. If no id-claim is present, it emits a configuration
+  error during ingestion and excludes the file from rule execution.
+- **Migration recipe stub** at
+  `docs/migration/body-headers-to-frontmatter.md`. Resolves the EXT-003
+  initialization advisory link; the complete
+  example tracks as ADR-006 § EXT-004.
 
 ### Changed
-- Diagnostics for missing IDs (`core.id`) and missing frontmatter (`core.frontmatter`) now only trigger for files explicitly claimed by path rules.
-- Updated `DEFAULT_IGNORE_PATTERNS` to remove `**/CHANGELOG.md` and `**/README.md`, which are now naturally excluded by intent-based classification.
-- Updated `DEFAULT_IGNORE_PATTERNS` to include `**/log/**`, `**/logs/**`, and `**/tmp/**` to reduce file traversal overhead.
-- Updated `README.md` and `docs/namespaces.md` to prioritize documentation of the new intent-based file classification system.
+
+- **`core.id` (IdMissing) and `core.frontmatter` conditions.** These diagnostics now only fire for
+  files claimed by path. Escape clause instructions regarding
+  `[ignore].patterns` have been removed, as these diagnostics only apply to files
+  identified as ctxgrd documents by intent.
+- **`DEFAULT_IGNORE_PATTERNS`.** Removed `**/CHANGELOG.md`
+  and `**/README.md`. Intent-based classification renders these workarounds obsolete.
+- **`DEFAULT_IGNORE_PATTERNS`.** Added `**/log/**`,
+  `**/logs/**`, and `**/tmp/**` to optimize walker performance (similar to
+  `target/**` and `**/dist/**`).
+- **README.** Restructured to prioritize the "first-touch is silent" principle. The
+  intent-claim mechanisms (id-claim or path-claim) are now presented before
+  rule lists.
+- **`docs/namespaces.md`.** Rewritten to prioritize `[<NS>].paths`.
+  It documents the finalized decisions regarding negation (rejected in favor of `[ignore]`), absolute paths (rejected),
+  source-emitted documents (where `[<NS>].paths` does not apply), and
+  the precedence of `[ignore]` (which always overrides path claims).
+
+### Decisions captured (ADR-007)
+
+- OQ-1 resolved: Negation is not supported in `[<NS>].paths`.
+- OQ-3 resolved: Absolute paths are rejected.
+- OQ-4 resolved: Source-emitted documents are excluded from
+  path-classification.
+- OQ-5 resolved: `[ignore]` patterns take precedence over path-claims.
+- OQ-7 resolved: `init` announces pre-filled paths on stderr.
+- OQ-8 resolved: `cfg.path-conflict` uses the `KernelMessage`
+  channel.
+
+OQ-2 (LSP behavior on file rename) and OQ-6 (CLI override for
+`[<NS>].paths`) remain explicitly deferred.
+
+### Verification
+
+- 307 tests across 5 suites: 295 lib, 4 init_body_headers, 4
+  fixture_smoke, 2 intent_classification (verifying Hugo README + DESIGN.md
+  silence), 2 path_conflict (validating cross-namespace overlap →
+  `cfg.path-conflict`).
+- `cargo clippy --lib --no-deps -- -D warnings` reports clean.
+- `make check` reports clean (6 documents · 9 rules · 0 diagnostics).
 
 [Unreleased]: https://github.com/aktagon/ctxgrd/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/aktagon/ctxgrd/compare/v0.4.0...v0.5.0
