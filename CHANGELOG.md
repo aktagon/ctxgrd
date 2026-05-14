@@ -9,10 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.0] — 2026-05-14
 
-> Headline: **Real-time document intelligence.** Connect editors to
-> the document graph. Diagnostics, go-to-definition, and completion
-> are supported in Neovim and Helix.
-
 ### Added
 
 - **LSP server implementation (ADR-008).** Provides real-time diagnostics and
@@ -28,12 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Nothing yet.**
 
 ## [0.4.0] — 2026-05-07
-
-> Headline: **first-touch is silent.** Integrate `ctxgrd` into any repository (e.g., Hugo,
-> Jekyll, design tokens, prompt files) without triggering false-positives on
-> non-document markdown. A `.md` file is evaluated as a document only when
-> it demonstrates explicit intent—either through an `id: <NS>-<N>` frontmatter field or a
-> `[<NS>].paths` glob match.
 
 ### Added
 

@@ -58,7 +58,9 @@ require('ctxgrd').setup({
 
 ## Troubleshooting
 
-Run `:LspInfo` in a markdown file to check if `ctxgrd` is attached.
+Check if the LSP is attached by running:
+`:lua print(vim.inspect(vim.lsp.get_clients()))` (Neovim 0.10+) or `:lua print(vim.inspect(vim.lsp.get_active_clients()))` (older versions).
+If you use `nvim-lspconfig`, you can also use `:LspInfo`.
 Check `:messages` for any error output from the server.
 
 ## Documentation Index
