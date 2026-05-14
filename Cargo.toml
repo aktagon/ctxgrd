@@ -1,6 +1,6 @@
 [package]
 name = "ctxgrd"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Document linter with pluggable sources and rules"
@@ -73,6 +73,8 @@ globset = "0.4"
 grep-searcher = "0.1"
 grep-regex = "0.1"
 ignore = "0.4"
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 insta = "1"

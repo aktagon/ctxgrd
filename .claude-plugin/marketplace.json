@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "ctxgrd",
+  "version": "1.0.0",
+  "description": "Official ctxgrd plugins for Claude Code.",
+  "plugins": [
+    {
+      "name": "ctxgrd",
+      "description": "Structured markdown record linting and navigation.",
+      "source": "./plugins/ctxgrd",
+      "category": "development"
+    }
+  ]
+}

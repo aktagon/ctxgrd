@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-14
+
+> Headline: **Real-time document intelligence.** Connect your editor to
+> the document graph. Diagnostics, go-to-definition, and completion
+> now work in Neovim and Helix.
+
+### Added
+
+- **LSP server implementation (ADR-008).** Real-time diagnostics and
+  navigation. Integrated via the `ctxgrd lsp` subcommand.
+- **Neovim plugin.** Minimal Lua integration. Bridges Neovim's LSP
+  client to the server.
+- **Claude Code plugin.** Official integration. Extends the agent with
+  `lint`, `new`, and `refs` skills.
+- **`llms.txt` index.** Discovery point for LLMs and automated agents.
+
+### Changed
+
+- **Whitelist-based release pipeline.** `scripts/publish-release.sh`
+  now uses an explicit allowlist. Fail-closed security for public
+  releases.
+
 ## [0.4.0] — 2026-05-07
 
 > Headline: **first-touch is silent.** Drop `ctxgrd` into any repo (Hugo,

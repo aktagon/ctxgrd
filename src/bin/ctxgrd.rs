@@ -175,6 +175,8 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Rich)]
         format: Format,
     },
+    /// Start the Language Server Protocol (LSP) server over stdio.
+    Lsp,
 }
 
 /// End-user guides embedded at compile time so `ctxgrd docs <topic>`
@@ -238,7 +240,14 @@ fn dispatch() -> Result<ExitCode> {
         ),
         Cmd::Docs { topic } => docs_cmd(topic.as_deref()),
         Cmd::Refs { id, format } => refs_cmd(&cli.root, &id, format),
+        Cmd::Lsp => lsp_cmd(),
     }
+}
+
+#[tokio::main]
+async fn lsp_cmd() -> Result<ExitCode> {
+    ctxgrd::lsp::run_server().await;
+    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
 }
 
 fn docs_cmd(topic: Option<&str>) -> Result<ExitCode> {
