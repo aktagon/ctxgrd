@@ -25,9 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Whitelist-based release pipeline.** `scripts/publish-release.sh`
-  now uses an explicit allowlist. Fail-closed security for public
-  releases.
+- **Nothing yet.**
 
 ## [0.4.0] — 2026-05-07
 
