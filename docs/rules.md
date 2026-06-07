@@ -83,12 +83,12 @@ Each line on stdin is a JSON object with two top-level fields:
 
 ```json
 {
-  "path": "/abs/adrs/ADR-001-use-event-sourcing-for-audit.md",
+  "path": "/abs/adrs/001-use-event-sourcing-for-audit.md",
   "context": {
     "id": "ADR-001",
     "namespace": "ADR",
     "number": 1,
-    "location": "adrs/ADR-001-use-event-sourcing-for-audit.md",
+    "location": "adrs/001-use-event-sourcing-for-audit.md",
     "depends_on": ["PRD-001"],
     "metadata": {
       "id": "ADR-001",

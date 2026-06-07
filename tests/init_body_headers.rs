@@ -164,10 +164,84 @@ fn init_pre_fills_paths_for_multiple_dirs_in_same_namespace() {
 }
 
 #[test]
+fn init_lists_available_packs_with_add_instruction() {
+    // ADR-025 § PKD-003: init advertises discoverable packs by name with
+    // the `pack add` command, so a new user discovers the adoption on-ramp.
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::cargo_bin("ctxgrd")
+        .expect("binary built")
+        .args(["--root", tmp.path().to_str().unwrap(), "init"])
+        .output()
+        .expect("ctxgrd executes");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stdout.contains("Available packs:"),
+        "init shows available-packs header; stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ctxgrd pack add <name>"),
+        "init shows pack-add instruction in Next steps; stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("project-docs") && stdout.contains("agents"),
+        "init lists both built-in packs; stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn init_with_pack_suppresses_available_packs_table() {
+    // ADR-025 § PKD-004: when --pack already applied a pack, don't
+    // re-advertise the available-packs table.
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::cargo_bin("ctxgrd")
+        .expect("binary built")
+        .args([
+            "--root",
+            tmp.path().to_str().unwrap(),
+            "init",
+            "--pack",
+            "agents",
+        ])
+        .output()
+        .expect("ctxgrd executes");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !stdout.contains("Available packs"),
+        "table suppressed after --pack; stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn init_stdout_omits_available_packs_table() {
+    // ADR-025 § PKD-004: --stdout output stays pipe-clean (valid TOML
+    // only) — no pack table mixed in.
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::cargo_bin("ctxgrd")
+        .expect("binary built")
+        .args(["--root", tmp.path().to_str().unwrap(), "init", "--stdout"])
+        .output()
+        .expect("ctxgrd executes");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !stdout.contains("Available packs"),
+        "--stdout must not include the pack table; stdout was:\n{stdout}"
+    );
+}
+
+#[test]
 fn init_outputs_fire_even_when_toml_already_exists() {
-    // ADR 006 § EXT-003 + ADR 007 § DOC-005: both stderr surfaces
-    // must still reach the user when init refuses to write
-    // ctxgrd.toml (e.g., file exists, no --force).
+    // `init` is a no-op when ctxgrd.toml already exists (idempotent).
+    // Exit 0; advisory still fires on stderr; "Pre-filled" is suppressed
+    // because nothing was written.
     let tmp = fixture_into_tempdir("init-body-headers");
     fs::write(tmp.path().join("ctxgrd.toml"), b"# pre-existing\n").unwrap();
 
@@ -177,19 +251,24 @@ fn init_outputs_fire_even_when_toml_already_exists() {
         .output()
         .expect("ctxgrd executes");
 
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
     let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
 
-    assert_ne!(
+    assert_eq!(
         output.status.code(),
         Some(0),
-        "init must refuse without --force"
+        "init exits 0 when toml already exists (idempotent no-op)"
+    );
+    assert!(
+        stdout.contains("already exists — left unchanged"),
+        "no-op message goes to stdout; stdout was:\n{stdout}"
     );
     assert!(
         stderr.contains("0001-record-architecture-decisions.md"),
-        "advisory still fires on the failure path; stderr was:\n{stderr}"
+        "advisory still fires on the no-op path; stderr was:\n{stderr}"
     );
     assert!(
-        stderr.contains("Pre-filled [ADR].paths from detected docs/adr/."),
-        "announcement still fires on the failure path; stderr was:\n{stderr}"
+        !stderr.contains("Pre-filled"),
+        "Pre-filled suppressed when nothing was written; stderr was:\n{stderr}"
     );
 }

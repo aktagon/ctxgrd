@@ -1,6 +1,6 @@
 [package]
 name = "ctxgrd"
-version = "0.5.0"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Document linter with pluggable sources and rules"
@@ -80,3 +80,17 @@ tokio = { version = "1", features = ["full"] }
 insta = "1"
 assert_cmd = "2"
 predicates = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

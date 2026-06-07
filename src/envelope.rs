@@ -27,7 +27,7 @@ use crate::id::{DocumentId, ParseIdError};
 /// trio and have the kernel fill in the rest — one less thing for shell
 /// script authors to get right.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Envelope {
+pub(crate) struct Envelope {
     pub id: String,
     pub body: String,
     pub location: String,
@@ -46,7 +46,7 @@ pub struct Envelope {
 /// the routing; this enum just names what went wrong.
 #[derive(Debug, Clone, Error)]
 #[non_exhaustive]
-pub enum EnvelopeError {
+pub(crate) enum EnvelopeError {
     #[error("envelope id {raw_id:?} does not match the required pattern")]
     IdMalformed { raw_id: String },
     /// Body frontmatter was present but failed to parse.
@@ -68,7 +68,7 @@ impl Envelope {
     /// 3. Merge `extra ⊕ body.frontmatter` with frontmatter winning
     ///    on key conflict (CORE-002).
     /// 4. Copy the AST through unchanged.
-    pub fn into_document(self) -> Result<Document, EnvelopeError> {
+    pub(crate) fn into_document(self) -> Result<Document, EnvelopeError> {
         let id: DocumentId =
             self.id
                 .parse()
@@ -76,10 +76,9 @@ impl Envelope {
                     raw_id: self.id.clone(),
                 })?;
 
-        let (metadata, frontmatter_lines) = match Frontmatter::parse(&self.body) {
-            Ok(fm) => {
+        let (metadata, frontmatter_lines) = match Frontmatter::parse_with_lines(&self.body) {
+            Ok((fm, lines)) => {
                 let merged = frontmatter::merge_metadata(&self.extra, &fm.metadata);
-                let lines = frontmatter::frontmatter_key_lines(&self.body);
                 (merged, lines)
             }
             Err(FrontmatterError::MissingFence) => (self.extra.clone(), BTreeMap::new()),

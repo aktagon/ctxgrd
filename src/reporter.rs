@@ -50,7 +50,7 @@ pub fn render(diagnostics: &[Diagnostic]) -> String {
 ///
 /// ```text
 /// error[core.cross-ref]: cross-reference 'ADR-042' does not resolve…
-///   --> adrs/ADR-099-broken-demo.md:18:5
+///   --> adrs/099-broken-demo.md:18:5
 ///    |
 /// 18 | See ADR-042 for background — though ADR-042 does not exist…
 ///    |     ^^^^^^^
@@ -83,6 +83,25 @@ pub fn render_rich(diagnostics: &[Diagnostic], root: &Path) -> String {
         plural(warnings, "warning"),
     );
     out
+}
+
+/// The success trailer (`ok: N documents · M rules · 0 diagnostics`),
+/// or `None` when any diagnostic was emitted.
+///
+/// Warnings do not change the exit status, but they *are* diagnostics —
+/// printing `ok: … 0 diagnostics` after a `found: … 1 warning` trailer
+/// contradicts itself. Gating on `diagnostics.is_empty()` keeps the two
+/// trailers mutually exclusive: a clean run shows `ok:`, any run with
+/// diagnostics shows only the `found:` line from [`render_rich`].
+pub fn ok_summary(documents: usize, rules: usize, diagnostics: &[Diagnostic]) -> Option<String> {
+    if !diagnostics.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "ok: {} · {} · 0 diagnostics",
+        plural(documents, "document"),
+        plural(rules, "rule"),
+    ))
 }
 
 /// `"1 error"` vs `"2 errors"` — used by trailers and the `ok:` summary
@@ -259,6 +278,22 @@ mod tests {
             note: None,
             span_len: None,
         }
+    }
+
+    #[test]
+    fn ok_summary_suppressed_when_warnings_present() {
+        // A warning-only run must NOT print the `ok: … 0 diagnostics`
+        // trailer — it would contradict the `found: … 1 warning` line.
+        let w = Diagnostic::warning("agents.context-budget", "cli/CLAUDE.md", 0, 0, "x");
+        assert_eq!(ok_summary(6, 9, std::slice::from_ref(&w)), None);
+    }
+
+    #[test]
+    fn ok_summary_present_when_clean() {
+        assert_eq!(
+            ok_summary(6, 9, &[]).as_deref(),
+            Some("ok: 6 documents · 9 rules · 0 diagnostics"),
+        );
     }
 
     #[test]

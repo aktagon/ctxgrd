@@ -31,6 +31,10 @@ use crate::diagnostic::KernelMessage;
 #[derive(Debug, Default, Clone)]
 pub struct PathClaims {
     by_namespace: BTreeMap<String, globset::GlobSet>,
+    /// Sorted, deduplicated literal directory prefixes derived from all
+    /// `[<NS>].paths` globs. Used by the markdown walker to exempt
+    /// path-claimed subtrees from `[ignore]` pruning (ADR-023 § PKC-006).
+    prefix_dirs: Vec<std::path::PathBuf>,
 }
 
 impl PathClaims {
@@ -42,7 +46,10 @@ impl PathClaims {
     /// having to spell out the field by hand whenever the type
     /// gains a new internal slot.
     pub fn empty() -> Self {
-        Self::default()
+        Self {
+            by_namespace: BTreeMap::new(),
+            prefix_dirs: Vec::new(),
+        }
     }
 
     /// Aggregate every `[<NS>].paths` GlobSet from `config` into a
@@ -53,7 +60,29 @@ impl PathClaims {
             .iter()
             .filter_map(|(name, ns)| ns.paths.as_ref().map(|g| (name.clone(), g.clone())))
             .collect();
-        Self { by_namespace }
+
+        // Derive prefix dirs from all path_patterns (ADR-023 § PKC-006).
+        let mut prefix_dirs: Vec<std::path::PathBuf> = config
+            .namespaces
+            .values()
+            .flat_map(|ns| ns.path_patterns.iter())
+            .map(|p| literal_prefix(p))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        prefix_dirs.sort();
+        prefix_dirs.dedup();
+
+        Self {
+            by_namespace,
+            prefix_dirs,
+        }
+    }
+
+    /// The sorted, deduplicated literal directory prefixes derived from
+    /// all configured `[<NS>].paths` globs. Used by the markdown walker
+    /// to exempt these directories from `[ignore]` pruning.
+    pub fn prefix_dirs(&self) -> &[std::path::PathBuf] {
+        &self.prefix_dirs
     }
 
     /// `true` iff no namespace has a configured `paths` glob.
@@ -82,6 +111,33 @@ impl PathClaims {
             .filter(move |(_, globs)| globs.is_match(&path))
             .map(|(name, _)| name.as_str())
     }
+}
+
+/// Extract the literal directory prefix from a glob pattern.
+///
+/// Takes path components up to (but not including) the first component
+/// that contains a glob character (`*`, `?`, `[`, `{`). Returns an empty
+/// `PathBuf` when the pattern starts with a glob.
+///
+/// Examples:
+/// - `".claude/skills/**/SKILL.md"` → `PathBuf::from(".claude/skills")`
+/// - `"CLAUDE.md"` → `PathBuf::from("CLAUDE.md")` (bare filename retained as prefix)
+/// - `"TODO.md"` → `PathBuf::from("TODO.md")` (bare filename retained as prefix)
+/// - `"**/*.md"` → `PathBuf::new()` (starts with glob)
+///
+/// Note: bare filenames produce their own name as the prefix (not an empty
+/// path). The ancestor check `prefix.starts_with(rel)` in the walker
+/// handles them correctly — `"CLAUDE.md".starts_with("CLAUDE.md")` is true.
+pub(crate) fn literal_prefix(pattern: &str) -> std::path::PathBuf {
+    let mut prefix = std::path::PathBuf::new();
+    for component in std::path::Path::new(pattern).components() {
+        let s = component.as_os_str().to_string_lossy();
+        if s.contains(['*', '?', '[', '{']) {
+            break;
+        }
+        prefix.push(component);
+    }
+    prefix
 }
 
 /// A file claimed by two or more namespaces' `[<NS>].paths` globs

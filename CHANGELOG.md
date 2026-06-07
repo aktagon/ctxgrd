@@ -7,6 +7,186 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Nothing yet.**
+
+## [0.14.0] — 2026-06-07
+
+### Fixed
+
+- **The walker no longer lints files the config never claimed.** A path-claim
+  into an ignored directory (`.claude/skills/**/SKILL.md`) exempted the whole
+  subtree from `[ignore]`, so a nested repo's ADRs were linted under the outer
+  config's conventions. Now only files a claim glob actually matches escape
+  the ignore set; directories stay traversable, so deep claims remain
+  reachable.
+- **`agents.context-headings` and `agents.context-budget` agree on nested
+  instruction files.** The headings rule demanded a literal `@TODO.md`, which
+  in a nested `cli/CLAUDE.md` points at a file that does not exist — and the
+  budget rule warned about that. No text satisfied both rules. Imports now
+  resolve relative to the importing file, so `@../TODO.md` passes, and the
+  help text suggests the right relative path for the file's depth. The import
+  must sit on its own line; the help says so.
+- **Code examples are not imports.** Both import scanners skip `@`-tokens
+  inside fenced blocks and inline code spans. A Python decorator in a
+  CLAUDE.md example (`@mcp.tool(`) no longer warns as a dangling import.
+- **The summary counts every file that was linted.** Path-claimed files
+  (CLAUDE.md, AGENTS.md, TODO.md) now appear in the documents and rules
+  counts, and the `ok: … 0 diagnostics` trailer no longer prints after a
+  warning-only run. Fixing six errors in CLAUDE.md and then reading
+  `ok: 3 documents` was the exact inverse of the truth.
+- **Glob docs stop claiming gitignore syntax.** `[ignore].patterns` and
+  `[<NS>].paths` compile as globset: anchored at the lint root, `*` crosses
+  `/`, no `!` negation. The help text and `docs/namespaces.md` now say what
+  the matcher does instead of what it resembles.
+
+## [0.13.0] — 2026-06-05
+
+### Changed
+
+- **`ctxgrd init` defaults to the full document shapes.** For namespaces the
+  built-in `project-docs` pack defines (ADR, PRD, RFC), the generated
+  `required-headings` now use the pack's full requirement-driven shape; the
+  conventional minimal shape (Nygard-style ADR, four-section PRD) rides along
+  as a commented alternative the user can swap in. Namespaces the pack does
+  not cover (DDR, RUN, PMR) keep their conventional shape unchanged.
+- **`project-docs` pack: PRD headings gain `Definition of Done`.** The
+  canonical PRD shape is now Context / Goals / Non-goals / User stories /
+  Requirements / Definition of Done / Open Questions / References / Change log.
+- **`project-docs` pack: ADR `allowed-values.status` gains `rejected`,**
+  matching the status vocabulary the project's own ADRs already use.
+
+### Added
+
+- **New built-in `ops` pack: `RUN` and `PMR` namespaces,** grounded in
+  Google's SRE Book. Runbooks (`docs/runbooks/**`: Trigger / Prerequisites /
+  Steps / Rollback / Verification; status `draft`/`active`/`deprecated`) and
+  postmortems (`docs/pmrs/**`: headings follow the blameless-postmortem
+  template from SRE Book Appendix D — Summary / Impact / Root Causes /
+  Trigger / Resolution / Detection / Action Items / Lessons Learned /
+  Timeline; status `draft`/`in-review`/`complete`; `incident_date` required).
+  Previously these record types existed only in the init catalogue; the
+  `ops` pack now owns them. `project-docs` is unchanged from 0.12.0.
+- **Drift-guard test** (`tests/dogfood_pack_drift.rs`) pinning the repo's own
+  `ctxgrd.toml` ADR/PRD shape tables to the `project-docs` pack, so the
+  dogfood config and the pack can no longer diverge silently.
+
+## [0.12.0] — 2026-06-05
+
+One consolidated release. The internal version moved through 0.6.0–0.11.1
+without a tag, so this entry describes the net change since 0.5.0.
+
+### Added
+
+- **Rule packs (ADR-013).** A pack is a reusable bundle of namespace config
+  plus the external rule scripts it needs. `ctxgrd pack add <name>` appends the
+  pack's `[<NAMESPACE>]` blocks to your `ctxgrd.toml` and copies its rule
+  scripts, then walks away — there is no runtime tie, so linting behaves
+  identically whether or not the pack stays on disk. Each written block carries
+  a `# pack: <name>` provenance comment, existing namespace blocks are never
+  clobbered, and `--dry-run` prints what would change without touching a file.
+- **`ctxgrd pack list` / `pack show`.** Two read-only commands that never modify
+  config. `list` shows every discoverable pack and its source; `show <name>`
+  prints the namespaces, rules, and scripts a pack defines before you adopt it.
+- **`ctxgrd init --pack <names>`.** Sugar for the first-run case — equivalent to
+  `init` followed by `pack add` for each comma-separated name.
+- **Three built-in packs (ADR-023).** `project-docs` stands up the `ADR`,
+  `PRD`, `RFC`, and `BUG` doc types with status vocabularies and required
+  headings, plus a path-claimed `TODO` namespace for the repo-root `TODO.md`.
+  `agents` bundles everything a coding agent reads, is driven by, and reuses:
+  `AGENTS` (the always-loaded `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
+  instruction files), `SKILLS` (`SKILL.md` files), and the id-claimed `SPEC`,
+  `TASK`, and `PROMPT` doc types. `design` claims `DESIGN.md` design-token
+  sheets. Path-claimed namespaces fire on adoption; id-claimed ones activate
+  when you author a document.
+- **Agent-context rules (ADR-020, ADR-021).** Compiled-in rules for the
+  agent's own context files. Editing the always-loaded instruction files busts
+  the prompt cache, so volatile state does not belong there:
+  `agents.context-headings` errors on a `Current State` or `TODO` heading and
+  requires an `@TODO.md` import when a root `TODO.md` exists;
+  `agents.context-budget` warns on a dangling `@import` and an over-budget
+  file (`max_words`); `agents.context-cache` warns, in commit context only, on
+  cache-busting edits and churn (`churn_min_hours`); `todo.freshness` requires
+  a `Last updated: YYYY-MM-DD` line and warns once stale (`stale_days`,
+  default 30); `todo.structure` requires a `### TODO` checklist and asks for a
+  `### Context` section. Opt-in `todo.sections` enforces a strict
+  Now/Next/Later/Done shape instead. `ctxgrd rules` reports all of them with
+  source `pack`.
+- **Agent-build rules (ADR-022).** `spec.requires-prd` errors when a SPEC's
+  `depends_on` names no PRD; opt-in `tasks.files-allowed` warns when a path
+  under a TASK's `Files allowed` heading resolves nowhere;
+  `skills.frontmatter` errors when a `SKILL.md` lacks a non-empty `name` or
+  `description`.
+- **`ears.clause-syntax` (ADR-031).** An EARS clause-grammar rule: each list
+  item carrying an `EARS-<NN>` / `EARS-<NN>.<M>` id under a `Requirements`
+  heading must parse as one of the six EARS patterns (ubiquitous,
+  event-driven, unwanted-behavior, state-driven, optional-feature, complex).
+  The diagnostic names the defect — missing `shall`, missing trigger comma,
+  lowercase keyword — so an agent can self-correct. Self-gating: bullets
+  without an `EARS-` id are skipped. Default in the `agents` pack's `[SPEC]`
+  and the `project-docs` pack's `[PRD]`; fires in any namespace that lists it.
+- **`core.requirement-ref` + `todo.listed` (ADR-026).** `core.requirement-ref`
+  scans `**Satisfies:**` / `**Addressed by:**` list items and warns when a
+  requirement-ID token does not resolve. `todo.listed` warns when a document
+  whose `status` is not terminal is missing from the repo-root `TODO.md`;
+  available globally or per namespace.
+- **`design.section-order` + `design.token-ref` (ADR-027).**
+  `design.section-order` errors when a recognized `DESIGN.md` section heading
+  is out of canonical order or duplicated; `design.token-ref` warns when a
+  `{path.to.token}` reference in frontmatter points at no defined token.
+- **Builtin-rule registry (ADR-024).** All compiled-in rules are defined once
+  in `BUILTIN_RULES`; the resolver allow-list, dispatch tables, reserved rule
+  prefixes, and `ctxgrd rules` descriptions derive from it, so the registry
+  and the dispatch cannot drift.
+- **`ctxgrd list`.** A document-inventory command that lists ingested documents
+  grouped by namespace (`rich` / `markdown` / `json` output).
+- **`ctxgrd hooks install` + CI guide.** Installs a pre-commit git hook;
+  `docs/ci.md` covers GitHub Actions, the pre-commit framework, and the LSP
+  server.
+- **Pack discovery from three sources.** Built-in (compiled into the binary),
+  `~/.ctxgrd/packs/*` (per-user), and `./packs/*` (per-repo). The more local
+  source wins on name collision. Committing `./packs/<name>/` to a repository is
+  how a team distributes a convention — git is the channel, no registry needed.
+- **`docs/packs.md`** — the pack guide, also at `ctxgrd docs packs`.
+
+### Changed
+
+- **Unconfigured roots fail fast.** Linting a root without a `ctxgrd.toml`
+  now exits with `cfg.missing` instead of passing silently — a green run no
+  longer means "nothing was checked."
+- **`cfg.rule-unknown` downgraded from kernel error to warning.** An unknown
+  rule code is skipped instead of aborting the run, and the message suggests
+  `ctxgrd pack add <name>` when a discoverable pack provides the rule
+  (ADR-025).
+- **`ctxgrd init` output redesigned (ADR-025).** A gh-style summary table and
+  aligned next-step hints replace the prose dump.
+- **Single-pass ingest (ADR-029).** Frontmatter is parsed once per file with
+  a key-to-line map, and cross-ref / requirement-ref token extraction moved
+  to parse time — rules read the shared `Document`, never re-parse the body.
+- **Doc filenames standardized to `NNN-slug.md`** across scaffolding and the
+  `examples/` fixture.
+
+### Fixed
+
+- **`design.token-ref` no longer fires on composite-token references
+  (ADR-027 § DES-003).** The rule previously required a `{path.to.token}`
+  reference to resolve to a _scalar_, but the DESIGN.md spec lets a component
+  property reference a whole composite token (e.g. `typography: "{typography.label}"`
+  where `typography.label` is a `{fontFamily, fontSize, …}` map). Conformant
+  files failed, and the only workaround was to flatten structured tokens into
+  opaque CSS strings. Resolution is now existence-based: a path landing on any
+  defined node (scalar or group) resolves; only a path that points at nothing
+  warns. Diagnostics now anchor to the offending key's front-matter line
+  instead of `0,0`, and the message reads "points at no defined token."
+
+### Verification
+
+- 455 tests (410 lib + 45 integration) pass; `cargo clippy --lib --no-deps
+-- -D warnings` reports clean.
+- `make check` self-lint reports clean (33 documents · 27 rules ·
+  0 diagnostics).
+
 ## [0.5.0] — 2026-05-14
 
 ### Added
@@ -91,6 +271,8 @@ OQ-2 (LSP behavior on file rename) and OQ-6 (CLI override for
 - `cargo clippy --lib --no-deps -- -D warnings` reports clean.
 - `make check` reports clean (6 documents · 9 rules · 0 diagnostics).
 
-[Unreleased]: https://github.com/aktagon/ctxgrd/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/aktagon/ctxgrd/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/aktagon/ctxgrd/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/aktagon/ctxgrd/compare/v0.5.0...v0.12.0
 [0.5.0]: https://github.com/aktagon/ctxgrd/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/aktagon/ctxgrd/releases/tag/v0.4.0

@@ -14,7 +14,9 @@
 //! structurally: these functions never see the raw body string.
 
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde_json::Value;
 
 use crate::dag::{self, Cycle};
@@ -42,7 +44,7 @@ const ID_REGEX_NOTE: &str = "id must match the pattern `<NAMESPACE>-<number>`, w
 /// ARE ctxgrd documents, so suggesting the user silence them via
 /// `[ignore]` would be misleading. Path-claimed files should fix the
 /// id; non-claimed files don't reach this path at all.
-pub fn parse_diagnostic_to_diagnostic(p: &ParseDiagnostic) -> Diagnostic {
+pub(crate) fn parse_diagnostic_to_diagnostic(p: &ParseDiagnostic) -> Diagnostic {
     match &p.kind {
         ParseDiagnosticKind::Frontmatter(msg) => Diagnostic::error(
             "core.frontmatter",
@@ -85,7 +87,7 @@ pub fn parse_diagnostic_to_diagnostic(p: &ParseDiagnostic) -> Diagnostic {
 /// location (not one per group) so every offending file is named
 /// in the report. The reporter's sort brings them together
 /// automatically.
-pub fn id_unique(docs: &[Document]) -> Vec<Diagnostic> {
+pub(crate) fn id_unique(docs: &[Document]) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for collision in document::find_id_collisions(docs) {
         let mates = collision.locations.to_vec();
@@ -115,7 +117,7 @@ pub fn id_unique(docs: &[Document]) -> Vec<Diagnostic> {
 
 /// `core.dep-resolved` — `depends_on` entries that don't match any
 /// document in the run.
-pub fn dep_resolved(docs: &[Document]) -> Vec<Diagnostic> {
+pub(crate) fn dep_resolved(docs: &[Document]) -> Vec<Diagnostic> {
     dag::unresolved_refs(docs)
         .into_iter()
         .map(|r| {
@@ -151,7 +153,7 @@ pub fn dep_resolved(docs: &[Document]) -> Vec<Diagnostic> {
 
 /// `core.dep-cycle` — self-edges (one diagnostic per doc) and
 /// non-trivial SCCs (one diagnostic per SCC, naming all members).
-pub fn dep_cycle(docs: &[Document]) -> Vec<Diagnostic> {
+pub(crate) fn dep_cycle(docs: &[Document]) -> Vec<Diagnostic> {
     dag::cycles(docs)
         .into_iter()
         .map(|cycle| match cycle {
@@ -224,7 +226,7 @@ pub fn dep_cycle(docs: &[Document]) -> Vec<Diagnostic> {
 /// most one diagnostic, anchored at the first occurrence. Repeat
 /// mentions of the same missing id in a single body don't flood the
 /// report.
-pub fn cross_ref(
+pub(crate) fn cross_ref(
     docs: &[Document],
     declared_namespaces: &BTreeSet<&str>,
     references: &[crate::reference::Reference],
@@ -323,6 +325,107 @@ fn split_token(token: &str) -> Option<(&str, u32)> {
     Some((ns, num))
 }
 
+fn requirement_id_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Z]{2,}-\d{3,}").expect("valid regex"))
+}
+
+/// `core.requirement-ref` — opt-in rule that resolves requirement references
+/// to requirement definitions across the linted corpus.
+///
+/// **Pass 1.** Collect every heading whose text *starts with* a token
+/// matching `[A-Z]{2,}-\d{3,}` (e.g. `### FR-007 Session timeout`).
+/// Build a set of `(prefix, number)` definitions and a derived set of
+/// known prefixes.
+///
+/// **Pass 2.** For each doc, scan body lines for `- **Satisfies:**` /
+/// `- **Addressed by:**` list items. Extract all requirement-ID tokens,
+/// skipping those inside backtick spans. For each token: if its prefix
+/// is not in `known_prefixes`, ignore (foreign code such as `RFC-7231`).
+/// Otherwise, if `(prefix, number)` is not in `defined`, emit a warning.
+/// Deduplication is per `(document, unresolved-target)`, anchored at
+/// first occurrence.
+///
+/// **Severity: warning** (v1). Eases adoption on large existing corpora
+/// that opt in incrementally. Flipping to error is a MAJOR bump per
+/// the versioning contract.
+///
+/// **Opt-in.** Called corpus-wide then filtered by `aggregate.retain`
+/// in `run.rs` — identical to `cross_ref`. No separate activation
+/// plumbing needed.
+pub(crate) fn requirement_ref(docs: &[Document]) -> Vec<Diagnostic> {
+    // Pass 1: collect definitions and derived known prefixes.
+    let mut defined: BTreeSet<(String, u32)> = BTreeSet::new();
+    let mut known_prefixes: BTreeSet<String> = BTreeSet::new();
+    let re = requirement_id_regex();
+    for doc in docs {
+        let Some(ast) = doc.ast.as_ref() else {
+            continue;
+        };
+        for heading in &ast.headings {
+            let Some(m) = re.find(&heading.text) else {
+                continue;
+            };
+            if m.start() != 0 {
+                continue;
+            }
+            let token = m.as_str();
+            let Some((prefix, num_str)) = token.rsplit_once('-') else {
+                continue;
+            };
+            let Ok(num) = num_str.parse::<u32>() else {
+                continue;
+            };
+            defined.insert((prefix.to_string(), num));
+            known_prefixes.insert(prefix.to_string());
+        }
+    }
+    if known_prefixes.is_empty() {
+        return Vec::new();
+    }
+    // Pass 2: check references from req_ref_tokens (populated by the parser
+    // from Satisfies/Addressed-by list items).
+    let mut out = Vec::new();
+    for doc in docs {
+        let Some(ast) = doc.ast.as_ref() else {
+            continue;
+        };
+        let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
+        for token in &ast.req_ref_tokens {
+            if token.in_code || token.in_strikethrough {
+                continue;
+            }
+            if !known_prefixes.contains(&token.namespace) {
+                continue;
+            }
+            let key = (token.namespace.clone(), token.number);
+            if defined.contains(&key) {
+                continue;
+            }
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(
+                Diagnostic::warning(
+                    "core.requirement-ref",
+                    doc.location.clone(),
+                    token.line,
+                    token.col,
+                    format!(
+                        "requirement reference '{}' does not resolve to a defined requirement",
+                        token.token
+                    ),
+                )
+                .with_help(
+                    "typo or stale link; define the requirement as a heading, or fix the reference",
+                )
+                .with_span_len(token.token.len() as u32),
+            );
+        }
+    }
+    out
+}
+
 // -- parameterised rules ----------------------------------------------
 
 /// `core.required-headings` — every configured H2 heading string MUST
@@ -332,7 +435,7 @@ fn split_token(token: &str) -> Option<(&str, u32)> {
 /// isn't there). Only H2 (`level == 2`) counts, per the rule's name.
 ///
 /// No-op when the document has no AST (CORE-005).
-pub fn required_headings(doc: &Document, params: &Value) -> Vec<Diagnostic> {
+pub(crate) fn required_headings(doc: &Document, params: &Value) -> Vec<Diagnostic> {
     let Some(ast) = doc.ast.as_ref() else {
         return Vec::new();
     };
@@ -374,7 +477,7 @@ pub fn required_headings(doc: &Document, params: &Value) -> Vec<Diagnostic> {
 /// non-empty. Empty means: null, empty string, empty array, or empty
 /// object. A plain `false` or `0` is NOT empty — the rule checks
 /// *presence of a value*, not truthiness.
-pub fn required_metadata(doc: &Document, params: &Value) -> Vec<Diagnostic> {
+pub(crate) fn required_metadata(doc: &Document, params: &Value) -> Vec<Diagnostic> {
     let Some(keys) = params.get("keys").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -415,7 +518,7 @@ pub fn required_metadata(doc: &Document, params: &Value) -> Vec<Diagnostic> {
 /// MUST be one of the listed strings. Missing keys are silently OK
 /// (those are `core.required-metadata`'s job). Non-string values are
 /// stringified for comparison.
-pub fn allowed_values(doc: &Document, params: &Value) -> Vec<Diagnostic> {
+pub(crate) fn allowed_values(doc: &Document, params: &Value) -> Vec<Diagnostic> {
     let Value::Object(table) = params else {
         return Vec::new();
     };
@@ -923,5 +1026,141 @@ mod tests {
         let diags = allowed_values(&doc, &params);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("'status'"));
+    }
+
+    // -- requirement_ref tests -----------------------------------------
+
+    fn make_doc_with_headings(
+        raw_id: &str,
+        headings: Vec<(&str, u8)>,
+        req_ref_tokens: Vec<CrossRefToken>,
+    ) -> Document {
+        Document {
+            id: raw_id.parse().expect("valid id"),
+            raw_id: raw_id.to_owned(),
+            location: format!("{raw_id}.md"),
+            depends_on: vec![],
+            frontmatter_lines: Default::default(),
+            metadata: Default::default(),
+            ast: Some(Ast {
+                headings: headings
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (text, level))| Heading {
+                        level,
+                        text: text.to_owned(),
+                        line: i as u32 + 1,
+                        col: 1,
+                    })
+                    .collect(),
+                req_ref_tokens,
+                ..Ast::default()
+            }),
+            body: String::new(),
+        }
+    }
+
+    fn req_token(id: &str, line: u32, col: u32, in_code: bool) -> CrossRefToken {
+        let dash = id.find('-').unwrap();
+        CrossRefToken {
+            token: id.to_owned(),
+            namespace: id[..dash].to_owned(),
+            number: id[dash + 1..].parse().unwrap(),
+            line,
+            col,
+            in_code,
+            in_strikethrough: false,
+        }
+    }
+
+    #[test]
+    fn requirement_ref_resolving_reference_passes() {
+        // doc_a defines FR-007 as a heading; doc_b references it via Satisfies.
+        let doc_a = make_doc_with_headings(
+            "PRD-001",
+            vec![("FR-007 Session timeout behaviour", 3)],
+            vec![],
+        );
+        let doc_b =
+            make_doc_with_headings("ADR-001", vec![], vec![req_token("FR-007", 2, 18, false)]);
+        let diags = requirement_ref(&[doc_a, doc_b]);
+        assert!(diags.is_empty(), "expected 0 diagnostics, got: {diags:?}");
+    }
+
+    #[test]
+    fn requirement_ref_unresolved_reference_flagged() {
+        let doc_a = make_doc_with_headings(
+            "PRD-001",
+            vec![("FR-007 Session timeout behaviour", 3)],
+            vec![],
+        );
+        let doc_b =
+            make_doc_with_headings("ADR-001", vec![], vec![req_token("FR-300", 2, 18, false)]);
+        let diags = requirement_ref(&[doc_a, doc_b]);
+        assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic");
+        assert_eq!(diags[0].code, "core.requirement-ref");
+        assert_eq!(
+            diags[0].message,
+            "requirement reference 'FR-300' does not resolve to a defined requirement"
+        );
+    }
+
+    #[test]
+    fn requirement_ref_foreign_prefix_ignored() {
+        // RFC-7231 has no heading definition anywhere — foreign prefix, must be silent.
+        let doc =
+            make_doc_with_headings("ADR-001", vec![], vec![req_token("RFC-7231", 2, 18, false)]);
+        let diags = requirement_ref(&[doc]);
+        assert!(
+            diags.is_empty(),
+            "foreign prefix RFC must produce 0 diagnostics"
+        );
+    }
+
+    #[test]
+    fn requirement_ref_in_code_suppressed() {
+        let doc_a = make_doc_with_headings(
+            "PRD-001",
+            vec![("FR-007 Session timeout behaviour", 3)],
+            vec![],
+        );
+        // FR-300 is a known-prefix (FR) but missing number; in_code = true must suppress.
+        let doc_b =
+            make_doc_with_headings("ADR-001", vec![], vec![req_token("FR-300", 2, 18, true)]);
+        let diags = requirement_ref(&[doc_a, doc_b]);
+        assert!(diags.is_empty(), "in_code token must produce 0 diagnostics");
+    }
+
+    #[test]
+    fn requirement_ref_dedupe_same_target_in_one_doc() {
+        let doc_a = make_doc_with_headings(
+            "PRD-001",
+            vec![("FR-007 Session timeout behaviour", 3)],
+            vec![],
+        );
+        // Two tokens for FR-300 (from Satisfies and Addressed-by lines).
+        let doc_b = make_doc_with_headings(
+            "ADR-001",
+            vec![],
+            vec![
+                req_token("FR-300", 2, 18, false),
+                req_token("FR-300", 3, 22, false),
+            ],
+        );
+        let diags = requirement_ref(&[doc_a, doc_b]);
+        assert_eq!(
+            diags.len(),
+            1,
+            "same unresolved target in one doc must dedupe to 1 diagnostic"
+        );
+        assert_eq!(diags[0].code, "core.requirement-ref");
+    }
+
+    #[test]
+    fn requirement_ref_noops_when_no_definitions_in_corpus() {
+        // No headings define a requirement — known_prefixes is empty, early return.
+        let doc =
+            make_doc_with_headings("ADR-001", vec![], vec![req_token("SEC-001", 2, 18, false)]);
+        assert!(requirement_ref(&[doc]).is_empty());
     }
 }

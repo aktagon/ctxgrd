@@ -12,12 +12,12 @@ Also serves as the integration test fixture for `tests/fixture_smoke.rs`.
 examples/
 ├── ctxgrd.toml
 ├── adrs/
-│   ├── ADR-001-use-event-sourcing-for-audit.md   valid ADR, root of the dep graph
-│   └── ADR-099-broken-demo.md                    intentionally broken; fires 5 diagnostics
+│   ├── 001-use-event-sourcing-for-audit.md        valid ADR, root of the dep graph
+│   └── 099-broken-demo.md                         intentionally broken; fires 5 diagnostics
 ├── prds/
-│   └── PRD-001-audit-trail-requirements.md
+│   └── 001-audit-trail-requirements.md
 ├── pmrs/
-│   └── PMR-001-audit-log-dropped-events-2026-03.md
+│   └── 001-audit-log-dropped-events-2026-03.md
 ├── rules/
 │   └── adr/
 │       ├── consequences-non-empty/               code: adr.consequences-non-empty
@@ -49,20 +49,20 @@ ADR-099 ──► PRD-999      (unresolved — intentional)
 ctxgrd --root examples
 ```
 
-Expected exit code: `1`, with five diagnostics from `ADR-099-broken-demo.md`
-(see `expected-output.txt`). Delete `adrs/ADR-099-broken-demo.md` and the run
+Expected exit code: `1`, with five diagnostics from `099-broken-demo.md`
+(see `expected-output.txt`). Delete `adrs/099-broken-demo.md` and the run
 is clean (exit `0`).
 
 ## What each piece demonstrates
 
-| File                                    | Feature                                                        |
-| --------------------------------------- | -------------------------------------------------------------- |
-| `ctxgrd.toml`                           | Namespace rule assignment + parameter sub-tables               |
-| `adrs/ADR-001-…`                        | Valid file-based document; cross-namespace `depends_on`        |
-| `prds/PRD-001-…`                        | Different `required-headings` list from ADR                    |
-| `pmrs/PMR-001-…`                        | Domain-specific required metadata key (`incident_date`)        |
-| `adrs/ADR-099-broken-demo.md`           | All five diagnostic types at once; code-span cross-ref opt-out |
-| `rules/adr/consequences-non-empty/run`  | External rule operating on document body (file-based check)    |
-| `rules/adr/supersession-consistent/run` | External rule reading inline `context.metadata` from stdin     |
-| `sources/jira-stub/run`                 | External source emitting JSONL document envelopes              |
-| `[JIRA]` in `ctxgrd.toml`               | Unified metadata: same core rules validate JIRA `extra` fields |
+| File                                       | Feature                                                        |
+| ------------------------------------------ | -------------------------------------------------------------- |
+| `ctxgrd.toml`                              | Namespace rule assignment + parameter sub-tables               |
+| `adrs/001-use-event-sourcing-for-audit.md` | Valid file-based document; cross-namespace `depends_on`        |
+| `prds/001-audit-trail-requirements.md`     | Different `required-headings` list from ADR                    |
+| `pmrs/001-audit-log-dropped-events-…`      | Domain-specific required metadata key (`incident_date`)        |
+| `adrs/099-broken-demo.md`                  | All five diagnostic types at once; code-span cross-ref opt-out |
+| `rules/adr/consequences-non-empty/run`     | External rule operating on document body (file-based check)    |
+| `rules/adr/supersession-consistent/run`    | External rule reading inline `context.metadata` from stdin     |
+| `sources/jira-stub/run`                    | External source emitting JSONL document envelopes              |
+| `[JIRA]` in `ctxgrd.toml`                  | Unified metadata: same core rules validate JIRA `extra` fields |

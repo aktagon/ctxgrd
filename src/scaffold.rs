@@ -46,7 +46,7 @@ pub fn scaffold(
     let slug = slugify(title);
     let contents = render_contents(namespace, number, title, ns_cfg);
     let dir = target_dir(namespace, existing, root, out_override);
-    let filename = format!("{namespace}-{number:03}-{slug}.md");
+    let filename = format!("{number:03}-{slug}.md");
     let target_path = dir.join(filename);
     Scaffold {
         id: DocumentId::new(namespace, number),
@@ -457,10 +457,13 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
 ///
 /// Every block gets the full nine-rule set and populated
 /// `required-headings` / `required-metadata` / `allowed-values`
-/// sub-tables. Heading defaults are namespace-specific (ADR:
-/// Status/Context/Decision/Consequences; PRD: Overview/Goals/
-/// Requirements/Success metrics; etc.) so the generated file is
-/// immediately lintable without editing.
+/// sub-tables. Heading defaults are namespace-specific: the built-in
+/// doc pack shape (`project-docs` / `ops`) where a pack defines the
+/// namespace (with the conventional minimal shape as a commented
+/// alternative),
+/// else the conventional shape (ADR: Status/Context/Decision/
+/// Consequences; etc.) — so the generated file is immediately
+/// lintable without editing.
 ///
 /// Intended entry point for `ctxgrd init` and for an LSP-driven
 /// "Initialize workspace" quick-fix down the road.
@@ -553,16 +556,42 @@ fn render_namespace_block(
     }
     buf.push('\n');
 
-    let headings = default_headings(namespace);
+    // Active headings come from a built-in doc pack (`project-docs` or
+    // `ops`) when one defines this namespace (the full shape); the
+    // conventional minimal shape is kept below as a commented alternative.
+    // Namespaces no pack covers fall back to the conventional shape with
+    // no alternative line.
+    let conventional = default_headings(namespace);
+    let pack_shape = crate::pack::builtin_pack_headings(namespace).filter(|p| {
+        !p.iter()
+            .map(String::as_str)
+            .eq(conventional.iter().copied())
+    });
     buf.push_str(&format!("[{namespace}.\"core.required-headings\"]\n"));
+    let active: Vec<&str> = match &pack_shape {
+        Some(p) => p.iter().map(String::as_str).collect(),
+        None => conventional.clone(),
+    };
     buf.push_str("headings = [");
-    for (i, h) in headings.iter().enumerate() {
+    for (i, h) in active.iter().enumerate() {
         if i > 0 {
             buf.push_str(", ");
         }
         buf.push_str(&format!("\"{h}\""));
     }
-    buf.push_str("]\n\n");
+    buf.push_str("]\n");
+    if pack_shape.is_some() {
+        buf.push_str("# Conventional minimal shape, if you prefer it:\n");
+        buf.push_str("# headings = [");
+        for (i, h) in conventional.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(", ");
+            }
+            buf.push_str(&format!("\"{h}\""));
+        }
+        buf.push_str("]\n");
+    }
+    buf.push('\n');
 
     buf.push_str(&format!("[{namespace}.\"core.required-metadata\"]\n"));
     buf.push_str("keys = [\"id\", \"title\", \"status\"]\n\n");
@@ -583,13 +612,17 @@ fn render_namespace_block(
     }
 }
 
-/// Canonical H2 heading sets, per namespace.
+/// Conventional minimal H2 heading sets, per namespace.
 ///
 /// These reflect the industry-standard structures for each record
 /// type: ADR (Nygard), PRD (feature / goals / NFRs), DDR (design
 /// decision + state matrix), RFC (IETF-shape), RUN (runbook).
 /// Unknown namespaces get a minimal two-section template the
 /// author can grow into.
+///
+/// For namespaces a built-in doc pack (`project-docs`, `ops`) defines,
+/// the pack's fuller shape is rendered active and this set appears as
+/// the commented alternative (see `render_namespace_block`).
 fn default_headings(namespace: &str) -> Vec<&'static str> {
     match namespace {
         "ADR" => vec!["Status", "Context", "Decision", "Consequences"],
@@ -1017,7 +1050,7 @@ depends_on: []
         assert_eq!(s.contents, expected);
         assert_eq!(
             s.target_path,
-            Path::new("./adrs/ADR-002-switch-to-append-only-object-storage.md")
+            Path::new("./adrs/002-switch-to-append-only-object-storage.md")
         );
     }
 
@@ -1067,14 +1100,36 @@ depends_on: []
         let rules = adr.get("rules").and_then(|v| v.as_array()).unwrap();
         // All nine core rules listed.
         assert_eq!(rules.len(), 9);
-        // ADR gets the canonical headings.
+        // ADR gets the project-docs pack shape as the active headings.
         let headings = adr
             .get("core.required-headings")
             .and_then(|v| v.get("headings"))
             .and_then(|v| v.as_array())
             .unwrap();
         let names: Vec<&str> = headings.iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(names, vec!["Status", "Context", "Decision", "Consequences"]);
+        assert_eq!(
+            names,
+            vec![
+                "Status",
+                "Context",
+                "Requirements",
+                "Consequences",
+                "Open Questions",
+                "References",
+                "Change log"
+            ]
+        );
+        // The conventional Nygard shape rides along as a commented
+        // alternative the user can swap in.
+        assert!(
+            toml_text.contains("# Conventional minimal shape, if you prefer it:"),
+            "expected commented conventional alternative"
+        );
+        assert!(
+            toml_text
+                .contains("# headings = [\"Status\", \"Context\", \"Decision\", \"Consequences\"]"),
+            "expected Nygard headings as comment"
+        );
     }
 
     #[test]
@@ -1091,8 +1146,30 @@ depends_on: []
             .and_then(|v| v.as_array())
             .unwrap();
         let names: Vec<&str> = prd_headings.iter().filter_map(|v| v.as_str()).collect();
-        assert!(names.contains(&"Overview"));
+        assert!(names.contains(&"User stories"));
+        assert!(names.contains(&"Definition of Done"));
         assert!(names.contains(&"Goals"));
+        // The conventional minimal PRD shape is the commented alternative.
+        assert!(toml_text.contains(
+            "# headings = [\"Overview\", \"Goals\", \"Requirements\", \"Success metrics\"]"
+        ));
+    }
+
+    #[test]
+    fn init_toml_pack_uncovered_namespace_has_no_alternative_comment() {
+        // DDR is not defined by the project-docs pack — its conventional
+        // shape stays active with no commented alternative.
+        let toml_text = render_init_toml(&["DDR"], &[], &DetectedPaths::new());
+        let value: toml::Value = toml::from_str(&toml_text).expect("valid TOML");
+        let headings = value
+            .get("DDR")
+            .and_then(|v| v.get("core.required-headings"))
+            .and_then(|v| v.get("headings"))
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let names: Vec<&str> = headings.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(names, vec!["Status", "Context", "Decision", "State Matrix"]);
+        assert!(!toml_text.contains("# Conventional minimal shape"));
     }
 
     #[test]

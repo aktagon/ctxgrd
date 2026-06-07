@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use thiserror::Error;
 
+use crate::agent_guide;
 use crate::config::{self, Config, ConfigError};
 use crate::diagnostic::{Diagnostic, KernelMessage, Severity};
 use crate::document::Document;
@@ -101,6 +102,14 @@ pub enum LintError {
         #[source]
         source: std::io::Error,
     },
+    /// The run checked nothing at all: no `ctxgrd.toml` at the root,
+    /// no namespaces configured anywhere (local or global), and no
+    /// file claimed intent. Distinguished from a legitimate
+    /// zero-config run (id-claimed docs, no toml — still exits 0) so
+    /// an unconfigured root fails loudly instead of reporting a
+    /// false-confidence `ok: 0 documents`.
+    #[error("no ctxgrd.toml found and no documents claim intent — nothing was linted")]
+    NothingToLint,
 }
 
 impl LintError {
@@ -108,6 +117,7 @@ impl LintError {
         match self {
             Self::Config(c) => c.code(),
             Self::MarkdownScan(_) => Some("src.markdown-io"),
+            Self::NothingToLint => Some("cfg.missing"),
             Self::TempDir(_) => Some("ext.tempdir"),
             Self::ExternalRule { .. } => Some("ext.io"),
         }
@@ -151,6 +161,17 @@ impl LintError {
                 code.replace('.', "/")
             ))
             .with_note(format!("cause: {}", source.kind())),
+            Self::NothingToLint => Diagnostic::error(
+                "cfg.missing",
+                "ctxgrd.toml",
+                0,
+                0,
+                "no ctxgrd.toml found and no documents claim intent — nothing was linted",
+            )
+            .with_help(
+                "run `ctxgrd init` to create a starter config, or pass `--root <dir>` \
+                 if you meant a different directory",
+            ),
         }
     }
 }
@@ -186,20 +207,50 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
             // where the rule's `run` file was expected; for `core.*`
             // codes it's a descriptive parenthetical. Only the former
             // makes sense as a "create this path" hint.
-            let help = if code.starts_with("core.") {
-                format!("remove '{code}' from [{namespace}].rules, or pick a real core rule (see `ctxgrd rules`)")
+            // ADR-025 § PKD-002: if a discoverable pack provides this code,
+            // the most actionable advice is the `pack add` that installs it —
+            // name the pack ahead of the generic forks below. A mistyped
+            // `core.*` or a genuinely-unknown code matches no pack and falls
+            // through to the legacy help.
+            let providers = crate::pack::providers_of(root, code);
+            // Three shapes of unknown rule: a mistyped `core.*`, a
+            // reserved built-in (e.g. `agents.*`/`todo.*`) the binary
+            // doesn't ship, and an external rule whose `run` script is
+            // missing. Each needs different advice — sending the built-in
+            // case down the "write a script" path is actively wrong
+            // (ADR-020 § ACX-010).
+            let (message, help) = if !providers.is_empty() {
+                let names = providers.join("`, `");
+                let cmd = providers
+                    .iter()
+                    .map(|n| format!("ctxgrd pack add {n}"))
+                    .collect::<Vec<_>>()
+                    .join("` or `");
+                (
+                    format!("[{namespace}] rule '{code}' is not known"),
+                    format!(
+                        "rule '{code}' is provided by pack `{names}` — run `{cmd}` to install it"
+                    ),
+                )
+            } else if code.starts_with("core.") {
+                (
+                    format!("[{namespace}] rule '{code}' is not known"),
+                    format!("remove '{code}' from [{namespace}].rules, or pick a real core rule (see `ctxgrd rules`)"),
+                )
+            } else if config::is_reserved_builtin_prefix(code) {
+                (
+                    format!("[{namespace}] rule '{code}' is a built-in rule not provided by this ctxgrd build"),
+                    format!("upgrade ctxgrd (built-in rules ship in the binary, not as scripts), or check the name with `ctxgrd rules`; if intentional, remove '{code}' from [{namespace}].rules"),
+                )
             } else {
-                format!("add a rule directory at {expected_path}, or remove '{code}' from [{namespace}].rules")
+                (
+                    format!("[{namespace}] rule '{code}' is not known"),
+                    format!("add a rule directory at {expected_path}, or remove '{code}' from [{namespace}].rules"),
+                )
             };
-            Diagnostic::error(
-                "cfg.rule-unknown",
-                "ctxgrd.toml",
-                0,
-                0,
-                format!("[{namespace}] rule '{code}' is not known"),
-            )
-            .with_help(help)
-            .with_note("run `ctxgrd rules` to see all available rules")
+            Diagnostic::error("cfg.rule-unknown", "ctxgrd.toml", 0, 0, message)
+                .with_help(help)
+                .with_note("run `ctxgrd rules` to see all available rules")
         }
         C::RuleParamsMissing { namespace, code } => Diagnostic::error(
             "cfg.rule-params-missing",
@@ -255,7 +306,11 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
                 format!("[ignore].patterns entry {pattern:?} is not a valid glob: {detail}")
             },
         )
-        .with_help("globs follow gitignore syntax (e.g. `docs/drafts/**`)"),
+        .with_help(
+            "globs follow globset syntax, anchored at the lint root — prefix `**/` to match \
+             at any depth (e.g. `docs/drafts/**`, `**/node_modules/**`); `!` negation is not \
+             supported",
+        ),
         C::ReferencesInvalid { detail } => Diagnostic::error(
             "cfg.references-invalid",
             "ctxgrd.toml",
@@ -279,7 +334,10 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
                 format!("[{namespace}].paths entry {pattern:?} is not a valid glob: {detail}")
             },
         )
-        .with_help("globs follow gitignore syntax (e.g. `docs/adrs/**`)"),
+        .with_help(
+            "globs follow globset syntax, anchored at the lint root — prefix `**/` to match \
+             at any depth (e.g. `docs/adrs/**`)",
+        ),
     }
 }
 
@@ -301,11 +359,16 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
 /// `parse_diagnostics` are NOT yet rendered as user-facing
 /// `Diagnostic`s — that is the caller's choice. `lint` always
 /// renders them; `find_references` currently discards them.
+///
+/// `path_claims` is built once here and threaded to callers so
+/// `lint` and `scan_file_level` share the same instance rather than
+/// each rebuilding from config (review finding #7).
 pub(crate) struct IngestResult {
     pub(crate) config: Config,
     pub(crate) documents: Vec<Document>,
     pub(crate) parse_diagnostics: Vec<ParseDiagnostic>,
     pub(crate) kernel_messages: Vec<KernelMessage>,
+    pub(crate) path_claims: crate::path_claims::PathClaims,
 }
 
 /// Source-aggregation pipeline shared by [`lint`] and
@@ -367,6 +430,7 @@ pub(crate) fn ingest(root: &Path) -> Result<IngestResult, LintError> {
         documents,
         parse_diagnostics,
         kernel_messages,
+        path_claims,
     })
 }
 
@@ -378,10 +442,37 @@ pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
         documents,
         parse_diagnostics,
         mut kernel_messages,
+        path_claims,
     } = ingest(root)?;
 
+    // An unconfigured root that produced no work at all fails loudly
+    // (exit 2) instead of a false-confidence `ok: 0 documents`. The
+    // conjunction is deliberate: a missing toml alone is zero-config
+    // mode (config::load contract — id-claimed docs still lint), and
+    // a non-empty `parse_diagnostics` means a file *tried* to claim
+    // intent — that finding must surface, not be masked by this error.
+    if config.namespaces.is_empty()
+        && documents.is_empty()
+        && parse_diagnostics.is_empty()
+        && !root.join("ctxgrd.toml").exists()
+    {
+        return Err(LintError::NothingToLint);
+    }
+
+    // Files claimed by a file-level namespace (AGENTS, TODO) are linted
+    // by the builtin-compiled file-level pass below, not the id pipeline —
+    // suppress the `core.id` / `core.frontmatter` parse diagnostics that
+    // their missing frontmatter would otherwise produce (ADR-020 § ACX-003).
+    // `path_claims` was built once in ingest() — reused here (finding #7).
+    let file_level_ns = config.file_level_namespaces();
     let mut diagnostics: Vec<Diagnostic> = parse_diagnostics
         .iter()
+        .filter(|pd| {
+            file_level_ns.is_empty()
+                || !path_claims
+                    .matching_namespaces(&pd.location)
+                    .any(|ns| file_level_ns.contains(&ns))
+        })
         .map(rules::parse_diagnostic_to_diagnostic)
         .collect();
 
@@ -432,6 +523,7 @@ pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
             }
         }
     };
+    aggregate.extend(rules::requirement_ref(&documents));
     aggregate.extend(rules::cross_ref(
         &documents,
         &declared_namespaces,
@@ -481,6 +573,30 @@ pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
         }
     }
 
+    // 6b: file-level builtin-compiled rules (the `agents.*` / `todo.*`
+    // rules) lint id-less path-claimed singletons (CLAUDE.md/AGENTS.md/
+    // TODO.md) that never become id-keyed documents, so they run outside
+    // the per-document loop above (ADR-020 § ACX-003/ACX-004).
+    let file_level_scan = agent_guide::scan_file_level(root, &config, &path_claims)
+        .map_err(LintError::MarkdownScan)?;
+    diagnostics.extend(file_level_scan.diagnostics);
+
+    // 6c: document-level builtin-compiled rules (id-claim namespaces, e.g.
+    // `tasks.*`). Unlike 6b these lint real id-keyed documents in the
+    // per-document loop — `tasks.files-allowed` is the first (ADR-022 §
+    // ABP-004), dispatched by code via `agent_guide::document_check`.
+    for doc in &documents {
+        let ns_cfg = config.namespace_config(&doc.id.namespace);
+        for code in &ns_cfg.rules {
+            if let Some(check_fn) = agent_guide::document_check(code) {
+                diagnostics.extend(check_fn(doc, ns_cfg.params.get(code), root));
+            }
+        }
+        if config.todo_listed_global && !ns_cfg.rules.iter().any(|c| c == "todo.listed") {
+            diagnostics.extend(agent_guide::check_todo_listed(doc, None, root));
+        }
+    }
+
     // 7: external rules — one subprocess per (namespace, rule) batch
     // (ADR-002 § RUL-001). Group docs by namespace, then run each
     // configured external rule once over all docs in that namespace.
@@ -497,7 +613,7 @@ pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
             let ext_rules: Vec<(String, PathBuf)> = ns_cfg
                 .rules
                 .iter()
-                .filter(|c| !c.starts_with("core."))
+                .filter(|c| !c.starts_with("core.") && !config::is_builtin_compiled(c))
                 .filter_map(|c| {
                     let (ns, name) = c.split_once('.')?;
                     let path = root.join("rules").join(ns).join(name).join("run");
@@ -538,10 +654,16 @@ pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
         ExitStatus::Ok
     };
 
-    let documents_linted = documents.len();
-    let namespaces_in_docs: BTreeSet<&str> =
+    // Coverage spans both document models: id-keyed documents *and* the
+    // path-claimed file-level singletons (AGENTS/TODO) that never become
+    // id-keyed documents but are still linted (finding #3). Excluding the
+    // latter understated coverage — a user could conclude their
+    // instruction files were not being linted.
+    let documents_linted = documents.len() + file_level_scan.files_linted;
+    let mut namespaces: BTreeSet<&str> =
         documents.iter().map(|d| d.id.namespace.as_str()).collect();
-    let rules_active: usize = namespaces_in_docs
+    namespaces.extend(file_level_scan.namespaces.iter().map(String::as_str));
+    let rules_active: usize = namespaces
         .iter()
         .map(|ns| config.namespace_config(ns).rules.len())
         .sum();
@@ -746,7 +868,7 @@ fn any_doc_has_external_rule(documents: &[Document], config: &config::Config) ->
             .namespace_config(&d.id.namespace)
             .rules
             .iter()
-            .any(|c| !c.starts_with("core."))
+            .any(|c| !c.starts_with("core.") && !config::is_builtin_compiled(c))
     })
 }
 
@@ -804,6 +926,56 @@ mod tests {
     }
 
     #[test]
+    fn rule_unknown_suggests_pack_add_when_a_pack_provides_the_code() {
+        // ADR-025 § PKD-002: `skills.frontmatter` is bundled by the
+        // `agents` pack, so the help points at `pack add agents` rather
+        // than telling the user to author a `run` script.
+        let tmp = tempfile::tempdir().unwrap();
+        let err = LintError::Config(ConfigError::RuleUnknown {
+            namespace: "SKILLS".into(),
+            code: "skills.frontmatter".into(),
+            expected_path: tmp
+                .path()
+                .join("rules/skills/frontmatter/run")
+                .display()
+                .to_string(),
+        });
+        let d = err.to_diagnostic(tmp.path());
+        assert_eq!(d.code, "cfg.rule-unknown");
+        let help = d.help.as_deref().unwrap();
+        assert!(
+            help.contains("ctxgrd pack add agents"),
+            "expected pack-add suggestion, got: {help}"
+        );
+        assert!(
+            help.contains("provided by pack `agents`"),
+            "expected pack provenance, got: {help}"
+        );
+    }
+
+    #[test]
+    fn rule_unknown_falls_back_to_script_hint_when_no_pack_provides_it() {
+        // A non-core code no pack provides keeps the legacy external-rule
+        // advice (write a `run` script) — the pack lookup degrades cleanly.
+        let tmp = tempfile::tempdir().unwrap();
+        let err = LintError::Config(ConfigError::RuleUnknown {
+            namespace: "ADR".into(),
+            code: "report.custom-check".into(),
+            expected_path: "rules/report/custom-check/run".into(),
+        });
+        let d = err.to_diagnostic(tmp.path());
+        let help = d.help.as_deref().unwrap();
+        assert!(
+            help.contains("add a rule directory at rules/report/custom-check/run"),
+            "expected legacy script hint, got: {help}"
+        );
+        assert!(
+            !help.contains("pack add"),
+            "must not invent a pack suggestion, got: {help}"
+        );
+    }
+
+    #[test]
     fn config_error_parse_routes_to_cfg_invalid() {
         let bad: Result<toml::Value, _> = toml::from_str("bad = 'unterminated\n");
         let parse_err = bad.unwrap_err();
@@ -842,6 +1014,23 @@ mod tests {
         // so the user can `ls` directly.
         let help = d.help.as_deref().unwrap();
         assert!(help.contains("rules/adr/consequences-non-empty/run"));
+    }
+
+    #[test]
+    fn lint_error_nothing_to_lint_carries_cfg_missing_code() {
+        let err = LintError::NothingToLint;
+        assert_eq!(err.code(), Some("cfg.missing"));
+    }
+
+    #[test]
+    fn lint_error_nothing_to_lint_renders_init_hint() {
+        let d = LintError::NothingToLint.to_diagnostic(Path::new("/tmp/billing-service"));
+        assert_eq!(d.code, "cfg.missing");
+        assert_eq!(d.location, "ctxgrd.toml");
+        assert!(d.message.contains("nothing was linted"));
+        let help = d.help.as_deref().unwrap();
+        assert!(help.contains("ctxgrd init"));
+        assert!(help.contains("--root"));
     }
 
     #[test]

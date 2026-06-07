@@ -30,11 +30,11 @@ use crate::envelope::Envelope;
 use crate::subprocess::{self, Env, ExitKind};
 
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(300);
-pub const RESERVED_SOURCE_NAME: &str = "markdown-file";
+pub(crate) const RESERVED_SOURCE_NAME: &str = "markdown-file";
 
 /// A source directory found on disk.
 #[derive(Debug, Clone)]
-pub struct DiscoveredSource {
+pub(crate) struct DiscoveredSource {
     pub name: String,
     pub run_path: PathBuf,
 }
@@ -48,14 +48,14 @@ pub struct DiscoveredSource {
 /// `markdown-file` name are skipped silently: they might be legit
 /// utilities the user is storing next to real sources (e.g.
 /// `sources/_shared/lib.sh`). A dot-prefix is also a silent skip.
-pub fn discover_sources(root: &Path) -> BTreeMap<String, DiscoveredSource> {
+pub(crate) fn discover_sources(root: &Path) -> BTreeMap<String, DiscoveredSource> {
     discover_sources_with_global(root, crate::config::global_ctxgrd_dir().as_deref())
 }
 
 /// Testable variant — pass `None` for "no global dir" or `Some(path)`
 /// to point at a specific one. Used by the `run::lint` test harness
 /// so parallel test workers don't trip over the real `$HOME`.
-pub fn discover_sources_with_global(
+pub(crate) fn discover_sources_with_global(
     root: &Path,
     global_dir: Option<&Path>,
 ) -> BTreeMap<String, DiscoveredSource> {
@@ -108,7 +108,7 @@ fn source_name_regex() -> &'static Regex {
 
 /// Outcome of running every activated source.
 #[derive(Debug, Clone, Default)]
-pub struct SourceRunResult {
+pub(crate) struct SourceRunResult {
     /// Envelopes gathered from every source that exited cleanly.
     pub envelopes: Vec<(String, Envelope)>,
     /// Source-level runtime messages — `src.runtime-error`,
@@ -125,7 +125,7 @@ pub struct SourceRunResult {
 /// that doesn't exist) are NOT an error at CP3b — they're silently
 /// ignored; CP3c can tighten this into a `src.unknown` diagnostic if
 /// we decide to.
-pub fn run_activated_sources(
+pub(crate) fn run_activated_sources(
     root: &Path,
     discovered: &BTreeMap<String, DiscoveredSource>,
     activations: &BTreeMap<String, Value>,

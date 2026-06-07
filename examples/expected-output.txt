@@ -1,12 +1,12 @@
 $ ctxgrd --root examples
 error[core.required-headings]: missing required H2 heading 'Decision'
-  --> adrs/ADR-099-broken-demo.md
+  --> adrs/099-broken-demo.md
 
   help: add a `## Decision` section to the document body
   note: required H2 headings: Status, Context, Decision, Consequences
 
 error[core.allowed-values]: metadata key 'status' has value 'cooking' not in allowed set [draft, accepted, rejected, superseded]
-  --> adrs/ADR-099-broken-demo.md:4:0
+  --> adrs/099-broken-demo.md:4:0
       |
     4 | status: cooking
       | ^
@@ -14,7 +14,7 @@ error[core.allowed-values]: metadata key 'status' has value 'cooking' not in all
   help: change `status` to one of: draft, accepted, rejected, superseded
 
 error[core.dep-resolved]: depends_on entry 'PRD-999' does not resolve to a document in the run
-  --> adrs/ADR-099-broken-demo.md:5:0
+  --> adrs/099-broken-demo.md:5:0
       |
     5 | depends_on:
       | ^
@@ -22,7 +22,7 @@ error[core.dep-resolved]: depends_on entry 'PRD-999' does not resolve to a docum
   help: create the missing document (`ctxgrd new PRD "..."`) or remove `PRD-999` from `depends_on`
 
 error[core.cross-ref]: cross-reference 'ADR-042' does not resolve to a known document
-  --> adrs/ADR-099-broken-demo.md:18:5
+  --> adrs/099-broken-demo.md:18:5
       |
    18 | See ADR-042 for background — though ADR-042 does not exist in this
       |     ^^^^^^^
@@ -31,7 +31,7 @@ error[core.cross-ref]: cross-reference 'ADR-042' does not resolve to a known doc
         or mark retired with `~~ADR-042~~`
 
 error[adr.consequences-non-empty]: ## Consequences section is empty or contains no bullet items
-  --> adrs/ADR-099-broken-demo.md:25:0
+  --> adrs/099-broken-demo.md:25:0
       |
    25 | ## Consequences
       | ^
@@ -69,7 +69,7 @@ shown above.)
   Diagnostic walk-through — what each line means
 ───────────────────────────────────────────────────────────────────────────
 
-ADR-099-broken-demo.md fires five diagnostics. The reference scanner
+099-broken-demo.md fires five diagnostics. The reference scanner
 fires three more from refs/. The reporter sorts by
 (location, line, col, code) per REP-001 — all eight appear grouped by
 file, then by line.
@@ -153,7 +153,7 @@ file, then by line.
   Clean run (ADR-099 removed or fixed; refs/ deleted)
 ───────────────────────────────────────────────────────────────────────────
 
-$ rm adrs/ADR-099-broken-demo.md
+$ rm adrs/099-broken-demo.md
 $ rm -rf refs
 $ ctxgrd --root examples
 $ echo $?
@@ -170,7 +170,7 @@ scanner diagnostics for the dangling references in that directory.)
 $ mv ctxgrd.toml ctxgrd.toml.bak
 $ ctxgrd --root examples
 error[core.dep-resolved]: depends_on entry 'PRD-999' does not resolve to a document in the run
-  --> adrs/ADR-099-broken-demo.md:5:0
+  --> adrs/099-broken-demo.md:5:0
       |
     5 | depends_on:
       | ^
@@ -178,7 +178,7 @@ error[core.dep-resolved]: depends_on entry 'PRD-999' does not resolve to a docum
   help: create the missing document (`ctxgrd new PRD "..."`) or remove `PRD-999` from `depends_on`
 
 error[core.cross-ref]: cross-reference 'ADR-042' does not resolve to a known document
-  --> adrs/ADR-099-broken-demo.md:18:5
+  --> adrs/099-broken-demo.md:18:5
       |
    18 | See ADR-042 for background — though ADR-042 does not exist in this
       |     ^^^^^^^
@@ -202,7 +202,7 @@ graph-integrity checks.
 ───────────────────────────────────────────────────────────────────────────
 
 $ ctxgrd new ADR "Switch to append-only object storage"
-adrs/ADR-100-switch-to-append-only-object-storage.md
+adrs/100-switch-to-append-only-object-storage.md
 
 The scaffolder reads [ADR] from ctxgrd.toml, picks the next unused ID
 (ADR-100: max of existing ADR-001 and ADR-099 is 99, so next is 100),

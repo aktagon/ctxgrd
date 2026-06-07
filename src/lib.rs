@@ -20,8 +20,9 @@
 //! `pub(crate)` modules — kernel internals; semver-volatile and not
 //! part of any contract. Do not depend on these from outside the crate.
 
-pub mod lsp;
+pub(crate) mod agent_guide;
 pub(crate) mod ast;
+pub(crate) mod builtin_rules;
 pub mod config;
 pub(crate) mod dag;
 pub mod diagnostic;
@@ -31,6 +32,9 @@ pub(crate) mod ext;
 pub(crate) mod frontmatter;
 pub mod id;
 pub mod introspect;
+pub mod list;
+pub mod lsp;
+pub mod pack;
 pub mod path_claims;
 pub(crate) mod reference;
 pub mod reporter;

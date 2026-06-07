@@ -33,7 +33,7 @@ const REFERENCE_TOKEN_REGEX: &str = r"\b[A-Z][A-Z0-9]*-[0-9]+\b";
 /// `col`, `token`. Position fields are 1-indexed for humans;
 /// `col` points at the first byte of the token within the line.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Reference {
+pub(crate) struct Reference {
     pub file_path: PathBuf,
     pub line: u32,
     pub col: u32,
@@ -56,7 +56,7 @@ const SUPPRESS_NEXT: &str = "ctxgrd: ignore-next";
 /// caller decides whether to surface a `ref.scan-error` warning to
 /// the kernel based on the counts.
 #[derive(Debug, Default)]
-pub struct ScanReport {
+pub(crate) struct ScanReport {
     pub references: Vec<Reference>,
     /// Directory entries the walker could not produce (permissions,
     /// broken symlinks, filesystem races).
@@ -82,7 +82,7 @@ pub struct ScanReport {
 /// strikethrough suppression. We don't enforce this in code (some
 /// users legitimately have non-document `.md` files outside their
 /// document tree); it is documented in `docs/rules.md`.
-pub fn scan(root: &Path, globs: &[String]) -> io::Result<ScanReport> {
+pub(crate) fn scan(root: &Path, globs: &[String]) -> io::Result<ScanReport> {
     if globs.is_empty() {
         return Ok(ScanReport::default());
     }

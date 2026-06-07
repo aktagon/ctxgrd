@@ -24,6 +24,7 @@ pub struct Ast {
     pub inline_code_spans: Vec<InlineCodeSpan>,
     pub strikethrough_spans: Vec<StrikethroughSpan>,
     pub cross_ref_tokens: Vec<CrossRefToken>,
+    pub req_ref_tokens: Vec<CrossRefToken>,
     pub list_items: Vec<ListItem>,
     pub links: Vec<Link>,
 }
@@ -112,6 +113,7 @@ mod tests {
             "inline_code_spans",
             "strikethrough_spans",
             "cross_ref_tokens",
+            "req_ref_tokens",
             "list_items",
             "links",
         ] {
@@ -195,6 +197,15 @@ mod tests {
                 number: 42,
                 line: 17,
                 col: 5,
+                in_code: false,
+                in_strikethrough: false,
+            }],
+            req_ref_tokens: vec![CrossRefToken {
+                token: "FR-007".into(),
+                namespace: "FR".into(),
+                number: 7,
+                line: 22,
+                col: 18,
                 in_code: false,
                 in_strikethrough: false,
             }],

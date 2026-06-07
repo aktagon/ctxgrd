@@ -19,15 +19,23 @@ else
 BUILD_FLAGS :=
 endif
 
-BIN := target/$(TARGET)/ctxgrd
+# Resolve cargo's target directory — honors CARGO_TARGET_DIR and the
+# `target-dir` setting in .cargo/config.toml; falls back to ./target.
+TARGET_DIR := $(shell $(CARGO) metadata --no-deps --format-version 1 2>/dev/null | grep -o '"target_directory":"[^"]*"' | head -1 | cut -d'"' -f4)
+ifeq ($(TARGET_DIR),)
+TARGET_DIR := target
+endif
 
-.PHONY: help build install uninstall test check lint fmt clean run-example
+BIN := $(TARGET_DIR)/$(TARGET)/ctxgrd
+
+.PHONY: help build install install-debug uninstall test check lint fmt clean run-example
 
 help:
 	@echo "ctxgrd — Makefile targets"
 	@echo
 	@echo "  build        Build the release binary ($(BIN))"
 	@echo "  install      Install ctxgrd to $(BINDIR)/"
+	@echo "  install-debug Install the unoptimized debug build (fast to compile)"
 	@echo "  uninstall    Remove ctxgrd from $(BINDIR)/"
 	@echo "  test         Run all tests"
 	@echo "  check        cargo check + cargo clippy -D warnings"
@@ -53,6 +61,11 @@ install: build
 	  *) echo "  Note: $(BINDIR) is NOT on \$$PATH. Add it to your shell rc, e.g.:"; \
 	     echo "    echo 'export PATH=\"$(BINDIR):\$$PATH\"' >> ~/.zshrc" ;; \
 	esac
+
+# Install the debug build — skips the fat-LTO/codegen-units=1 release
+# profile, so it compiles fast. Slower at runtime; use for local iteration.
+install-debug:
+	$(MAKE) install TARGET=debug
 
 uninstall:
 	rm -f $(BINDIR)/ctxgrd

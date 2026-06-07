@@ -26,7 +26,7 @@ const FENCE: &str = "---";
 /// well-formedness downstream via [`crate::id::DocumentId`]. `metadata`
 /// contains every other top-level key in the YAML mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Frontmatter {
+pub(crate) struct Frontmatter {
     pub id: Option<String>,
     pub depends_on: Vec<String>,
     pub metadata: BTreeMap<String, Value>,
@@ -38,7 +38,7 @@ pub struct Frontmatter {
 /// they're kept distinct so tests and future rule authors can tell
 /// "no block at all" from "block there but YAML was broken".
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum FrontmatterError {
+pub(crate) enum FrontmatterError {
     /// No opening `---` fence on line 1, or no closing `---` fence found.
     #[error("missing '---' frontmatter fence")]
     MissingFence,
@@ -51,11 +51,25 @@ pub enum FrontmatterError {
 impl Frontmatter {
     /// Parse a document body's frontmatter block.
     ///
+    /// Thin wrapper around [`Self::parse_with_lines`] for callers that do
+    /// not need key line numbers.
+    pub(crate) fn parse(body: &str) -> Result<Self, FrontmatterError> {
+        let (fm, _) = Self::parse_with_lines(body)?;
+        Ok(fm)
+    }
+
+    /// Parse the frontmatter block and compute the 1-indexed line number of
+    /// every top-level YAML key in a single pass over the body (ADR-029
+    /// § PIP-001).
+    ///
     /// Expects the body to open with a line consisting solely of `---`
     /// (optionally preceded by a UTF-8 BOM). The closing fence is the
     /// next line that is exactly `---`. Everything between is passed to
-    /// `serde_yaml`.
-    pub fn parse(body: &str) -> Result<Self, FrontmatterError> {
+    /// `serde_yaml`. Key line numbers are computed from the same YAML
+    /// slice without a second walk of the full body.
+    pub(crate) fn parse_with_lines(
+        body: &str,
+    ) -> Result<(Self, BTreeMap<String, u32>), FrontmatterError> {
         let body = strip_bom(body);
         let Some(yaml) = extract_yaml_block(body) else {
             return Err(FrontmatterError::MissingFence);
@@ -94,9 +108,6 @@ impl Frontmatter {
             }
             Some(Value::Null) | None => None,
             Some(other) => {
-                // Non-string id is a YAML-level error — the author wrote
-                // `id: 42` or similar. Report it as parse-level so the
-                // rule layer flags it via core.frontmatter.
                 return Err(FrontmatterError::YamlParse(format!(
                     "'id' must be a string, got {}",
                     value_kind(&other)
@@ -123,11 +134,24 @@ impl Frontmatter {
 
         let metadata: BTreeMap<String, Value> = map.into_iter().collect();
 
-        Ok(Self {
-            id,
-            depends_on,
-            metadata,
-        })
+        // Key line numbers: walk the YAML slice (already located above)
+        // to find top-level keys. The opening "---" is line 1, so the
+        // first YAML line (index 0) maps to body line 2.
+        let mut key_lines = BTreeMap::new();
+        for (idx, line) in yaml.lines().enumerate() {
+            if let Some(key) = top_level_key(line) {
+                key_lines.insert(key, (idx + 2) as u32);
+            }
+        }
+
+        Ok((
+            Self {
+                id,
+                depends_on,
+                metadata,
+            },
+            key_lines,
+        ))
     }
 }
 
@@ -135,7 +159,7 @@ impl Frontmatter {
 ///
 /// Implements the CORE-002 rule `source.extra ⊕ body.frontmatter` with
 /// frontmatter winning on key conflict. Neither input is mutated.
-pub fn merge_metadata(
+pub(crate) fn merge_metadata(
     source_extra: &BTreeMap<String, Value>,
     frontmatter: &BTreeMap<String, Value>,
 ) -> BTreeMap<String, Value> {
@@ -154,7 +178,7 @@ pub fn merge_metadata(
 /// treat the body's leading `---` as a horizontal rule in that case — it
 /// treats it as a broken frontmatter, and the `core.frontmatter` rule
 /// will flag it separately.
-pub fn body_start_offset(body: &str) -> usize {
+pub(crate) fn body_start_offset(body: &str) -> usize {
     let stripped = strip_bom(body);
     let bom_len = body.len() - stripped.len();
     let Some(after_fence) = stripped.strip_prefix(FENCE) else {
@@ -180,55 +204,6 @@ pub fn body_start_offset(body: &str) -> usize {
     // the whole body. The rule layer catches the missing-fence case.
     let _ = bom_len;
     0
-}
-
-/// Find the 1-indexed line number of every top-level YAML key inside
-/// the frontmatter block.
-///
-/// Used by rules (`core.dep-resolved`, `core.allowed-values`) to
-/// anchor their diagnostics at the offending YAML key rather than
-/// line 0. Keys with leading whitespace are nested mapping entries
-/// and NOT recorded — only column-1 keys count.
-///
-/// Empty map when there's no recognisable frontmatter block.
-pub fn frontmatter_key_lines(body: &str) -> BTreeMap<String, u32> {
-    let mut out = BTreeMap::new();
-    let stripped = strip_bom(body);
-    let Some(after_fence) = stripped.strip_prefix(FENCE) else {
-        return out;
-    };
-    if after_fence
-        .strip_prefix('\n')
-        .or_else(|| after_fence.strip_prefix("\r\n"))
-        .is_none()
-    {
-        return out;
-    }
-
-    let mut in_fm = false;
-    for (idx, line) in stripped.lines().enumerate() {
-        let line_num = (idx + 1) as u32;
-        let trimmed = line.trim_end();
-        if trimmed == FENCE {
-            if idx == 0 {
-                in_fm = true;
-                continue;
-            }
-            if in_fm {
-                break;
-            }
-        }
-        if !in_fm {
-            continue;
-        }
-        // A top-level key: no leading whitespace, one `:` followed by
-        // a space or end-of-line. YAML permits `key :` too, so accept
-        // that form as well.
-        if let Some(key) = top_level_key(line) {
-            out.insert(key, line_num);
-        }
-    }
-    out
 }
 
 fn top_level_key(line: &str) -> Option<String> {

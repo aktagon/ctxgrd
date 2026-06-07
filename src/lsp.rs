@@ -57,12 +57,18 @@ impl WorkspaceIndex {
 
     fn index_document(&mut self, uri: Url, doc: crate::document::Document) {
         let raw_id = doc.raw_id.clone();
-        
+
         let definition_location = Location {
             uri: uri.clone(),
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 0 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
             },
         };
         self.definitions.insert(raw_id, definition_location);
@@ -93,7 +99,11 @@ impl WorkspaceIndex {
         }
 
         for dep in &doc.depends_on {
-            let line = doc.frontmatter_lines.get("depends_on").copied().unwrap_or(0);
+            let line = doc
+                .frontmatter_lines
+                .get("depends_on")
+                .copied()
+                .unwrap_or(0);
             let ref_loc = Location {
                 uri: uri.clone(),
                 range: Range {
@@ -107,7 +117,10 @@ impl WorkspaceIndex {
                     },
                 },
             };
-            self.references.entry(dep.clone()).or_default().push(ref_loc);
+            self.references
+                .entry(dep.clone())
+                .or_default()
+                .push(ref_loc);
         }
 
         self.documents.insert(uri, Arc::new(doc));
@@ -131,14 +144,20 @@ impl Backend {
             }
         };
 
-        self.client.log_message(MessageType::INFO, format!("Scanning workspace: {}", root.display())).await;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Scanning workspace: {}", root.display()),
+            )
+            .await;
 
         match run::ingest(&root) {
             Ok(ingest) => {
                 let mut state = self.workspace_state.write().await;
                 state.config = Some(Arc::new(ingest.config));
                 state.index.clear();
-                let mut diagnostics_by_uri: HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>> = HashMap::new();
+                let mut diagnostics_by_uri: HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>> =
+                    HashMap::new();
 
                 for doc in ingest.documents {
                     let full_path = root.join(&doc.location);
@@ -166,7 +185,9 @@ impl Backend {
                 }
             }
             Err(e) => {
-                self.client.log_message(MessageType::ERROR, format!("Workspace scan failed: {}", e)).await;
+                self.client
+                    .log_message(MessageType::ERROR, format!("Workspace scan failed: {}", e))
+                    .await;
             }
         }
 
@@ -183,9 +204,14 @@ impl Backend {
         };
 
         let path_claims = crate::path_claims::PathClaims::from_config(&config);
-        let location = uri.to_file_path()
+        let location = uri
+            .to_file_path()
             .ok()
-            .and_then(|p| p.strip_prefix(&*root).ok().map(|p| p.to_string_lossy().into_owned()))
+            .and_then(|p| {
+                p.strip_prefix(&*root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
             .unwrap_or_default();
 
         {
@@ -203,7 +229,8 @@ impl Backend {
 
         // For now, re-run full lint to update diagnostics
         if let Ok(outcome) = run::lint(&root) {
-            let mut diagnostics_by_uri: HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>> = HashMap::new();
+            let mut diagnostics_by_uri: HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>> =
+                HashMap::new();
             for diag in outcome.diagnostics {
                 let full_path = root.join(&diag.location);
                 if let Ok(u) = Url::from_file_path(full_path) {
@@ -211,7 +238,7 @@ impl Backend {
                     diagnostics_by_uri.entry(u).or_default().push(lsp_diag);
                 }
             }
-            
+
             // Collect URIs to clear while holding the read lock
             let all_uris: Vec<Url> = {
                 let state = self.workspace_state.read().await;
@@ -229,11 +256,20 @@ impl Backend {
         }
     }
 
-    async fn publish_diagnostics(&self, uri: Url, diagnostics: Vec<tower_lsp::lsp_types::Diagnostic>) {
-        self.client.publish_diagnostics(uri, diagnostics, None).await;
+    async fn publish_diagnostics(
+        &self,
+        uri: Url,
+        diagnostics: Vec<tower_lsp::lsp_types::Diagnostic>,
+    ) {
+        self.client
+            .publish_diagnostics(uri, diagnostics, None)
+            .await;
     }
 
-    async fn inner_goto_definition(&self, params: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
+    async fn inner_goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
@@ -321,34 +357,64 @@ mod tests {
     #[test]
     fn test_find_token_at_position() {
         let text = "See ADR-001 for details.\nAnd PRD-123 too.";
-        
+
         // At 'A' in ADR-001
         assert_eq!(
-            find_token_at_position(text, Position { line: 0, character: 4 }),
+            find_token_at_position(
+                text,
+                Position {
+                    line: 0,
+                    character: 4
+                }
+            ),
             Some("ADR-001".to_string())
         );
-        
+
         // At 'R' in ADR-001
         assert_eq!(
-            find_token_at_position(text, Position { line: 0, character: 6 }),
+            find_token_at_position(
+                text,
+                Position {
+                    line: 0,
+                    character: 6
+                }
+            ),
             Some("ADR-001".to_string())
         );
-        
+
         // At '1' in ADR-001
         assert_eq!(
-            find_token_at_position(text, Position { line: 0, character: 10 }),
+            find_token_at_position(
+                text,
+                Position {
+                    line: 0,
+                    character: 10
+                }
+            ),
             Some("ADR-001".to_string())
         );
-        
+
         // Outside
         assert_eq!(
-            find_token_at_position(text, Position { line: 0, character: 0 }),
+            find_token_at_position(
+                text,
+                Position {
+                    line: 0,
+                    character: 0
+                }
+            ),
             None
         );
-        
+
         // Second line
         assert_eq!(
-            find_token_at_position(text, Position { line: 1, character: 4 }),
+            find_token_at_position(
+                text,
+                Position {
+                    line: 1,
+                    character: 4
+                }
+            ),
             Some("PRD-123".to_string())
         );
     }
@@ -358,7 +424,7 @@ mod tests {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         let mut state = self.workspace_state.write().await;
-        
+
         if let Some(uri) = params.root_uri {
             if let Ok(path) = uri.to_file_path() {
                 state.root_path = Some(Arc::new(path));
@@ -393,7 +459,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "ctxgrd lsp initialized")
             .await;
-        
+
         let _ = self.scan_workspace().await;
     }
 
@@ -401,7 +467,10 @@ impl LanguageServer for Backend {
         Ok(())
     }
 
-    async fn symbol(&self, _params: WorkspaceSymbolParams) -> Result<Option<Vec<SymbolInformation>>> {
+    async fn symbol(
+        &self,
+        _params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
         let state = self.workspace_state.read().await;
         let mut symbols = Vec::new();
 
@@ -452,13 +521,21 @@ impl LanguageServer for Backend {
 
         for doc in state.index.documents.values() {
             let label = doc.raw_id.clone();
-            let detail = doc.metadata.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let documentation = doc.metadata.get("status").and_then(|v| v.as_str()).map(|s| {
-                Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("Status: {}", s),
-                })
-            });
+            let detail = doc
+                .metadata
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let documentation = doc
+                .metadata
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!("Status: {}", s),
+                    })
+                });
 
             items.push(CompletionItem {
                 label,
@@ -485,7 +562,12 @@ impl LanguageServer for Backend {
         };
 
         if let Some(token) = find_token_at_position(&doc.body, position) {
-            if let Some(target_doc) = state.index.definitions.get(&token).and_then(|loc| state.index.documents.get(&loc.uri)) {
+            if let Some(target_doc) = state
+                .index
+                .definitions
+                .get(&token)
+                .and_then(|loc| state.index.documents.get(&loc.uri))
+            {
                 let mut contents = format!("**{}**", target_doc.raw_id);
                 if let Some(title) = target_doc.metadata.get("title").and_then(|v| v.as_str()) {
                     contents.push_str(&format!("\n\n{}", title));
@@ -493,7 +575,7 @@ impl LanguageServer for Backend {
                 if let Some(status) = target_doc.metadata.get("status").and_then(|v| v.as_str()) {
                     contents.push_str(&format!("\n\nStatus: {}", status));
                 }
-                
+
                 return Ok(Some(Hover {
                     contents: HoverContents::Scalar(MarkedString::String(contents)),
                     range: None,
@@ -505,12 +587,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.on_document_changed(params.text_document.uri, &params.text_document.text).await;
+        self.on_document_changed(params.text_document.uri, &params.text_document.text)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().next() {
-            self.on_document_changed(params.text_document.uri, &change.text).await;
+            self.on_document_changed(params.text_document.uri, &change.text)
+                .await;
         }
     }
 
@@ -518,14 +602,15 @@ impl LanguageServer for Backend {
         let _ = self.scan_workspace().await;
     }
 
-    async fn did_close(&self, _params: DidCloseTextDocumentParams) {
-    }
+    async fn did_close(&self, _params: DidCloseTextDocumentParams) {}
 }
 
 pub async fn run_server() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = tower_lsp::LspService::new(|client| Backend::new(client));
-    tower_lsp::Server::new(stdin, stdout, socket).serve(service).await;
+    let (service, socket) = tower_lsp::LspService::new(Backend::new);
+    tower_lsp::Server::new(stdin, stdout, socket)
+        .serve(service)
+        .await;
 }

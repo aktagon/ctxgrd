@@ -21,7 +21,7 @@ use crate::id::DocumentId;
 /// A reference from one document to another that the graph couldn't
 /// satisfy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnresolvedRef {
+pub(crate) struct UnresolvedRef {
     /// Index of the document whose `depends_on` list contained the
     /// unresolved entry.
     pub from_doc_idx: usize,
@@ -32,7 +32,7 @@ pub struct UnresolvedRef {
 
 /// A cycle detected in the `depends_on` graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Cycle {
+pub(crate) enum Cycle {
     /// `doc_idx` depends on itself directly.
     SelfEdge { doc_idx: usize },
     /// Two or more documents form a non-trivial strongly-connected
@@ -45,7 +45,7 @@ pub enum Cycle {
 /// entry order. Self-edges (a doc depending on its own id) are
 /// resolved (they find themselves) — they only surface through
 /// [`cycles`] below.
-pub fn unresolved_refs(docs: &[Document]) -> Vec<UnresolvedRef> {
+pub(crate) fn unresolved_refs(docs: &[Document]) -> Vec<UnresolvedRef> {
     let index = build_index(docs);
     let mut out = Vec::new();
     for (idx, doc) in docs.iter().enumerate() {
@@ -66,7 +66,7 @@ pub fn unresolved_refs(docs: &[Document]) -> Vec<UnresolvedRef> {
 /// Every cycle in the `depends_on` graph: every self-edge + every
 /// non-trivial SCC. Unresolved entries are silently ignored because
 /// they're reported by [`unresolved_refs`] already.
-pub fn cycles(docs: &[Document]) -> Vec<Cycle> {
+pub(crate) fn cycles(docs: &[Document]) -> Vec<Cycle> {
     let index = build_index(docs);
     let adj = adjacency_list(docs, &index);
     let mut out = Vec::new();

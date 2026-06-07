@@ -25,7 +25,7 @@ use crate::ast::{
     StrikethroughSpan,
 };
 use crate::document::Document;
-use crate::frontmatter::{self, Frontmatter, FrontmatterError};
+use crate::frontmatter::{self, Frontmatter};
 use crate::id::DocumentId;
 use crate::path_claims::{PathClaims, PathConflict};
 
@@ -112,11 +112,6 @@ pub fn scan(
     ignore: Option<&globset::GlobSet>,
     path_claims: Option<&PathClaims>,
 ) -> io::Result<ScanResult> {
-    let paths = sorted_markdown_files(root, ignore)?;
-    let mut documents = Vec::with_capacity(paths.len());
-    let mut parse_diagnostics = Vec::new();
-    let mut path_conflicts = Vec::new();
-
     let empty;
     let claims = match path_claims {
         Some(c) => c,
@@ -125,6 +120,10 @@ pub fn scan(
             &empty
         }
     };
+    let paths = sorted_markdown_files(root, ignore, claims)?;
+    let mut documents = Vec::with_capacity(paths.len());
+    let mut parse_diagnostics = Vec::new();
+    let mut path_conflicts = Vec::new();
 
     for path in paths {
         let body = fs::read_to_string(&path)?;
@@ -148,11 +147,12 @@ pub fn scan(
 /// failure.
 ///
 /// Returns [`ParseOutcome::Skip`] when the body has no frontmatter
-/// fence at all — those files are unlikely to be ctxgrd documents
-/// (READMEs, scratch notes, …) and should not clutter the report
-/// with `core.frontmatter` false positives. A fence that is present
-/// but whose contained YAML won't parse is still a failed document
-/// and produces [`ParseOutcome::Diagnostic`].
+/// (no fence, or broken YAML) AND the file is not path-claimed — those
+/// files are unlikely to be ctxgrd documents (READMEs, scratch notes,
+/// …) and should not clutter the report with `core.frontmatter` false
+/// positives. A path-claimed file is a ctxgrd document by configured
+/// intent, so a missing fence or broken YAML there is a real defect and
+/// produces [`ParseOutcome::Diagnostic`] (ADR-007 § DOC-002 (e)).
 pub(crate) fn parse_one(body: &str, location: String, path_claims: &PathClaims) -> ParseOutcome {
     // ADR-007 § DOC-001: a markdown file is a document candidate only
     // when it claims intent — either an `id:` field (id-claim, checked
@@ -179,13 +179,20 @@ pub(crate) fn parse_one(body: &str, location: String, path_claims: &PathClaims) 
         })
     };
 
-    let fm = match Frontmatter::parse(body) {
+    let (fm, frontmatter_lines) = match Frontmatter::parse_with_lines(body) {
         Ok(fm) => fm,
-        Err(FrontmatterError::MissingFence) => return ParseOutcome::Skip,
         Err(e) => {
-            // DOC-001 (d): malformed frontmatter on a non-claimed file
-            // is silent. Path-claimed files still get core.frontmatter
-            // — they ARE ctxgrd documents by configured intent.
+            // DOC-001 (d): frontmatter trouble on a non-claimed file is
+            // silent, whether the YAML is malformed OR the fence is
+            // absent entirely (MissingFence). READMEs and scratch notes
+            // never become diagnostics.
+            //
+            // DOC-002 (e): a path-claimed file still gets
+            // core.frontmatter — it IS a ctxgrd document by configured
+            // intent, so a missing/broken frontmatter block is a real
+            // defect. The MissingFence case is the BUG-001 fix: a
+            // governed file with no frontmatter at all is no longer
+            // silently skipped once its location is path-claimed.
             if !path_claimed {
                 return ParseOutcome::Skip;
             }
@@ -248,7 +255,6 @@ pub(crate) fn parse_one(body: &str, location: String, path_claims: &PathClaims) 
     }
 
     let ast = parse_ast(body);
-    let frontmatter_lines = frontmatter::frontmatter_key_lines(body);
 
     ParseOutcome::Document(Document {
         id,
@@ -279,7 +285,7 @@ pub fn parse_ast(body: &str) -> Ast {
     for (event, range) in Parser::new_ext(markdown, opts).into_offset_iter() {
         builder.on_event(event, range);
     }
-    builder.finish_cross_refs();
+    builder.finish_ref_tokens();
     builder.into_ast()
 }
 
@@ -315,15 +321,16 @@ fn byte_to_line_col(offset: usize, line_starts: &[usize]) -> (u32, u32) {
 
 // -- walking the filesystem --------------------------------------------
 
-fn sorted_markdown_files(
+pub(crate) fn sorted_markdown_files(
     root: &Path,
     ignore: Option<&globset::GlobSet>,
+    claims: &PathClaims,
 ) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !is_ignored(root, e.path(), ignore));
+        .filter_entry(|e| !is_ignored(root, e.path(), e.file_type().is_dir(), ignore, claims));
     for entry in walker {
         let entry = entry.map_err(io::Error::from)?;
         if !entry.file_type().is_file() {
@@ -347,7 +354,26 @@ fn sorted_markdown_files(
 /// ignore globset. The root itself is never ignored (otherwise the
 /// whole walk would abort at depth 0). Match is against the path
 /// relative to root so patterns like `**/.*` behave as users expect.
-fn is_ignored(root: &Path, path: &Path, ignore: Option<&globset::GlobSet>) -> bool {
+///
+/// PKC-006 splits the claim exemption into two predicates:
+///
+/// - **Traversability** (directories): a directory that is an
+///   ancestor-of, equal-to, or descendant-of any claim prefix is never
+///   pruned, even when it matches an ignore pattern — otherwise a deep
+///   claimed file (`.claude/skills/…/SKILL.md`) is unreachable under
+///   the default `**/.*` ignore.
+/// - **Lintability** (files): an ignore-matched file is admitted only
+///   when a `[<NS>].paths` glob positively matches it. The prefix
+///   relation alone would whitelist every markdown file around a
+///   claimed one (e.g. a nested repo's ADRs beside a claimed SKILL.md)
+///   — files this config never claimed (BUG-005).
+fn is_ignored(
+    root: &Path,
+    path: &Path,
+    is_dir: bool,
+    ignore: Option<&globset::GlobSet>,
+    claims: &PathClaims,
+) -> bool {
     let Some(set) = ignore else {
         return false;
     };
@@ -357,10 +383,26 @@ fn is_ignored(root: &Path, path: &Path, ignore: Option<&globset::GlobSet>) -> bo
     if rel.as_os_str().is_empty() {
         return false;
     }
-    set.is_match(rel)
+    if !set.is_match(rel) {
+        return false;
+    }
+    if is_dir {
+        // Ancestor check (`prefix.starts_with(rel)`) prevents pruning the
+        // dot-dir parents before the claimed subtree is reached. Descendant
+        // check (`rel.starts_with(prefix)`) is needed because globset's
+        // default `*` matches `/`, so `**/.*` matches ANY directory whose
+        // first component starts with `.` — including deep ones like
+        // `.claude/skills/my-skill`.
+        claims
+            .prefix_dirs()
+            .iter()
+            .all(|prefix| !prefix.starts_with(rel) && !rel.starts_with(prefix))
+    } else {
+        claims.matching_namespaces(rel).next().is_none()
+    }
 }
 
-fn render_location(root: &Path, path: &Path) -> String {
+pub(crate) fn render_location(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
@@ -378,6 +420,30 @@ fn cross_ref_regex() -> &'static Regex {
     })
 }
 
+fn req_ref_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Z]{2,}-[0-9]{3,}").expect("static req-ref regex compiles"))
+}
+
+/// Returns `true` when `text` (the list item text after stripping the
+/// marker) normalises to a `Satisfies` or `Addressed by` label.
+/// Strips leading `**` bold markers, then strips up to the first `**`
+/// close or `:` to isolate the label keyword (without colon).
+fn is_req_ref_item(text: &str) -> bool {
+    let inner = text.trim_start_matches("**");
+    // Extract up to first `**` or first `:`, whichever comes first.
+    let label = if let Some((before_bold_close, _)) = inner.split_once("**") {
+        before_bold_close
+            .split_once(':')
+            .map(|(l, _)| l)
+            .unwrap_or(before_bold_close)
+    } else {
+        inner.split_once(':').map(|(l, _)| l).unwrap_or(inner)
+    };
+    let lower = label.trim().to_lowercase();
+    lower == "satisfies" || lower == "addressed by"
+}
+
 // -- event-driven AST construction -------------------------------------
 
 struct AstBuilder<'a> {
@@ -390,6 +456,7 @@ struct AstBuilder<'a> {
     inline_code_spans: Vec<InlineCodeSpan>,
     strikethrough_spans: Vec<StrikethroughSpan>,
     cross_ref_tokens: Vec<CrossRefToken>,
+    req_ref_tokens: Vec<CrossRefToken>,
     list_items: Vec<ListItem>,
     links: Vec<Link>,
 
@@ -451,6 +518,7 @@ impl<'a> AstBuilder<'a> {
             inline_code_spans: Vec::new(),
             strikethrough_spans: Vec::new(),
             cross_ref_tokens: Vec::new(),
+            req_ref_tokens: Vec::new(),
             list_items: Vec::new(),
             links: Vec::new(),
             code_ranges: Vec::new(),
@@ -646,7 +714,15 @@ impl<'a> AstBuilder<'a> {
         }
     }
 
-    fn finish_cross_refs(&mut self) {
+    /// Populate both `cross_ref_tokens` and `req_ref_tokens` (ADR-029 § PIP-002).
+    /// Must be called after the main event loop so code and strikethrough
+    /// ranges are fully populated.
+    fn finish_ref_tokens(&mut self) {
+        self.extract_cross_refs();
+        self.extract_req_refs();
+    }
+
+    fn extract_cross_refs(&mut self) {
         let re = cross_ref_regex();
         let body = self.body;
         for m in re.find_iter(body) {
@@ -683,6 +759,62 @@ impl<'a> AstBuilder<'a> {
         }
     }
 
+    fn extract_req_refs(&mut self) {
+        let re = req_ref_regex();
+        // Collect qualifying line numbers first to avoid borrowing `self.list_items`
+        // while mutating `self.req_ref_tokens`.
+        let qualifying_lines: Vec<u32> = self
+            .list_items
+            .iter()
+            .filter(|li| is_req_ref_item(&li.text))
+            .map(|li| li.line)
+            .collect();
+
+        for line_num in qualifying_lines {
+            let line_idx = usize::try_from(line_num)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(1);
+            let line_start_byte = match self.line_starts.get(line_idx).copied() {
+                Some(b) => b,
+                None => continue,
+            };
+            // Skip lines inside frontmatter.
+            if line_start_byte < self.body_start {
+                continue;
+            }
+            let line_text = self.body[line_start_byte..]
+                .split('\n')
+                .next()
+                .unwrap_or("");
+            for m in re.find_iter(line_text) {
+                let abs_start = line_start_byte + m.start();
+                let abs_end = line_start_byte + m.end();
+                if !is_token_boundary(self.body, abs_start, abs_end) {
+                    continue;
+                }
+                let matched = m.as_str();
+                let dash = matched.find('-').expect("regex guarantees a dash");
+                let namespace = matched[..dash].to_owned();
+                let number: u32 = match matched[dash + 1..].parse() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let (line, col) = byte_to_line_col(abs_start, self.line_starts);
+                let in_code = range_contains(&self.code_ranges, abs_start);
+                let in_strikethrough = range_contains(&self.strikethrough_ranges, abs_start);
+                self.req_ref_tokens.push(CrossRefToken {
+                    token: matched.to_owned(),
+                    namespace,
+                    number,
+                    line,
+                    col,
+                    in_code,
+                    in_strikethrough,
+                });
+            }
+        }
+    }
+
     fn into_ast(self) -> Ast {
         Ast {
             headings: self.headings,
@@ -690,6 +822,7 @@ impl<'a> AstBuilder<'a> {
             inline_code_spans: self.inline_code_spans,
             strikethrough_spans: self.strikethrough_spans,
             cross_ref_tokens: self.cross_ref_tokens,
+            req_ref_tokens: self.req_ref_tokens,
             list_items: self.list_items,
             links: self.links,
         }
@@ -1111,6 +1244,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn doc_002_e_path_claimed_no_fence_fires_frontmatter() {
+        // BUG-001 / DOC-002 (e): a governed file with NO frontmatter
+        // fence at all, located under a configured `[<NS>].paths`, is a
+        // real defect — it must fire core.frontmatter, not skip silently.
+        let body = "# PRD-001: Title\n\nBody with no frontmatter.\n";
+        let claims = claims_for("PRD", "docs/prds/**");
+        let diag = expect_diagnostic(parse_one(body, "docs/prds/001-foo.md".to_owned(), &claims));
+        assert_eq!(diag.location, "docs/prds/001-foo.md");
+        assert!(matches!(diag.kind, ParseDiagnosticKind::Frontmatter(_)));
+    }
+
+    #[test]
+    fn no_fence_unclaimed_still_skips() {
+        // The DOC-001 silence is load-bearing: a no-fence file outside
+        // any configured path stays skipped after the BUG-001 fix.
+        let body = "# Just a heading\n";
+        let claims = claims_for("PRD", "docs/prds/**");
+        assert_eq!(
+            parse_one(body, "notes/scratch.md".to_owned(), &claims),
+            ParseOutcome::Skip,
+        );
+    }
+
+    #[test]
+    fn no_fence_multi_claim_yields_conflict() {
+        // DOC-007: with no fence there is no id to resolve a multi-claim,
+        // so two overlapping paths produce a conflict, not a diagnostic.
+        let body = "# heading only\n";
+        let claims = claims_for_many(&[("ADR", "docs/**"), ("PRD", "docs/**")]);
+        let conflict = expect_conflict(parse_one(body, "docs/orphan.md".to_owned(), &claims));
+        assert_eq!(conflict.namespaces, vec!["ADR", "PRD"]);
+    }
+
     // --- ADR-007 § DOC-007 verification ---
 
     #[test]
@@ -1238,6 +1405,171 @@ mod tests {
             result.parse_diagnostics.is_empty(),
             "ignored files must not produce diagnostics: {:?}",
             result.parse_diagnostics
+        );
+    }
+
+    #[test]
+    fn path_claim_prefix_escapes_dotfile_ignore() {
+        // PKC-006: a SKILLS-claimed .claude/skills/.../SKILL.md under the
+        // default **/.*  ignore is linted; .git stays pruned.
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join(".claude/skills/my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: does stuff\n---\n# Skill\n",
+        )
+        .unwrap();
+        // Also create a .git directory to verify it stays pruned
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let patterns = ["**/.*"];
+        let mut builder = globset::GlobSetBuilder::new();
+        for p in patterns {
+            builder.add(globset::Glob::new(p).unwrap());
+        }
+        let set = builder.build().unwrap();
+
+        // With no claims, .claude/ is pruned — 0 files found.
+        let without_exemption =
+            sorted_markdown_files(root.path(), Some(&set), &PathClaims::empty()).unwrap();
+        assert!(
+            without_exemption.is_empty(),
+            "without prefix exemption, .claude/ is pruned: {:?}",
+            without_exemption
+        );
+
+        // With a SKILLS claim, SKILL.md is found.
+        // NOTE: globset's default `*` matches `/`, so `**/.*` matches
+        // any path whose first component starts with `.`, including deep
+        // descendants like `.claude/skills/my-skill`. The exemption must
+        // cover ancestors AND descendants of the claim prefix (PKC-006).
+        let claims = test_claims(&[("SKILLS", &[".claude/skills/**/SKILL.md"])]);
+        let with_exemption = sorted_markdown_files(root.path(), Some(&set), &claims).unwrap();
+        assert_eq!(
+            with_exemption.len(),
+            1,
+            "SKILL.md found with prefix exemption: {:?}",
+            with_exemption
+        );
+        assert!(
+            with_exemption[0].ends_with("SKILL.md"),
+            "found file is SKILL.md: {:?}",
+            with_exemption
+        );
+    }
+
+    /// Build a [`PathClaims`] from `(namespace, paths globs)` pairs, the
+    /// way `Config` would after parsing `[<NS>].paths`.
+    fn test_claims(namespaces: &[(&str, &[&str])]) -> PathClaims {
+        let mut cfg = crate::config::Config::default();
+        for (name, patterns) in namespaces {
+            let mut builder = globset::GlobSetBuilder::new();
+            for p in *patterns {
+                builder.add(globset::Glob::new(p).unwrap());
+            }
+            cfg.namespaces.insert(
+                (*name).to_owned(),
+                crate::config::NamespaceConfig {
+                    rules: Vec::new(),
+                    params: std::collections::BTreeMap::new(),
+                    paths: Some(builder.build().unwrap()),
+                    path_patterns: patterns.iter().map(|s| (*s).to_owned()).collect(),
+                },
+            );
+        }
+        PathClaims::from_config(&cfg)
+    }
+
+    #[test]
+    fn claim_prefix_does_not_admit_unclaimed_descendants() {
+        // BUG-005: the PKC-006 exemption must admit only files a claim
+        // glob positively matches — not every markdown file under the
+        // claim prefix. A nested repo's id-claimed ADR next to a claimed
+        // SKILL.md must stay ignored under the default `**/.*` pattern,
+        // while the SKILL.md itself is still reached.
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join(".claude/skills/my-skill");
+        let adr_dir = skill_dir.join("docs/adrs");
+        std::fs::create_dir_all(&adr_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: does stuff\n---\n# Skill\n",
+        )
+        .unwrap();
+        std::fs::write(
+            adr_dir.join("001-reuse-boundary.md"),
+            "---\nid: ADR-1\ntitle: Reuse boundary\nstatus: accepted\n---\n# ADR\n",
+        )
+        .unwrap();
+
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/.*").unwrap());
+        let set = builder.build().unwrap();
+        let claims = test_claims(&[("SKILLS", &[".claude/skills/**/SKILL.md"])]);
+
+        let found = sorted_markdown_files(root.path(), Some(&set), &claims).unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "only the claimed SKILL.md escapes [ignore]: {:?}",
+            found
+        );
+        assert!(
+            found[0].ends_with("SKILL.md"),
+            "found file is SKILL.md: {:?}",
+            found
+        );
+    }
+
+    // -- req_ref_tokens tests ---------------------------------------------
+
+    #[test]
+    fn satisfies_line_produces_req_ref_token() {
+        // `- **Satisfies:** FR-007` → one entry: prefix FR, number 7, in_code false.
+        let body = "---\nid: ADR-001\n---\n\n- **Satisfies:** FR-007\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.req_ref_tokens.len(), 1);
+        let t = &ast.req_ref_tokens[0];
+        assert_eq!(t.token, "FR-007");
+        assert_eq!(t.namespace, "FR");
+        assert_eq!(t.number, 7);
+        assert!(!t.in_code);
+        assert!(!t.in_strikethrough);
+    }
+
+    #[test]
+    fn addressed_by_line_produces_req_ref_token() {
+        // `- **Addressed by:** NFR-003` is also picked up.
+        let body = "---\nid: ADR-001\n---\n\n- **Addressed by:** NFR-003\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.req_ref_tokens.len(), 1);
+        let t = &ast.req_ref_tokens[0];
+        assert_eq!(t.token, "NFR-003");
+        assert_eq!(t.namespace, "NFR");
+        assert_eq!(t.number, 3);
+        assert!(!t.in_code);
+    }
+
+    #[test]
+    fn req_ref_token_inside_backticks_sets_in_code() {
+        // Token inside backticks on a Satisfies line must have in_code = true.
+        let body = "---\nid: ADR-001\n---\n\n- **Satisfies:** `FR-300`\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.req_ref_tokens.len(), 1);
+        assert!(ast.req_ref_tokens[0].in_code);
+    }
+
+    #[test]
+    fn non_satisfies_line_produces_no_req_ref_tokens() {
+        // A line that is not a Satisfies/Addressed-by item must not populate req_ref_tokens.
+        let body = "---\nid: ADR-001\n---\n\nSee FR-007 for details.\n";
+        let ast = ast_of(body);
+        assert!(
+            ast.req_ref_tokens.is_empty(),
+            "prose line must not produce req_ref_tokens: {:?}",
+            ast.req_ref_tokens
         );
     }
 }

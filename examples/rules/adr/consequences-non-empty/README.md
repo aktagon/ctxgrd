@@ -31,8 +31,8 @@ every ADR document on stdin as JSONL.
 
 ```sh
 CTXGRD_RULE_PARAMS='{}' ./run < <(
-  echo '{"path":"/abs/adrs/ADR-001-use-event-sourcing-for-audit.md","context":{...}}'
-  echo '{"path":"/abs/adrs/ADR-099-broken-demo.md","context":{...}}'
+  echo '{"path":"/abs/adrs/001-use-event-sourcing-for-audit.md","context":{...}}'
+  echo '{"path":"/abs/adrs/099-broken-demo.md","context":{...}}'
 )
 ```
 
@@ -41,12 +41,12 @@ with everything the kernel knows about the document:
 
 ```json
 {
-  "path": "/abs/adrs/ADR-001-use-event-sourcing-for-audit.md",
+  "path": "/abs/adrs/001-use-event-sourcing-for-audit.md",
   "context": {
     "id": "ADR-001",
     "namespace": "ADR",
     "number": 1,
-    "location": "adrs/ADR-001-use-event-sourcing-for-audit.md",
+    "location": "adrs/001-use-event-sourcing-for-audit.md",
     "depends_on": ["PRD-001"],
     "metadata": { "title": "...", "status": "accepted" }
   }
@@ -66,7 +66,7 @@ field.
 
 ```json
 {
-  "path": "/abs/adrs/ADR-099-broken-demo.md",
+  "path": "/abs/adrs/099-broken-demo.md",
   "severity": "error",
   "message": "## Consequences section is empty or contains no bullet items",
   "line": 25,
@@ -77,5 +77,5 @@ field.
 After the host attaches the code:
 
 ```
-adrs/ADR-099-broken-demo.md:25:0: error: [adr.consequences-non-empty] ## Consequences section is empty or contains no bullet items
+adrs/099-broken-demo.md:25:0: error: [adr.consequences-non-empty] ## Consequences section is empty or contains no bullet items
 ```

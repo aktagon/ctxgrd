@@ -21,7 +21,7 @@ use toml::Value as TomlValue;
 
 use crate::diagnostic::KernelMessage;
 
-pub const CORE_RULES: [&str; 9] = [
+pub const CORE_RULES: [&str; 10] = [
     "core.frontmatter",
     "core.id",
     "core.id-unique",
@@ -31,6 +31,7 @@ pub const CORE_RULES: [&str; 9] = [
     "core.required-headings",
     "core.required-metadata",
     "core.allowed-values",
+    "core.requirement-ref",
 ];
 
 /// Core rules whose zero-config default includes them — every
@@ -51,6 +52,58 @@ const PARAMETERIZED_CORE_RULES: [&str; 3] = [
     "core.allowed-values",
 ];
 
+/// Whether `code` names a builtin-compiled rule (dispatched in-process,
+/// not an external subprocess script). Derived from `BUILTIN_RULES`
+/// so the resolver and the registry cannot drift (ADR-024 § REG-002).
+pub fn is_builtin_compiled(code: &str) -> bool {
+    crate::builtin_rules::BUILTIN_RULES
+        .iter()
+        .any(|r| r.code == code)
+}
+
+/// Whether `code` is a *file-level* builtin-compiled rule — one that lints
+/// id-less path-claimed singletons rather than id-keyed documents.
+/// Derived from `BUILTIN_RULES` (ADR-024 § REG-002).
+pub fn is_file_level_compiled(code: &str) -> bool {
+    crate::builtin_rules::BUILTIN_RULES
+        .iter()
+        .any(|r| r.code == code && r.level == crate::builtin_rules::Level::File)
+}
+
+/// The namespace part of a rule code (`agents` in `agents.context-budget`).
+fn rule_prefix(code: &str) -> &str {
+    code.split_once('.').map(|(ns, _)| ns).unwrap_or(code)
+}
+
+/// Whether `code` falls under a reserved built-in rule namespace — the
+/// `<ns>` prefix of any `BUILTIN_RULES` entry (e.g. `agents`, `todo`).
+/// Derived from the registry (ADR-024 § REG-002), so there is no second
+/// list to keep in sync. External rules may not use a reserved prefix,
+/// and an unknown rule under one is a missing built-in (a ctxgrd version
+/// mismatch), not a missing script.
+pub fn is_reserved_builtin_prefix(code: &str) -> bool {
+    let ns = rule_prefix(code);
+    crate::builtin_rules::BUILTIN_RULES
+        .iter()
+        .any(|r| rule_prefix(r.code) == ns)
+}
+
+impl Config {
+    /// Namespaces that carry a builtin-compiled rule. These are
+    /// *file-level*: their documents (CLAUDE.md / AGENTS.md / TODO.md)
+    /// are id-less singletons that never become id-keyed [`Document`]s,
+    /// so they are linted by walking path-claimed files directly (see
+    /// [`crate::agent_guide::scan_file_level`]) rather than through the
+    /// per-document rule loop.
+    pub fn file_level_namespaces(&self) -> Vec<&str> {
+        self.namespaces
+            .iter()
+            .filter(|(_, cfg)| cfg.rules.iter().any(|c| is_file_level_compiled(c)))
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+}
+
 /// Fully-resolved configuration for one `ctxgrd` invocation.
 ///
 /// The map is keyed by namespace. Every namespace that appears in
@@ -65,7 +118,9 @@ pub struct Config {
     /// the params object passed via `$CTXGRD_SOURCE_PARAMS`.
     pub sources: BTreeMap<String, Value>,
     /// Compiled path-match for the top-level `[ignore].patterns`
-    /// list (globset, gitignore-flavour). Paths the markdown walker
+    /// list (globset syntax — root-anchored, no `!` negation, a
+    /// slash-free pattern matches only at the root; NOT gitignore,
+    /// despite the resemblance). Paths the markdown walker
     /// sees are checked against this, relative to the lint root;
     /// matches are skipped. `None` means "no ignore block configured".
     pub ignore: Option<globset::GlobSet>,
@@ -79,6 +134,10 @@ pub struct Config {
     /// `<NAMESPACE>-<number>` token found. Empty (the default) means
     /// the scanner is disabled — current behaviour.
     pub reference_scan_globs: Vec<String>,
+    /// When true, `todo.listed` runs on every id-keyed document regardless
+    /// of whether the namespace lists the rule explicitly. Set via
+    /// `[todo.listed]\nenabled = true` in `ctxgrd.toml`.
+    pub todo_listed_global: bool,
     /// Kernel-level advisories raised during config loading — e.g.,
     /// `[sources.markdown-file]` was in the file but ignored
     /// (CORE-001). Surfaced through the same channel as runtime
@@ -98,8 +157,8 @@ pub struct NamespaceConfig {
     /// Compiled glob matcher for `[<NS>].paths` (ADR 007 § DOC-002 /
     /// DOC-004). `None` means the user did not configure a `paths`
     /// list for this namespace; under DOC-001 such namespaces accept
-    /// only id-claimed documents. Same gitignore-flavour grammar as
-    /// `[ignore].patterns`.
+    /// only id-claimed documents. Same globset grammar as
+    /// `[ignore].patterns` (root-anchored, no `!` negation).
     pub paths: Option<globset::GlobSet>,
     /// Raw glob strings round-tripped from the config file. Kept in
     /// sync with `paths` so downstream introspection (e.g. a future
@@ -292,7 +351,8 @@ fn load_global_namespaces(
             path: path.clone(),
             source,
         })?;
-        let ns_cfg = parse_namespace(stem, value, external, root)?;
+        let (ns_cfg, warnings) = parse_namespace(stem, value, external, root)?;
+        config.kernel_messages.extend(warnings);
         config.namespaces.insert(stem.to_string(), ns_cfg);
     }
     Ok(config)
@@ -469,11 +529,22 @@ fn parse_and_validate(
             parse_references(val, &mut config)?;
             continue;
         }
+        if key == "todo" {
+            if let TomlValue::Table(mut t) = val {
+                if let Some(TomlValue::Table(listed)) = t.remove("listed") {
+                    if matches!(listed.get("enabled"), Some(TomlValue::Boolean(true))) {
+                        config.todo_listed_global = true;
+                    }
+                }
+            }
+            continue;
+        }
         if !is_namespace_key(&key) {
             // Unknown top-level table — silently ignore.
             continue;
         }
-        let ns_cfg = parse_namespace(&key, val, external_rules, root)?;
+        let (ns_cfg, warnings) = parse_namespace(&key, val, external_rules, root)?;
+        config.kernel_messages.extend(warnings);
         config.namespaces.insert(key, ns_cfg);
     }
     Ok(config)
@@ -580,9 +651,9 @@ fn parse_namespace(
     val: TomlValue,
     external_rules: &BTreeMap<String, DiscoveredRule>,
     root: &Path,
-) -> Result<NamespaceConfig, ConfigError> {
+) -> Result<(NamespaceConfig, Vec<KernelMessage>), ConfigError> {
     let TomlValue::Table(mut table) = val else {
-        return Ok(NamespaceConfig::default());
+        return Ok((NamespaceConfig::default(), Vec::new()));
     };
 
     let rules = match table.remove("rules") {
@@ -603,32 +674,36 @@ fn parse_namespace(
         }
     };
 
-    // ADR 007 § DOC-002: `[<NS>].paths` is its own top-level
-    // namespace key, not a rule-code params sub-table. Lift it out
-    // before the params slurp so it doesn't leak into `params`.
     let (paths, path_patterns) = match table.remove("paths") {
         Some(v) => parse_namespace_paths(namespace, v)?,
         None => (None, Vec::new()),
     };
 
-    // Collect per-rule params sub-tables: `[<NS>."core.required-headings"]`
-    // surfaces here as a `Table` value under the rule code key.
     let mut params: BTreeMap<String, Value> = BTreeMap::new();
     for (k, v) in table {
         params.insert(k, toml_to_json(&v));
     }
 
-    // Validate each rule code.
-    for code in &rules {
-        validate_rule(namespace, code, &params, external_rules, root)?;
+    // Validate each rule: unknown rules produce a warning and are skipped;
+    // invalid params (wrong type etc.) are still hard errors.
+    let mut valid_rules = Vec::with_capacity(rules.len());
+    let mut warnings = Vec::new();
+    for code in rules {
+        match validate_rule(namespace, &code, &params, external_rules, root)? {
+            None => valid_rules.push(code),
+            Some(km) => warnings.push(km),
+        }
     }
 
-    Ok(NamespaceConfig {
-        rules,
-        params,
-        paths,
-        path_patterns,
-    })
+    Ok((
+        NamespaceConfig {
+            rules: valid_rules,
+            params,
+            paths,
+            path_patterns,
+        },
+        warnings,
+    ))
 }
 
 /// Parse `[<NS>].paths` per ADR 007 § DOC-002 + DOC-004. Always a
@@ -675,20 +750,24 @@ fn parse_namespace_paths(
     Ok((Some(set), patterns))
 }
 
+/// Returns `Ok(None)` when the rule is valid, `Ok(Some(warning))` when the
+/// rule is unrecognised but tolerated (the rule will be skipped), or
+/// `Err` for hard configuration mistakes (invalid params, etc.).
 fn validate_rule(
     namespace: &str,
     code: &str,
     params: &BTreeMap<String, Value>,
     external_rules: &BTreeMap<String, DiscoveredRule>,
     root: &Path,
-) -> Result<(), ConfigError> {
+) -> Result<Option<KernelMessage>, ConfigError> {
     if code.starts_with("core.") {
         if !CORE_RULES.contains(&code) {
-            return Err(ConfigError::RuleUnknown {
-                namespace: namespace.to_string(),
-                code: code.to_string(),
-                expected_path: format!("(built-in core rule; '{code}' is not one of them)"),
-            });
+            return Ok(Some(unknown_rule_warning(
+                namespace,
+                code,
+                &format!("remove '{code}' from [{namespace}].rules, or pick a real core rule (see `ctxgrd rules`)"),
+                external_rules,
+            )));
         }
         if PARAMETERIZED_CORE_RULES.contains(&code) {
             let p = params
@@ -699,23 +778,72 @@ fn validate_rule(
                 })?;
             validate_core_rule_params(namespace, code, p)?;
         }
-        return Ok(());
+        return Ok(None);
     }
 
-    // External rule: code must be `<ns>.<name>`, and
-    // `<root>/rules/<ns>/<name>/run` must exist. Discovery happened at
-    // load() entry; if the code isn't in the discovered set, the user
-    // either typoed the code or forgot to add the directory.
+    if is_builtin_compiled(code) {
+        return Ok(None);
+    }
+
+    if is_reserved_builtin_prefix(code) {
+        return Ok(Some(unknown_rule_warning(
+            namespace,
+            code,
+            &format!("upgrade ctxgrd (built-in rules ship in the binary, not as scripts), or check the name with `ctxgrd rules`; if intentional, remove '{code}' from [{namespace}].rules"),
+            external_rules,
+        )));
+    }
+
     if external_rules.contains_key(code) {
-        return Ok(());
+        return Ok(None);
     }
     let (ns, name) = code.split_once('.').unwrap_or((code, ""));
     let expected = root.join("rules").join(ns).join(name).join("run");
-    Err(ConfigError::RuleUnknown {
-        namespace: namespace.to_string(),
-        code: code.to_string(),
-        expected_path: expected.display().to_string(),
-    })
+    Ok(Some(unknown_rule_warning(
+        namespace,
+        code,
+        &format!(
+            "add a rule directory at {}, or remove '{code}' from [{namespace}].rules",
+            expected.display()
+        ),
+        external_rules,
+    )))
+}
+
+/// Build a `cfg.rule-unknown` warning kernel message, appending a
+/// "did you mean …?" hint when other rules share the same namespace prefix.
+fn unknown_rule_warning(
+    namespace: &str,
+    code: &str,
+    help: &str,
+    external_rules: &BTreeMap<String, DiscoveredRule>,
+) -> KernelMessage {
+    let prefix = code.split_once('.').map(|(p, _)| p).unwrap_or("");
+    let suggestions: Vec<&str> = CORE_RULES
+        .iter()
+        .copied()
+        .chain(crate::builtin_rules::BUILTIN_RULES.iter().map(|r| r.code))
+        .chain(external_rules.keys().map(String::as_str))
+        .filter(|k| *k != code && k.split_once('.').map(|(p, _)| p).unwrap_or("") == prefix)
+        .collect();
+
+    let full_help = if suggestions.is_empty() {
+        help.to_string()
+    } else {
+        let list = suggestions
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{help} — did you mean {list}?")
+    };
+
+    KernelMessage::warning(
+        "cfg.rule-unknown",
+        format!("[{namespace}] rule '{code}' is not known — skipping"),
+    )
+    .with_help(full_help)
+    .with_note("run `ctxgrd rules` to see all available rules")
 }
 
 fn validate_core_rule_params(
@@ -991,16 +1119,18 @@ rules = ["core.required-headings"]
     }
 
     #[test]
-    fn unknown_core_rule_errors() {
-        let text = r#"
-[ADR]
-rules = ["core.nope"]
-"#;
-        let err = parse(text).unwrap_err();
-        match err {
-            ConfigError::RuleUnknown { code, .. } => assert_eq!(code, "core.nope"),
-            other => panic!("unexpected error: {other:?}"),
-        }
+    fn unknown_core_rule_warns_and_skips() {
+        let text = "[ADR]\nrules = [\"core.nope\"]\n";
+        let config = parse(text).unwrap();
+        let adr = config.namespaces.get("ADR").unwrap();
+        assert!(!adr.enables("core.nope"), "unknown rule must be skipped");
+        let km = config
+            .kernel_messages
+            .iter()
+            .find(|m| m.code == "cfg.rule-unknown")
+            .expect("expected cfg.rule-unknown warning");
+        assert_eq!(km.severity, crate::diagnostic::Severity::Warning);
+        assert!(km.message.contains("core.nope"));
     }
 
     #[test]
@@ -1015,26 +1145,93 @@ rules = ["core.frontmatter", "adr.consequences-non-empty"]
     }
 
     #[test]
-    fn external_rule_rejected_when_not_discovered() {
+    fn external_rule_rejected_when_not_discovered_warns_and_skips() {
+        let text = "[ADR]\nrules = [\"adr.typoed-name\"]\n";
+        let config = parse_with_external(text, &[]).unwrap();
+        let adr = config.namespaces.get("ADR").unwrap();
+        assert!(
+            !adr.enables("adr.typoed-name"),
+            "unknown rule must be skipped"
+        );
+        let km = config
+            .kernel_messages
+            .iter()
+            .find(|m| m.code == "cfg.rule-unknown")
+            .expect("expected cfg.rule-unknown warning");
+        assert_eq!(km.severity, crate::diagnostic::Severity::Warning);
+        assert!(km.message.contains("adr.typoed-name"));
+        assert!(
+            km.help
+                .as_deref()
+                .unwrap_or("")
+                .contains("rules/adr/typoed-name/run"),
+            "help should mention the expected path: {:?}",
+            km.help
+        );
+    }
+
+    #[test]
+    fn reserved_builtin_prefix_is_derived_from_the_rule_list() {
+        // Derived from BUILTIN_COMPILED_RULES — no separate list to sync.
+        // Both `agents.` and `todo.` are reserved because rules under
+        // each are registered (ADR-020 § ACX-010).
+        assert!(is_reserved_builtin_prefix("agents.context-headings"));
+        assert!(is_reserved_builtin_prefix("agents.some-future-rule"));
+        assert!(is_reserved_builtin_prefix("todo.freshness"));
+        assert!(is_reserved_builtin_prefix("todo.some-future-rule"));
+        assert!(!is_reserved_builtin_prefix("ctx.stability"));
+        assert!(!is_reserved_builtin_prefix("adr.foo"));
+    }
+
+    #[test]
+    fn unknown_reserved_rule_warns_as_missing_builtin_not_missing_script() {
+        let text = "[AGENTS]\nrules = [\"agents.bogus\"]\n";
+        let config = parse_with_external(text, &[]).unwrap();
+        let km = config
+            .kernel_messages
+            .iter()
+            .find(|m| m.code == "cfg.rule-unknown")
+            .expect("expected cfg.rule-unknown warning");
+        assert!(km.message.contains("agents.bogus"));
+        let help = km.help.as_deref().unwrap_or("");
+        assert!(
+            help.contains("upgrade ctxgrd"),
+            "should read as a missing built-in: {help}"
+        );
+        assert!(
+            !help.contains("rules/agents"),
+            "must not point at an external script path: {help}"
+        );
+    }
+
+    #[test]
+    fn unknown_rule_did_you_mean_suggests_same_prefix_rules() {
+        // "todo.frehsness" is a typo of "todo.freshness"; the warning
+        // help text should suggest real todo.* rules.
+        let text = "[TODO]\npaths = [\"TODO.md\"]\nrules = [\"todo.frehsness\"]\n";
+        let config = parse(text).unwrap();
+        let km = config
+            .kernel_messages
+            .iter()
+            .find(|m| m.code == "cfg.rule-unknown")
+            .expect("expected cfg.rule-unknown warning");
+        let help = km.help.as_deref().unwrap_or("");
+        assert!(
+            help.contains("todo.freshness"),
+            "did-you-mean should suggest 'todo.freshness': {help}"
+        );
+    }
+
+    #[test]
+    fn known_builtin_rule_validates_without_a_script() {
         let text = r#"
-[ADR]
-rules = ["adr.typoed-name"]
+[AGENTS]
+rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
+
+[TODO]
+rules = ["todo.freshness", "todo.structure"]
 "#;
-        let err = parse_with_external(text, &[]).unwrap_err();
-        match err {
-            ConfigError::RuleUnknown {
-                code,
-                expected_path,
-                ..
-            } => {
-                assert_eq!(code, "adr.typoed-name");
-                assert!(
-                    expected_path.contains("rules/adr/typoed-name/run"),
-                    "expected path mention: {expected_path}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(parse_with_external(text, &[]).is_ok());
     }
 
     #[test]
@@ -1400,5 +1597,23 @@ paths = ["docs/adrs/**"]
         let tmp = tempfile::tempdir().unwrap();
         let config = load_with_global(tmp.path(), None).unwrap();
         assert!(config.namespaces.is_empty());
+    }
+
+    #[test]
+    fn todo_listed_global_enabled_parses() {
+        let config = parse("[todo.listed]\nenabled = true\n").unwrap();
+        assert!(config.todo_listed_global);
+    }
+
+    #[test]
+    fn todo_listed_global_absent_is_false() {
+        let config = parse("[ADR]\nrules = []\n").unwrap();
+        assert!(!config.todo_listed_global);
+    }
+
+    #[test]
+    fn todo_listed_global_enabled_false_is_false() {
+        let config = parse("[todo.listed]\nenabled = false\n").unwrap();
+        assert!(!config.todo_listed_global);
     }
 }

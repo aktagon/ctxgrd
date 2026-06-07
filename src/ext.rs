@@ -33,7 +33,7 @@ use crate::subprocess::{self, Env, ExitKind};
 /// Default per-batch timeout when `[NS."<rule.code>".timeout_sec]` is
 /// not set. Applies to the entire batch (all docs through one
 /// invocation), not per-doc.
-pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Scratch directory used for the lifetime of one lint run.
 ///
@@ -44,14 +44,14 @@ pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Used to materialise body files for source-derived documents so
 /// rules can refer to them by path on disk. The body cache is reused
 /// across rules within one lint run.
-pub struct RunTempDir {
+pub(crate) struct RunTempDir {
     path: PathBuf,
     body_cache: std::cell::RefCell<BTreeMap<String, PathBuf>>,
 }
 
 impl RunTempDir {
     /// Production constructor — creates `$TMPDIR/ctxgrd.<pid>/`.
-    pub fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         let path = std::env::temp_dir().join(format!("ctxgrd.{}", std::process::id()));
         fs::create_dir_all(&path)?;
         Ok(Self {
@@ -74,7 +74,7 @@ impl RunTempDir {
         })
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -93,7 +93,7 @@ impl Drop for RunTempDir {
 /// the rule's stdin as JSONL (RUL-002); diagnostics arrive on stdout
 /// with a `path` field that the kernel uses to attribute each one back
 /// to its source `Document` (RUL-003).
-pub fn run_rule_batch(
+pub(crate) fn run_rule_batch(
     code: &str,
     run_path: &Path,
     docs: &[&Document],

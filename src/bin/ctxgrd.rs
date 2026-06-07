@@ -12,7 +12,7 @@
 //! Exit code: 0 / 1 / 2 per RUN-001. Config/kernel errors surface as
 //! a single-line `error: [cfg.*] ...` on stderr with exit 2.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -24,6 +24,7 @@ use std::io;
 use ctxgrd::config;
 use ctxgrd::diagnostic::Diagnostic;
 use ctxgrd::introspect;
+use ctxgrd::list;
 use ctxgrd::reporter;
 use ctxgrd::run::{self, LintError};
 use ctxgrd::scaffold;
@@ -99,6 +100,20 @@ enum Format {
     Json,
 }
 
+/// Output format for `ctxgrd list`.
+///
+/// Separate from [`Format`] because the inventory has no `simple`
+/// one-line diagnostic form, but does add `markdown` — an H2-per-
+/// namespace pipe table for pasting into docs or an LLM prompt.
+/// `rich` is the column-aligned terminal table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum ListFormat {
+    Rich,
+    Markdown,
+    Json,
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Lint the tree (default).
@@ -120,6 +135,10 @@ enum Cmd {
         /// Print to stdout instead of writing the file.
         #[arg(long)]
         stdout: bool,
+        /// Apply one or more packs after writing the base config — sugar
+        /// for `init` then `pack add <name>` for each (ADR-013 § PACK-006).
+        #[arg(long, value_delimiter = ',')]
+        pack: Vec<String>,
     },
     /// Scaffold a new document, or a new external rule when namespace is `rule`.
     New {
@@ -142,6 +161,17 @@ enum Cmd {
         /// Explicit document number (documents only); defaults to `max(existing) + 1`.
         #[arg(long)]
         id: Option<u32>,
+    },
+    /// List ingested documents grouped by namespace (ADR-015).
+    List {
+        /// Filter to a single namespace.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Output format. `rich` is the column-aligned table;
+        /// `markdown` emits an H2 heading + pipe table per namespace;
+        /// `json` emits the full document array.
+        #[arg(long, value_enum, default_value_t = ListFormat::Rich)]
+        format: ListFormat,
     },
     /// Introspect the resolved rule set.
     Rules {
@@ -177,6 +207,49 @@ enum Cmd {
     },
     /// Start the Language Server Protocol (LSP) server over stdio.
     Lsp,
+    /// Manage git hooks that gate commits on ctxgrd (ADR-014).
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+    /// Inspect and apply rule packs — reusable namespace bundles (ADR-013).
+    Pack {
+        #[command(subcommand)]
+        action: PackAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksAction {
+    /// Install a pre-commit hook that runs `ctxgrd` before each commit.
+    Install {
+        /// Overwrite an existing `.git/hooks/pre-commit`.
+        #[arg(long)]
+        force: bool,
+        /// Print the hook script instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PackAction {
+    /// List every discoverable pack (built-in, global, local).
+    List,
+    /// Show the namespaces, rules, and scripts a pack defines.
+    Show {
+        /// Pack name, e.g. `project-docs`.
+        name: String,
+    },
+    /// Apply a pack: append its blocks to ctxgrd.toml, never clobbering
+    /// an existing namespace. Copies any bundled rule scripts.
+    Add {
+        /// Pack name, e.g. `project-docs`.
+        name: String,
+        /// Print the config that would be written and exit, touching no file.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// End-user guides embedded at compile time so `ctxgrd docs <topic>`
@@ -185,6 +258,7 @@ const DOC_NAMESPACES: &str = include_str!("../../docs/namespaces.md");
 const DOC_RULES: &str = include_str!("../../docs/rules.md");
 const DOC_SOURCES: &str = include_str!("../../docs/sources.md");
 const DOC_REFERENCES: &str = include_str!("../../docs/references.md");
+const DOC_PACKS: &str = include_str!("../../docs/packs.md");
 
 fn main() -> ExitCode {
     match dispatch() {
@@ -207,7 +281,8 @@ fn dispatch() -> Result<ExitCode> {
             namespaces,
             force,
             stdout,
-        } => init_cmd(&cli.root, &namespaces, force, stdout),
+            pack,
+        } => init_cmd(&cli.root, &namespaces, force, stdout, &pack),
         Cmd::New {
             namespace,
             title,
@@ -238,9 +313,18 @@ fn dispatch() -> Result<ExitCode> {
             rule_code.as_deref(),
             format,
         ),
+        Cmd::List { namespace, format } => list_cmd(&cli.root, namespace.as_deref(), format),
         Cmd::Docs { topic } => docs_cmd(topic.as_deref()),
         Cmd::Refs { id, format } => refs_cmd(&cli.root, &id, format),
         Cmd::Lsp => lsp_cmd(),
+        Cmd::Hooks { action } => match action {
+            HooksAction::Install { force, dry_run } => hooks_install_cmd(&cli.root, force, dry_run),
+        },
+        Cmd::Pack { action } => match action {
+            PackAction::List => pack_list_cmd(&cli.root),
+            PackAction::Show { name } => pack_show_cmd(&cli.root, &name),
+            PackAction::Add { name, dry_run } => pack_add_cmd(&cli.root, &name, dry_run),
+        },
     }
 }
 
@@ -257,6 +341,7 @@ fn docs_cmd(topic: Option<&str>) -> Result<ExitCode> {
         println!("  rules       Write external rule scripts (rules/<ns>/<name>/run)");
         println!("  sources     Write external source scripts (sources/<name>/run)");
         println!("  references  Scan non-markdown files for pointer mentions");
+        println!("  packs       Apply reusable namespace bundles (ctxgrd pack)");
         println!();
         println!("Usage: ctxgrd docs <topic>");
         return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
@@ -264,6 +349,7 @@ fn docs_cmd(topic: Option<&str>) -> Result<ExitCode> {
     let body = match topic {
         "namespaces" => DOC_NAMESPACES,
         "rules" => DOC_RULES,
+        "packs" => DOC_PACKS,
         "sources" => DOC_SOURCES,
         "references" => DOC_REFERENCES,
         unknown => {
@@ -386,12 +472,12 @@ fn lint_cmd(root: &PathBuf, format: Format) -> Result<ExitCode> {
                     if !rendered.is_empty() {
                         print!("{rendered}");
                     }
-                    if outcome.exit == run::ExitStatus::Ok {
-                        eprintln!(
-                            "ok: {} · {} · 0 diagnostics",
-                            reporter::plural(outcome.documents_linted, "document"),
-                            reporter::plural(outcome.rules_active, "rule"),
-                        );
+                    if let Some(summary) = reporter::ok_summary(
+                        outcome.documents_linted,
+                        outcome.rules_active,
+                        &outcome.diagnostics,
+                    ) {
+                        eprintln!("{summary}");
                     }
                 }
                 Format::Simple => {
@@ -457,6 +543,38 @@ fn rules_cmd(
                 print!("{}", introspect::render_table(&entries));
             }
         }
+    }
+    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+}
+
+fn list_cmd(root: &PathBuf, namespace: Option<&str>, format: ListFormat) -> Result<ExitCode> {
+    let entries = match list::inventory(root, namespace) {
+        Ok(e) => e,
+        Err(e) => {
+            let d = match e {
+                run::LintError::Config(ce) => run::config_error_to_diagnostic(&ce, root),
+                other => Diagnostic::error("internal", "", 0, 0, format!("{other}")),
+            };
+            emit_error(&d, root);
+            return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+        }
+    };
+
+    // An empty inventory would render `rich` as a lonely header row and
+    // `markdown` as nothing at all — both read as "did it work?". JSON
+    // keeps the valid empty array so machine consumers are unaffected.
+    if entries.is_empty() && !matches!(format, ListFormat::Json) {
+        match namespace {
+            Some(ns) => println!("No {ns} documents found."),
+            None => println!("No documents found."),
+        }
+        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
+    }
+
+    match format {
+        ListFormat::Rich => print!("{}", list::render_table(&entries)),
+        ListFormat::Markdown => print!("{}", list::render_markdown(&entries)),
+        ListFormat::Json => println!("{}", list::render_json(&entries)),
     }
     Ok(ExitCode::from(run::ExitStatus::Ok.code()))
 }
@@ -633,6 +751,7 @@ fn init_cmd(
     namespaces: &[String],
     force: bool,
     to_stdout: bool,
+    packs: &[String],
 ) -> Result<ExitCode> {
     // ADR 006 § EXT-003 + ADR 007 § DOC-005: the body-header advisory
     // and the paths-pre-fill announcement must reach the user
@@ -664,36 +783,34 @@ fn init_cmd(
     // DOC-005: positive output (pre-fill announcement) sits above
     // EXT-003's body-header advisory so the user reads "here is what
     // is now linting" before "here is what still needs migration".
-    let stderr_extras = {
-        let mut s = String::new();
-        if let Some(a) = &paths_announcement {
-            s.push_str(a);
-        }
+    let flush_advisory = || {
         if let Some(a) = &body_header_advisory {
-            s.push_str(a);
+            eprint!("{a}");
         }
-        s
     };
     let flush_stderr = || {
-        if !stderr_extras.is_empty() {
-            eprint!("{stderr_extras}");
+        if let Some(a) = &paths_announcement {
+            eprint!("{a}");
+        }
+        if let Some(a) = &body_header_advisory {
+            eprint!("{a}");
         }
     };
 
     if to_stdout {
         print!("{toml_text}");
+        if !packs.is_empty() {
+            eprintln!("note: --pack is ignored with --stdout; packs are applied only when writing the file");
+        }
         flush_stderr();
         return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
     }
 
     let target = root.join("ctxgrd.toml");
     if target.exists() && !force {
-        let rel = relative_display(&target, root);
-        let d = Diagnostic::error("io.exists", &rel, 0, 0, format!("{rel} already exists"))
-            .with_help("re-run with --force to overwrite, or --stdout to print");
-        emit_error(&d, root);
-        flush_stderr();
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+        println!("ctxgrd.toml already exists — left unchanged");
+        flush_advisory();
+        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
     }
 
     if let Err(e) = fs::create_dir_all(root) {
@@ -725,14 +842,258 @@ fn init_cmd(
         .strip_prefix(root)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| target.display().to_string());
-    println!("{display_path}");
+    println!("Created  {display_path}");
+
+    // PACK-006: `init --pack` is sugar for `init` then `pack add` per
+    // pack. Apply after the base config is on disk so each pack appends
+    // its missing blocks (never-clobbering the namespaces init wrote).
+    for name in packs {
+        match ctxgrd::pack::find(root, name) {
+            Some(p) => {
+                let plan = ctxgrd::pack::apply_add(&p, root)?;
+                report_pack_add(&p, &plan);
+            }
+            None => {
+                let d =
+                    Diagnostic::error("pack.unknown", "", 0, 0, format!("unknown pack '{name}'"))
+                        .with_help("run `ctxgrd pack list` to see available packs");
+                emit_error(&d, root);
+                flush_stderr();
+                return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+            }
+        }
+    }
+
+    // PKD-003: advertise discoverable packs as an adoption on-ramp.
+    // Suppressed when the user already applied one via --pack (PKD-004);
+    // the --stdout path returned earlier, so it never reaches here.
+    if packs.is_empty() {
+        let discovered = ctxgrd::pack::discover(root);
+        if !discovered.is_empty() {
+            println!();
+            println!("Available packs:");
+            println!();
+            print!("{}", ctxgrd::pack::render_init_packs(&discovered));
+        }
+    }
+
     println!();
     println!("Next steps:");
-    println!("  • Review the generated sections and customise headings / allowed values.");
+    println!("  • Apply a pack:             ctxgrd pack add <name>");
     if let Some(first) = active.first() {
-        println!("  • Scaffold your first document:  ctxgrd new {first} \"<title>\"");
+        println!("  • Scaffold a document:      ctxgrd new {first} \"<title>\"");
     }
-    println!("  • List resolved rules:            ctxgrd rules");
+    println!("  • Run the linter:           ctxgrd check");
+    println!("  • Install pre-commit hook:  ctxgrd hooks install");
     flush_stderr();
+    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+}
+
+/// `ctxgrd pack list` — read-only table of every discoverable pack
+/// (PACK-004). Touches no file.
+fn pack_list_cmd(root: &Path) -> Result<ExitCode> {
+    let packs = ctxgrd::pack::discover(root);
+    print!("{}", ctxgrd::pack::render_list(&packs));
+    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+}
+
+/// `ctxgrd pack show <name>` — read-only detail view of one pack
+/// (PACK-004). Touches no file.
+fn pack_show_cmd(root: &Path, name: &str) -> Result<ExitCode> {
+    let Some(pack) = ctxgrd::pack::find(root, name) else {
+        return pack_not_found(root, name);
+    };
+    print!("{}", ctxgrd::pack::render_show(&pack));
+    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+}
+
+/// `ctxgrd pack add <name>` — apply a pack, create-or-append, never
+/// clobber (PACK-005). `--dry-run` prints the config it would write and
+/// exits without touching any file.
+fn pack_add_cmd(root: &Path, name: &str, dry_run: bool) -> Result<ExitCode> {
+    let Some(pack) = ctxgrd::pack::find(root, name) else {
+        return pack_not_found(root, name);
+    };
+
+    if dry_run {
+        let existing = fs::read_to_string(root.join("ctxgrd.toml")).unwrap_or_default();
+        let plan = ctxgrd::pack::plan_add(&pack, &existing, root);
+        if plan.blocks_text.is_empty() {
+            println!("# (nothing to add — every namespace is already present)");
+        } else {
+            print!("{}", plan.blocks_text);
+        }
+        for ns in &plan.skipped {
+            eprintln!("would skip [{ns}] — already defined in ctxgrd.toml");
+        }
+        for rule in &plan.rules_to_copy {
+            eprintln!("would copy rules/{}/{}/run", rule.ns, rule.name);
+        }
+        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
+    }
+
+    let plan = ctxgrd::pack::apply_add(&pack, root)?;
+    report_pack_add(&pack, &plan);
+    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+}
+
+/// Shared success report for `pack add` and `init --pack` (PKC-003).
+/// Uses `render_add_receipt` to split path-claimed vs id-claimed namespaces;
+/// reports any skipped or copied items separately.
+fn report_pack_add(pack: &ctxgrd::pack::Pack, plan: &ctxgrd::pack::AddPlan) {
+    let receipt = ctxgrd::pack::render_add_receipt(pack, plan);
+    if !receipt.is_empty() {
+        print!("{receipt}");
+    }
+    for ns in &plan.skipped {
+        println!("skipped [{ns}] — already defined in ctxgrd.toml");
+    }
+    for rule in &plan.rules_to_copy {
+        println!("copied rules/{}/{}/run", rule.ns, rule.name);
+    }
+    if plan.added.is_empty() && plan.skipped.is_empty() {
+        println!("pack '{}': nothing to add", pack.name);
+    }
+}
+
+/// Emit the `pack.unknown` error and return the kernel-error exit code.
+fn pack_not_found(root: &Path, name: &str) -> Result<ExitCode> {
+    let d = Diagnostic::error("pack.unknown", "", 0, 0, format!("unknown pack '{name}'"))
+        .with_help("run `ctxgrd pack list` to see available packs");
+    emit_error(&d, root);
+    Ok(ExitCode::from(run::ExitStatus::KernelError.code()))
+}
+
+/// Render the pre-commit hook script. The hook is intentionally
+/// minimal (ADR-014 § HOOK-005): it delegates entirely to `ctxgrd` and
+/// lets the three-valued exit code decide the commit — a non-zero exit
+/// (lint failure `1` or kernel error `2`) aborts it. The
+/// `command -v ctxgrd` guard keeps a machine without ctxgrd on PATH
+/// (e.g. a fresh clone before install) from blocking commits; CI is the
+/// backstop gate there.
+fn render_precommit_hook(root: &std::path::Path) -> String {
+    let root_arg = root.display();
+    format!(
+        "#!/bin/sh\n\
+         # Installed by `ctxgrd hooks install` (ADR-014).\n\
+         # Gates commits on ctxgrd; a non-zero exit aborts the commit.\n\
+         command -v ctxgrd >/dev/null 2>&1 || {{\n\
+         \techo 'ctxgrd not found on PATH; skipping document lint' >&2\n\
+         \texit 0\n\
+         }}\n\
+         # Signals commit context so the agents.context-cache rule can warn\n\
+         # on cache-busting edits to CLAUDE.md/AGENTS.md (ADR-020).\n\
+         export CTXGRD_COMMIT_CONTEXT=1\n\
+         exec ctxgrd --root \"{root_arg}\"\n"
+    )
+}
+
+/// The pre-commit-framework snippet printed when `.pre-commit-config.yaml`
+/// is present (ADR-014 § HOOK-004). The `rev` tracks the installed
+/// binary's version so the printed pin matches what the user has.
+fn render_precommit_framework_snippet() -> String {
+    format!(
+        "repos:\n\
+         \x20\x20- repo: https://github.com/aktagon/ctxgrd\n\
+         \x20\x20\x20\x20rev: v{version}\n\
+         \x20\x20\x20\x20hooks:\n\
+         \x20\x20\x20\x20\x20\x20- id: ctxgrd\n",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn hooks_install_cmd(root: &PathBuf, force: bool, dry_run: bool) -> Result<ExitCode> {
+    // HOOK-004: a repo managed by the pre-commit framework owns its
+    // hooks — writing a raw `.git/hooks/pre-commit` would be clobbered
+    // on the framework's next `pre-commit install`. Detect it and emit
+    // the framework's native config instead. This takes precedence over
+    // everything else, including --dry-run: the "what would I do" answer
+    // here is simply "print this snippet".
+    if root.join(".pre-commit-config.yaml").exists() {
+        println!(
+            "{} already exists — add ctxgrd to it rather than writing a raw hook:",
+            relative_display(&root.join(".pre-commit-config.yaml"), root)
+        );
+        println!();
+        print!("{}", render_precommit_framework_snippet());
+        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
+    }
+
+    let script = render_precommit_hook(root);
+
+    // HOOK-006: --dry-run previews the script and writes nothing. Allowed
+    // outside a git repo too — it is a harmless preview.
+    if dry_run {
+        print!("{script}");
+        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
+    }
+
+    // Git-repo precondition: a `.git` directory must be present. Worktrees
+    // and submodules (where `.git` is a file) are deferred per ADR-014's
+    // Open Questions — report rather than guess.
+    let git_dir = root.join(".git");
+    if !git_dir.is_dir() {
+        let rel = relative_display(root, root);
+        let d = Diagnostic::error(
+            "hooks.not-a-repo",
+            &rel,
+            0,
+            0,
+            "not a git repository (no .git directory)".to_string(),
+        )
+        .with_help("run `ctxgrd hooks install` from a git repository root")
+        .with_note("pass --root to point at the repository containing .git");
+        emit_error(&d, root);
+        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+    }
+
+    let hook_path = git_dir.join("hooks").join("pre-commit");
+
+    // HOOK-003: never clobber an existing hook without --force. Mirrors
+    // init_cmd's ctxgrd.toml guard.
+    if hook_path.exists() && !force {
+        let rel = relative_display(&hook_path, root);
+        let d = Diagnostic::error("io.exists", &rel, 0, 0, format!("{rel} already exists"))
+            .with_help("re-run with --force to overwrite, or --dry-run to preview");
+        emit_error(&d, root);
+        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+    }
+
+    let hooks_dir = git_dir.join("hooks");
+    if let Err(e) = fs::create_dir_all(&hooks_dir) {
+        let rel = relative_display(&hooks_dir, root);
+        let d = Diagnostic::error("io.mkdir", &rel, 0, 0, format!("could not create {rel}"))
+            .with_help("check file permissions on the .git directory")
+            .with_note(format!("cause: {e}"));
+        emit_error(&d, root);
+        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+    }
+    if let Err(e) = fs::write(&hook_path, script.as_bytes()) {
+        let rel = relative_display(&hook_path, root);
+        let d = Diagnostic::error("io.write", &rel, 0, 0, format!("could not write {rel}"))
+            .with_help("check file permissions")
+            .with_note(format!("cause: {e}"));
+        emit_error(&d, root);
+        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)) {
+            let rel = relative_display(&hook_path, root);
+            let d = Diagnostic::error("io.chmod", &rel, 0, 0, format!("could not chmod {rel}"))
+                .with_help("check file permissions")
+                .with_note(format!("cause: {e}"));
+            emit_error(&d, root);
+            return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+        }
+    }
+
+    let rel = relative_display(&hook_path, root);
+    println!("{rel}");
+    println!();
+    println!("Installed a pre-commit hook. It runs `ctxgrd` before each commit;");
+    println!("a lint failure aborts the commit. Remove it with `rm {rel}`.");
     Ok(ExitCode::from(run::ExitStatus::Ok.code()))
 }

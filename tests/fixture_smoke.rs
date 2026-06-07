@@ -14,7 +14,7 @@ fn adr_099_broken_demo_smoke() {
     let doc = result
         .documents
         .iter()
-        .find(|d| d.location.ends_with("ADR-099-broken-demo.md"))
+        .find(|d| d.location.ends_with("099-broken-demo.md"))
         .expect("broken demo present in scan");
 
     assert_eq!(doc.id.namespace, "ADR");
@@ -131,7 +131,7 @@ fn cli_refs_subcommand_finds_all_pointer_kinds_for_adr_001() {
 
     // Self: the document itself when file-backed.
     assert!(
-        stdout.contains("adrs/ADR-001-use-event-sourcing-for-audit.md:0:0: (self)"),
+        stdout.contains("adrs/001-use-event-sourcing-for-audit.md:0:0: (self)"),
         "expected SelfDoc hit; got:\n{stdout}"
     );
     // Body cross-ref: ADR-001 mentions itself in its body somewhere.
@@ -181,4 +181,37 @@ fn cli_refs_subcommand_emits_valid_json() {
     assert!(stdout.contains(r#""kind":"depends_on""#));
     assert!(stdout.contains(r#""kind":"body_cross_ref""#));
     assert!(stdout.contains(r#""kind":"scanner_hit""#));
+}
+
+/// ADR-015 empty-inventory handling. Filtering to a namespace the
+/// fixture doesn't define yields zero documents. `rich` and `markdown`
+/// must print a human note rather than a lonely header / blank output;
+/// `json` keeps the valid empty array.
+#[test]
+fn cli_list_empty_namespace_prints_note_but_json_stays_array() {
+    let note = Command::cargo_bin("ctxgrd")
+        .expect("binary built")
+        .args(["--root", "examples", "list", "--namespace", "RUNBOOK"])
+        .output()
+        .expect("ctxgrd executes");
+    assert_eq!(note.status.code(), Some(0));
+    let stdout = String::from_utf8(note.stdout).expect("stdout utf-8");
+    assert_eq!(stdout, "No RUNBOOK documents found.\n");
+
+    let json = Command::cargo_bin("ctxgrd")
+        .expect("binary built")
+        .args([
+            "--root",
+            "examples",
+            "list",
+            "--namespace",
+            "RUNBOOK",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("ctxgrd executes");
+    assert_eq!(json.status.code(), Some(0));
+    let json_stdout = String::from_utf8(json.stdout).expect("stdout utf-8");
+    assert_eq!(json_stdout.trim_end(), "[]");
 }

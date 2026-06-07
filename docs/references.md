@@ -97,9 +97,9 @@ a given document ID, sorted deterministically:
 
 ```
 $ ctxgrd refs ADR-001
-adrs/ADR-001-use-event-sourcing-for-audit.md:0:0: (self)
-adrs/ADR-001-use-event-sourcing-for-audit.md:9:3: (body ref from ADR-001)
-pmrs/PMR-001-audit-log-dropped-events-2026-03.md:6:0: (depends_on from PMR-001)
+adrs/001-use-event-sourcing-for-audit.md:0:0: (self)
+adrs/001-use-event-sourcing-for-audit.md:9:3: (body ref from ADR-001)
+pmrs/001-audit-log-dropped-events-2026-03.md:6:0: (depends_on from PMR-001)
 refs/main.go:12:32: (scanner)
 refs/lib.rs:7:46: (scanner)
 ```

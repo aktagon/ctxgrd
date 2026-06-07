@@ -66,7 +66,7 @@ are announced on stderr.
 
 ## Configuring `[<NS>].paths`
 
-`paths` is a list of gitignore-style globs, relative to the lint root.
+`paths` is a list of globs, matched relative to the lint root.
 
 ```toml
 [ADR]
@@ -77,9 +77,11 @@ paths = ["docs/adrs/**", "docs/decisions/**"]
 matter. A file is path-claimed by the namespace if it matches **any**
 entry in the list.
 
-**Glob syntax.** Standard gitignore globs: `**` for any-depth wildcard,
-`*` for single-segment, `?` for single character. Patterns are matched
-against the file path relative to the lint root.
+**Glob syntax.** Globset syntax, not gitignore: patterns are anchored at
+the lint root (a slash-free pattern like `TODO.md` matches only a
+root-level entry — prefix `**/` to match at any depth), and `*` matches
+across `/` separators (prefer `**` to make any-depth intent explicit).
+`?` matches a single character.
 
 **Negation is not supported.** Patterns starting with `!` (e.g.
 `!docs/adrs/superseded/**`) are not allowed in `[<NS>].paths`. Each
@@ -158,20 +160,26 @@ status = ["Open", "In Progress", "Closed"]
 Each namespace is its own top-level section. They are independent — paths,
 rules, parameters, and headings differ per namespace:
 
+> Standing up several namespaces at once? Rather than hand-write a block
+> per doc type, a **rule pack** can generate them — `ctxgrd pack add
+project-docs` writes ADR, PRD, RFC, BUG, and TODO blocks in one step
+> (`ctxgrd pack add ops` adds RUN runbooks and PMR postmortems).
+> See `ctxgrd docs packs` (or [`packs.md`](packs.md)).
+
 ```toml
 [ADR]
 paths = ["docs/adrs/**"]
 rules = ["core.frontmatter", "core.id", ..., "core.required-headings"]
 
 [ADR."core.required-headings"]
-headings = ["Status", "Context", "Decision", "Consequences"]
+headings = ["Status", "Context", "Requirements", "Consequences", "Open Questions", "References", "Change log"]
 
 [PRD]
 paths = ["docs/prds/**"]
 rules = ["core.frontmatter", "core.id", ..., "core.required-headings"]
 
 [PRD."core.required-headings"]
-headings = ["Overview", "Goals", "Requirements", "Success metrics"]
+headings = ["Context", "Goals", "Non-goals", "User stories", "Requirements", "Definition of Done", "Open Questions", "References", "Change log"]
 ```
 
 If two namespaces' `paths` overlap, ctxgrd resolves the conflict by

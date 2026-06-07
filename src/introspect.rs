@@ -90,7 +90,17 @@ pub const CORE_DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "Metadata values must match configured allow-lists.",
         "For each listed key, if present in metadata, value is in the allow-list. Missing keys are skipped.",
     ),
+    (
+        "core.requirement-ref",
+        "Requirement references must resolve to defined requirements.",
+        "Scans `**Satisfies:**` / `**Addressed by:**` list items; emits a warning for each \
+         requirement-ID token (known prefix, missing number) that does not resolve to a heading \
+         definition in the linted corpus. Foreign prefixes (HTTP, RFC) are silently ignored.",
+    ),
 ];
+
+// BUILTIN_COMPILED_DESCRIPTIONS removed — descriptions are now derived from
+// crate::builtin_rules::BUILTIN_RULES at the point of use (ADR-024 § REG-002).
 
 /// Produce every `(namespace, rule-code)` entry the resolved config
 /// activates, sorted by `(namespace, code)`.
@@ -145,6 +155,18 @@ fn resolve(
         let (summary, description) = core_map.get(code).copied().unwrap_or(("", ""));
         return (
             "core".to_string(),
+            summary.to_string(),
+            description.to_string(),
+        );
+    }
+    if crate::config::is_builtin_compiled(code) {
+        let (summary, description) = crate::builtin_rules::BUILTIN_RULES
+            .iter()
+            .find(|r| r.code == code)
+            .map(|r| (r.summary, r.description))
+            .unwrap_or(("", ""));
+        return (
+            "pack".to_string(),
             summary.to_string(),
             description.to_string(),
         );

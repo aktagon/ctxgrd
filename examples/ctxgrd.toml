@@ -6,6 +6,19 @@
 # (frontmatter ∪ source `extra`, frontmatter wins), so the same rule
 # works for local markdown docs and JIRA-sourced docs alike.
 
+[ignore]
+patterns = [
+  "**/.*",
+  "target/**",
+  "**/node_modules/**",
+  "**/__pycache__/**",
+  "**/dist/**",
+  "**/build/**",
+  "**/log/**",
+  "**/logs/**",
+  "**/tmp/**",
+]
+
 # ───────────────────────── Sources ─────────────────────────
 
 # Activates the jira-stub source discovered at sources/jira-stub/run.
@@ -122,3 +135,49 @@ keys = ["status", "assignee"]
 
 [JIRA."core.allowed-values"]
 status = ["Open", "In Progress", "Closed"]
+
+# ─────────────────────── PROMPT ─────────────────────────
+#
+# Reusable LLM prompts (global CLAUDE.md: docs/prompts/<NNN>-<name>.md).
+# Mirrors the llm-agents pack's PROMPT namespace (ADR-013 § PACK-009).
+# id-claim only: a prompt is linted once it carries `id: PROMPT-<n>`;
+# frontmatter-less siblings like `*.test.md` stay silently skipped
+# under intent classification (ADR-007 § DOC-001).
+#
+[PROMPT]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.required-headings",
+  "core.required-metadata",
+]
+
+[PROMPT."core.required-headings"]
+headings = ["System prompt", "Output format"]
+
+[PROMPT."core.required-metadata"]
+keys = ["id", "title"]
+
+# ─────────────────────── AGENTS ─────────────────────────
+#
+# The always-loaded instruction files (CLAUDE.md / AGENTS.md). Path-claimed,
+# not id-claim — these files exist in most repos, so the namespace fires on
+# them deliberately (ADR-020 § ACX-001). The three `agents.*` rules are
+# builtin-compiled (source: pack).
+#
+[AGENTS]
+paths = ["CLAUDE.md", "AGENTS.md"]
+rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
+
+# ──────────────────────── TODO ──────────────────────────
+#
+# The repo-root TODO.md state file (`TODO.md`, not `**/TODO.md`). The two
+# `todo.*` rules validate its freshness line and section structure.
+#
+[TODO]
+paths = ["TODO.md"]
+rules = ["todo.freshness", "todo.structure"]
+
+[TODO."todo.freshness"]
+stale_days = 30

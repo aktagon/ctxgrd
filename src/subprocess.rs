@@ -28,11 +28,11 @@ use wait_timeout::ChildExt;
 ///
 /// Built via [`baseline_env`] + call-site insertions. Nothing from the
 /// parent process leaks in unless it's listed in the baseline.
-pub type Env = BTreeMap<OsString, OsString>;
+pub(crate) type Env = BTreeMap<OsString, OsString>;
 
 /// How a subprocess exit terminated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExitKind {
+pub(crate) enum ExitKind {
     Success,
     /// Process exited non-zero with `code`. `Some(code)` when the OS
     /// reported a numeric status; `None` when the process was killed
@@ -42,7 +42,7 @@ pub enum ExitKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct RunOutput {
+pub(crate) struct RunOutput {
     pub exit: ExitKind,
     pub stdout: Vec<u8>,
     /// Captured but not yet surfaced. Kept so a future `--debug` flag
@@ -58,14 +58,14 @@ impl RunOutput {
     /// source envelope JSONL and rule diagnostic JSONL are UTF-8 by
     /// contract, but we don't want to panic on rogue bytes from a
     /// malformed script.
-    pub fn stdout_utf8(&self) -> String {
+    pub(crate) fn stdout_utf8(&self) -> String {
         String::from_utf8_lossy(&self.stdout).into_owned()
     }
 
     /// Symmetric to [`Self::stdout_utf8`]. See the field comment for
     /// why this is kept alongside an unread buffer.
     #[allow(dead_code)]
-    pub fn stderr_utf8(&self) -> String {
+    pub(crate) fn stderr_utf8(&self) -> String {
         String::from_utf8_lossy(&self.stderr).into_owned()
     }
 }
@@ -73,7 +73,7 @@ impl RunOutput {
 /// Platform baseline env — `PATH`, `HOME`, `LANG`, and every `LC_*`
 /// variable the parent has. These are the only parent-process env
 /// vars that propagate to sources and rules, per SRC-002 / EXT-002.
-pub fn baseline_env() -> Env {
+pub(crate) fn baseline_env() -> Env {
     let mut env = Env::new();
     for key in ["PATH", "HOME", "LANG"] {
         if let Ok(val) = std::env::var(key) {
@@ -111,7 +111,7 @@ fn absolutize(program: &Path) -> io::Result<PathBuf> {
 /// Run `program args...` with a fully scrubbed environment and a hard
 /// timeout. On timeout the child is killed and whatever stdout/stderr
 /// was buffered up to that point is returned.
-pub fn run(
+pub(crate) fn run(
     program: &Path,
     args: &[&Path],
     env: &Env,
@@ -194,7 +194,7 @@ fn drain<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Vec<u8>> {
 /// The stdin write happens on a dedicated thread so it cannot deadlock
 /// against the stdout/stderr drains. If the child closes stdin early
 /// (broken pipe), the writer simply errors out and exits.
-pub fn run_with_stdin(
+pub(crate) fn run_with_stdin(
     program: &Path,
     args: &[&Path],
     env: &Env,
@@ -266,7 +266,7 @@ pub fn run_with_stdin(
 }
 
 /// Insert a `CTXGRD_*` variable into an env map. Convenience.
-pub fn set_env(env: &mut Env, key: &str, value: impl Into<OsString>) {
+pub(crate) fn set_env(env: &mut Env, key: &str, value: impl Into<OsString>) {
     env.insert(OsString::from(key), value.into());
 }
 
