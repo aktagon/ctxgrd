@@ -29,6 +29,7 @@ const PROJECT_DOCS_TOML: &str = include_str!("../packs/project-docs/pack.toml");
 const OPS_TOML: &str = include_str!("../packs/ops/pack.toml");
 const AGENTS_TOML: &str = include_str!("../packs/agents/pack.toml");
 const DESIGN_TOML: &str = include_str!("../packs/design/pack.toml");
+const PERSONA_TOML: &str = include_str!("../packs/persona/pack.toml");
 
 /// A discovered pack, normalised across the three discovery sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +94,7 @@ pub struct AddPlan {
 }
 
 /// The built-in packs (PACK-009). Four packs: `project-docs`, `ops`,
-/// `agents`, and `design` (ADR-023 § PKC-001, ADR-027).
+/// `agents`, `design`, and `persona` (ADR-023 § PKC-001, ADR-027, ADR-034).
 pub fn builtin_packs() -> Vec<Pack> {
     vec![
         Pack {
@@ -137,6 +138,21 @@ pub fn builtin_packs() -> Vec<Pack> {
             source_label: "built-in".to_string(),
             rank: 0,
             toml_text: DESIGN_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // STYLE namespace — path-claimed on STYLE.md. Structural checks
+            // only (section order, SOUL.md pairing). Voice quality
+            // (rules-vs-adjectives) is semantic and declined — there is no
+            // companion linter to delegate it to (ADR-034 § STY-005). Kept
+            // standalone, not folded into `agents`, because persona/voice is
+            // orthogonal to the coding-agent workflow (ADR-034 § Context,
+            // following the ADR-027 precedent for `design`).
+            name: "persona".to_string(),
+            summary: summary_of(PERSONA_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: PERSONA_TOML.to_string(),
             rules: Vec::new(),
         },
     ]

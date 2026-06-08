@@ -11,6 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Nothing yet.**
 
+## [0.15.0] — 2026-06-08
+
+### Added
+
+- **The `persona` pack (ADR-034).** Lints `STYLE.md` — the voice half of the
+  [SOUL.md / STYLE.md](https://github.com/aaronjmars/soul.md) persona
+  convention (MIT). Two warning-level rules: `style.section-order` flags a
+  duplicate section and nudges toward the `STYLE.template.md` order (advisory —
+  the spec mandates no order, so it never blocks), and `style.soul-pair` warns
+  when a `STYLE.md` has no `SOUL.md` beside it. What it does not do is judge the
+  voice. Whether a line is a concrete rule or a vague adjective — the thing that
+  actually makes a STYLE.md work — is a semantic call that belongs to a model
+  eval, not a structural linter, so ctxgrd declines it and says so in the pack
+  comment. Opt in with `ctxgrd pack add persona`.
+- **`pipeline.conformance` (SPEC-002).** When a `[pipeline].stages` order is
+  declared — say `PRD → ADR → SPEC → TASK` — a `depends_on` edge that jumps a
+  stage now errors, and the diagnostic names the stages it skipped. A TASK that
+  depends straight on a PRD under that pipeline is the case it catches. Edges
+  touching a namespace not listed in `stages` are exempt, and the rule stays
+  silent until a `[pipeline]` table exists.
+
+### Fixed
+
+- **`design.section-order` and `design.token-ref` now actually fire on a
+  `DESIGN.md`.** They were registered as document-level rules, but `DESIGN.md`
+  is path-claimed and never becomes an id-keyed document — so they ran in their
+  unit tests and nowhere else. A real `DESIGN.md` got nothing from them, and on
+  top of that a spurious `core.id` error for missing an `id:` it was never meant
+  to carry. Both are file-level now; the rules run, and the `design` pack no
+  longer trips `core.id`. Found while wiring up the `persona` pack, which is
+  path-claimed the same way.
+
 ## [0.14.0] — 2026-06-07
 
 ### Fixed

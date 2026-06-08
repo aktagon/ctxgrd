@@ -28,7 +28,7 @@ endif
 
 BIN := $(TARGET_DIR)/$(TARGET)/ctxgrd
 
-.PHONY: help build install install-debug uninstall test check lint fmt clean run-example
+.PHONY: help build install install-debug uninstall test ci check lint fmt clean run-example
 
 help:
 	@echo "ctxgrd — Makefile targets"
@@ -38,6 +38,7 @@ help:
 	@echo "  install-debug Install the unoptimized debug build (fast to compile)"
 	@echo "  uninstall    Remove ctxgrd from $(BINDIR)/"
 	@echo "  test         Run all tests"
+	@echo "  ci           check + test — the canonical gate"
 	@echo "  check        cargo check + cargo clippy -D warnings"
 	@echo "  fmt          Format every file with rustfmt"
 	@echo "  clean        cargo clean"
@@ -72,6 +73,11 @@ uninstall:
 
 test:
 	$(CARGO) test
+
+# Canonical gate: the full lint+lib check plus the whole test suite
+# (unit + every integration suite, including the SPEC-002 acceptance
+# scenarios in tests/status.rs). Point CI at this single target.
+ci: check test
 
 check: adr-lint
 	$(CARGO) check --all-targets

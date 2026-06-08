@@ -61,6 +61,9 @@ const TODO_LISTED: &str = "todo.listed";
 const DESIGN_SECTION_ORDER: &str = "design.section-order";
 const DESIGN_TOKEN_REF: &str = "design.token-ref";
 const EARS_SYNTAX: &str = "ears.clause-syntax";
+const STYLE_SECTION_ORDER: &str = "style.section-order";
+const STYLE_SOUL_PAIR: &str = "style.soul-pair";
+const PIPELINE_CONFORMANCE: &str = "pipeline.conformance";
 
 const DEFAULT_STALE_DAYS: i64 = 30;
 /// Generous default word budget for an always-loaded instruction file
@@ -158,15 +161,26 @@ pub(crate) fn document_check(code: &str) -> Option<crate::builtin_rules::CheckFn
 /// Build a minimal [`Document`] for a file-level guide file. The `id` is
 /// a placeholder — the file-level rules never read it; these files have
 /// no real `<NS>-<number>` identity.
+///
+/// Frontmatter is parsed when present so file-level rules that read
+/// `metadata` (e.g. `design.token-ref`/`style.*`) see the real values. A
+/// missing or malformed fence yields empty maps — the `agents.*`/`todo.*`
+/// rules ignore metadata and `skills.frontmatter` re-parses the body itself,
+/// so populating these fields is purely additive. The `core.frontmatter` /
+/// `core.id` parse diagnostics for these singletons are handled (suppressed)
+/// in `run.rs`, not here.
 fn synthetic_document(namespace: &str, location: String, body: String) -> Document {
     let ast = markdown::parse_ast(&body);
+    let (metadata, frontmatter_lines) = crate::frontmatter::Frontmatter::parse_with_lines(&body)
+        .map(|(fm, lines)| (fm.metadata, lines))
+        .unwrap_or_default();
     Document {
         id: DocumentId::new(namespace.to_string(), 0),
         raw_id: String::new(),
         location,
         depends_on: Vec::new(),
-        frontmatter_lines: Default::default(),
-        metadata: Default::default(),
+        frontmatter_lines,
+        metadata,
         ast: Some(ast),
         body,
     }
@@ -1166,6 +1180,89 @@ pub(crate) fn check_spec_requires_prd(
     ]
 }
 
+// -- pipeline.conformance (document-level) ---------------------------
+
+/// `pipeline.conformance` (SPEC-002 EARS-06.*): flag a dependency edge
+/// that skips one or more declared pipeline stages. Auto-active when a
+/// `[pipeline]` table is declared, for documents in staged namespaces;
+/// the declared `stages` order arrives via `params["stages"]` (the rule
+/// is edge-level, so it needs config the per-document `CheckFn` channel
+/// would not otherwise carry).
+///
+/// Edge direction follows the lift convention: a document `A` with
+/// `depends_on: [B]` is the downstream end of the edge `ns(B) → ns(A)`.
+/// A forward declared distance > 1 means one or more stages between
+/// `ns(B)` and `ns(A)` were skipped (EARS-06.2). Edges whose endpoints
+/// are not both staged are exempt (EARS-06.3).
+pub(crate) fn check_pipeline_conformance(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    // The declared stage order arrives via `params["stages"]`; without
+    // it there is nothing to measure distance against.
+    let Some(stages) = params
+        .and_then(|p| p.get("stages"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let stage_pos = |ns: &str| -> Option<usize> {
+        stages.iter().position(|s| s.as_str() == Some(ns))
+    };
+
+    // The downstream end of every edge is this document. An edge whose
+    // downstream namespace is unstaged is exempt (EARS-06.3).
+    let Some(downstream) = stage_pos(&doc.id.namespace) else {
+        return Vec::new();
+    };
+
+    let line = doc
+        .frontmatter_lines
+        .get("depends_on")
+        .copied()
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for entry in &doc.depends_on {
+        // The upstream namespace is the prefix of the depends_on id.
+        let Some((upstream_ns, _)) = entry.split_once('-') else {
+            continue;
+        };
+        // EARS-06.3: an edge touching an unstaged namespace is exempt.
+        let Some(upstream) = stage_pos(upstream_ns) else {
+            continue;
+        };
+        // A forward distance of 0 (same stage) or 1 (adjacent) skips
+        // nothing. Only distance > 1 names skipped stages (EARS-06.2);
+        // backward edges are a cycle concern, handled elsewhere.
+        if downstream <= upstream + 1 {
+            continue;
+        }
+        let skipped: Vec<&str> = stages[upstream + 1..downstream]
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        out.push(
+            Diagnostic::error(
+                PIPELINE_CONFORMANCE,
+                doc.location.clone(),
+                line,
+                0,
+                format!(
+                    "{} depends directly on {entry}, skipping pipeline stage(s) {}",
+                    doc.raw_id,
+                    skipped.join(", ")
+                ),
+            )
+            .with_help(
+                "route the dependency through the intermediate stage(s), or drop the \
+                 skipped namespaces from [pipeline].stages",
+            ),
+        );
+    }
+    out
+}
+
 // -- todo.listed (document-level) ------------------------------------
 
 /// Default statuses that exempt a document from the `todo.listed` check.
@@ -1419,6 +1516,127 @@ pub(crate) fn check_design_token_ref(
     }
 
     out
+}
+
+// -- STYLE namespace (style.section-order, style.soul-pair) -----------
+
+/// Maps a normalized heading string to its 0-indexed position in the
+/// `STYLE.template.md` section sequence (ADR-034 § STY-002). Returns
+/// `None` for unrecognized headings, which are silently skipped — STYLE.md
+/// sections are optional ("cut any that do not apply").
+fn style_canonical_index(normalized: &str) -> Option<usize> {
+    match normalized {
+        "voice principles" => Some(0),
+        "vocabulary" => Some(1),
+        "punctuation & formatting" => Some(2),
+        "platform differences" => Some(3),
+        "quick reactions" => Some(4),
+        "rhetorical moves" => Some(5),
+        "anti-patterns" => Some(6),
+        "examples of right voice" => Some(7),
+        _ => None,
+    }
+}
+
+/// `style.section-order` (STY-002): duplicate recognized `##` headings are
+/// an authoring mistake; recognized sections appearing after a
+/// higher-template-index section get an advisory nudge toward the template
+/// sequence. Both are **warnings** — unlike `design.section-order`, the
+/// SOUL.md spec mandates no order (verified 2026-06-08), so the order arm
+/// must never fail a spec-conformant file that reordered optional sections.
+/// Unrecognized headings are silently skipped.
+pub(crate) fn check_style_section_order(
+    doc: &Document,
+    _params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(ast) = doc.ast.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut last_seen: Option<(usize, String)> = None;
+    let mut seen_indices = [false; 8];
+
+    for h in ast.headings.iter().filter(|h| h.level == 2) {
+        let normalized = h.text.trim().to_lowercase();
+        let Some(idx) = style_canonical_index(&normalized) else {
+            continue;
+        };
+
+        if seen_indices[idx] {
+            out.push(
+                Diagnostic::warning(
+                    STYLE_SECTION_ORDER,
+                    doc.location.clone(),
+                    h.line,
+                    0,
+                    format!("duplicate section '{}'", h.text.trim()),
+                )
+                .with_help("each STYLE.md section should appear at most once"),
+            );
+        } else if last_seen
+            .as_ref()
+            .is_some_and(|(last_idx, _)| idx < *last_idx)
+        {
+            let last_text = last_seen.as_ref().map(|(_, t)| t.as_str()).unwrap_or("");
+            out.push(
+                Diagnostic::warning(
+                    STYLE_SECTION_ORDER,
+                    doc.location.clone(),
+                    h.line,
+                    0,
+                    format!(
+                        "section '{}' appears after '{}' — STYLE.template.md order is Voice \
+                         Principles, Vocabulary, Punctuation & Formatting, Platform Differences, \
+                         Quick Reactions, Rhetorical Moves, Anti-Patterns, Examples of Right Voice",
+                        h.text.trim(),
+                        last_text
+                    ),
+                )
+                .with_help(
+                    "advisory only — the spec mandates no order; reorder to match the template \
+                     sequence or ignore",
+                ),
+            );
+        } else {
+            seen_indices[idx] = true;
+            last_seen = Some((idx, h.text.trim().to_owned()));
+        }
+    }
+
+    out
+}
+
+/// `style.soul-pair` (STY-003): a claimed `STYLE.md` should have a `SOUL.md`
+/// beside it — the spec's recommended persona-folder pairing (identity +
+/// voice). A **warning** only: the spec confirms the files "can exist
+/// independently" (verified 2026-06-08), so a deliberately standalone
+/// STYLE.md must not be blocked. Only the sibling's existence is checked;
+/// its contents are not inspected.
+pub(crate) fn check_style_soul_pair(
+    doc: &Document,
+    _params: Option<&Value>,
+    root: &Path,
+) -> Vec<Diagnostic> {
+    let style_path = root.join(&doc.location);
+    let dir = style_path.parent().unwrap_or(root);
+    if dir.join("SOUL.md").is_file() {
+        return Vec::new();
+    }
+    vec![
+        Diagnostic::warning(
+            STYLE_SOUL_PAIR,
+            doc.location.clone(),
+            0,
+            0,
+            "STYLE.md has no SOUL.md beside it — voice with no documented identity to deliver",
+        )
+        .with_help(
+            "add a SOUL.md (identity) in the same folder, or ignore if this STYLE.md is \
+             deliberately standalone (the spec permits it)",
+        ),
+    ]
 }
 
 fn has_h3(doc: &Document, normalized_text: &str) -> bool {
@@ -2741,5 +2959,196 @@ shall is discussed in the EARS paper.
         let d = design_token_doc(meta);
         let diags = check_design_token_ref(&d, None, Path::new("."));
         assert!(diags.is_empty(), "no token refs must pass: {diags:?}");
+    }
+
+    // -- style.section-order (ADR-034 § STY-002) --------------------------
+
+    fn style_section_doc(headings: &[&str]) -> Document {
+        let ast_headings: Vec<Heading> = headings
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Heading {
+                level: 2,
+                text: text.to_string(),
+                line: (i + 1) as u32,
+                col: 1,
+            })
+            .collect();
+        Document {
+            id: "STYLE-0".parse().unwrap(),
+            raw_id: String::new(),
+            location: "STYLE.md".to_owned(),
+            depends_on: Vec::new(),
+            frontmatter_lines: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            ast: Some(Ast {
+                headings: ast_headings,
+                ..Ast::default()
+            }),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn style_section_order_all_in_order_passes() {
+        let d = style_section_doc(&[
+            "Voice Principles",
+            "Vocabulary",
+            "Punctuation & Formatting",
+            "Platform Differences",
+            "Quick Reactions",
+            "Rhetorical Moves",
+            "Anti-Patterns",
+            "Examples of Right Voice",
+        ]);
+        let diags = check_style_section_order(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "template order must pass: {diags:?}");
+    }
+
+    #[test]
+    fn style_section_order_vocabulary_before_voice_principles_warns() {
+        let d = style_section_doc(&["Vocabulary", "Voice Principles"]);
+        let diags = check_style_section_order(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one out-of-order warning: {diags:?}");
+        assert_eq!(diags[0].code, "style.section-order");
+        assert_eq!(
+            diags[0].severity,
+            crate::diagnostic::Severity::Warning,
+            "order arm must be a warning, never an error"
+        );
+        assert!(diags[0].message.contains("Voice Principles"), "{}", diags[0].message);
+        assert_eq!(diags[0].line, 2, "anchored at the out-of-order heading");
+    }
+
+    #[test]
+    fn style_section_order_unknown_section_between_known_skipped() {
+        let d = style_section_doc(&["Voice Principles", "Catchphrases", "Vocabulary"]);
+        let diags = check_style_section_order(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "unknown section must be skipped: {diags:?}");
+    }
+
+    #[test]
+    fn style_section_order_duplicate_anti_patterns_warns() {
+        let d = style_section_doc(&["Voice Principles", "Anti-Patterns", "Anti-Patterns"]);
+        let diags = check_style_section_order(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one duplicate warning: {diags:?}");
+        assert_eq!(diags[0].code, "style.section-order");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
+        assert!(diags[0].message.contains("duplicate"), "{}", diags[0].message);
+        assert!(diags[0].message.contains("Anti-Patterns"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn style_section_order_no_recognized_sections_passes() {
+        let d = style_section_doc(&["Intro", "Tone", "Notes"]);
+        let diags = check_style_section_order(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "no recognized sections must pass: {diags:?}");
+    }
+
+    // -- style.soul-pair (ADR-034 § STY-003) ------------------------------
+
+    fn style_doc_at(location: &str) -> Document {
+        Document {
+            id: "STYLE-0".parse().unwrap(),
+            raw_id: String::new(),
+            location: location.to_owned(),
+            depends_on: Vec::new(),
+            frontmatter_lines: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            ast: Some(Ast::default()),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn style_soul_pair_with_sibling_passes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("STYLE.md"), "# Style\n").expect("write STYLE.md");
+        std::fs::write(tmp.path().join("SOUL.md"), "# Soul\n").expect("write SOUL.md");
+        let d = style_doc_at("STYLE.md");
+        let diags = check_style_soul_pair(&d, None, tmp.path());
+        assert!(diags.is_empty(), "sibling SOUL.md must pass: {diags:?}");
+    }
+
+    #[test]
+    fn style_soul_pair_without_sibling_warns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("STYLE.md"), "# Style\n").expect("write STYLE.md");
+        let d = style_doc_at("STYLE.md");
+        let diags = check_style_soul_pair(&d, None, tmp.path());
+        assert_eq!(diags.len(), 1, "missing SOUL.md must warn: {diags:?}");
+        assert_eq!(diags[0].code, "style.soul-pair");
+        assert_eq!(
+            diags[0].severity,
+            crate::diagnostic::Severity::Warning,
+            "must never be an error — files may exist independently"
+        );
+        assert!(diags[0].message.contains("SOUL.md"), "{}", diags[0].message);
+    }
+
+    // -- pipeline.conformance (EARS-06.2/06.3) --------------------------
+
+    fn pipeline_doc(raw_id: &str, depends_on: Vec<&str>) -> Document {
+        Document {
+            id: raw_id.parse().expect("valid id"),
+            raw_id: raw_id.to_string(),
+            location: format!("{}.md", raw_id.to_lowercase()),
+            depends_on: depends_on.into_iter().map(String::from).collect(),
+            frontmatter_lines: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            ast: Some(Ast::default()),
+            body: String::new(),
+        }
+    }
+
+    fn stages_params(stages: &[&str]) -> Value {
+        serde_json::json!({ "stages": stages })
+    }
+
+    #[test]
+    fn conformance_flags_edge_that_skips_stages() {
+        // EARS-06.2: TASK depending directly on PRD under PRD → ADR →
+        // SPEC → TASK skips ADR and SPEC — both must be named.
+        let d = pipeline_doc("TASK-001", vec!["PRD-001"]);
+        let params = stages_params(&["PRD", "ADR", "SPEC", "TASK"]);
+        let diags = check_pipeline_conformance(&d, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "pipeline.conformance");
+        assert!(diags[0].message.contains("TASK-001"), "{}", diags[0].message);
+        assert!(diags[0].message.contains("PRD-001"), "{}", diags[0].message);
+        assert!(diags[0].message.contains("ADR"), "{}", diags[0].message);
+        assert!(diags[0].message.contains("SPEC"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn conformance_allows_adjacent_edge() {
+        // Distance 1 (PRD → ADR) skips nothing.
+        let d = pipeline_doc("ADR-001", vec!["PRD-001"]);
+        let params = stages_params(&["PRD", "ADR", "SPEC", "TASK"]);
+        assert!(check_pipeline_conformance(&d, Some(&params), Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn conformance_exempts_edge_with_unstaged_upstream() {
+        // EARS-06.3: BUG is not staged, so a TASK → BUG edge is exempt
+        // even though it would otherwise span the whole ladder.
+        let d = pipeline_doc("TASK-001", vec!["BUG-001"]);
+        let params = stages_params(&["PRD", "ADR", "SPEC", "TASK"]);
+        assert!(check_pipeline_conformance(&d, Some(&params), Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn conformance_exempts_when_downstream_unstaged() {
+        // EARS-06.3: the downstream namespace (BUG) is unstaged → exempt.
+        let d = pipeline_doc("BUG-001", vec!["PRD-001"]);
+        let params = stages_params(&["PRD", "ADR", "SPEC", "TASK"]);
+        assert!(check_pipeline_conformance(&d, Some(&params), Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn conformance_noop_without_stages_param() {
+        // Defensive: no declared stages means nothing to measure.
+        let d = pipeline_doc("TASK-001", vec!["PRD-001"]);
+        assert!(check_pipeline_conformance(&d, None, Path::new(".")).is_empty());
     }
 }

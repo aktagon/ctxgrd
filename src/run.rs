@@ -338,6 +338,51 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
             "globs follow globset syntax, anchored at the lint root — prefix `**/` to match \
              at any depth (e.g. `docs/adrs/**`)",
         ),
+        C::PipelineInvalid { detail } => Diagnostic::error(
+            "cfg.pipeline-invalid",
+            "ctxgrd.toml",
+            0,
+            0,
+            format!("[pipeline] {detail}"),
+        )
+        .with_help(
+            "expected `[pipeline]\\nstages = [\"PRD\", \"ADR\", …]` with an optional \
+             `[pipeline.gate]` table",
+        ),
+        C::PipelineStageUnknown { stage } => Diagnostic::error(
+            "cfg.pipeline-stage-unknown",
+            "ctxgrd.toml",
+            0,
+            0,
+            format!("[pipeline].stages entry '{stage}' is not an active namespace"),
+        )
+        .with_help(format!(
+            "declare [{stage}] in ctxgrd.toml, or remove '{stage}' from `stages`"
+        )),
+        C::PipelineGateInvalid { namespace, detail } => Diagnostic::error(
+            "cfg.pipeline-gate-invalid",
+            "ctxgrd.toml",
+            0,
+            0,
+            format!("[pipeline.gate].{namespace}: {detail}"),
+        )
+        .with_help(
+            "gate predicates are `any:<status>` or `all:<status>` for a namespace \
+             listed in `stages`",
+        ),
+        C::PipelineGateStatusUnknown { namespace, status } => Diagnostic::error(
+            "cfg.pipeline-gate-status",
+            "ctxgrd.toml",
+            0,
+            0,
+            format!(
+                "[pipeline.gate].{namespace} status '{status}' is not in {namespace}'s \
+                 core.allowed-values"
+            ),
+        )
+        .with_help(format!(
+            "use a status from [{namespace}.\"core.allowed-values\"].status, or add '{status}' to it"
+        )),
     }
 }
 
@@ -434,7 +479,26 @@ pub(crate) fn ingest(root: &Path) -> Result<IngestResult, LintError> {
     })
 }
 
+/// The full result of a lint run: the user-facing [`LintOutcome`] plus
+/// the resolved [`Config`] and [`Document`] set it was computed from.
+///
+/// `ctxgrd status` (SPEC-002) needs the same document set and rule
+/// diagnostics `lint` produces — statuses come from the documents,
+/// per-document lint-cleanliness from `outcome.diagnostics` joined on
+/// `location`. Exposing them here keeps status on the *exact* same
+/// pipeline rather than re-implementing any check (SPEC § Workflows
+/// step 2).
+pub(crate) struct LintRun {
+    pub(crate) outcome: LintOutcome,
+    pub(crate) config: Config,
+    pub(crate) documents: Vec<Document>,
+}
+
 pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
+    lint_run(root).map(|r| r.outcome)
+}
+
+pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     // Steps 1–4: load config, run sources, walk markdown, translate
     // envelopes. See `ingest()` for the SRC-002 invariant.
     let IngestResult {
@@ -597,6 +661,26 @@ pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
         }
     }
 
+    // 6d: pipeline.conformance — auto-active when a `[pipeline]` table is
+    // declared (SPEC-002 § EARS-06.1). Unlike the 6c rules it lives in no
+    // namespace `rules` list; activate it for every document in a staged
+    // namespace and thread the declared stage order through params so the
+    // edge-distance check can name skipped stages (EARS-06.2). Edges
+    // touching an unstaged namespace are exempt inside the check (EARS-06.3).
+    if let Some(pipeline) = &config.pipeline {
+        let staged: BTreeSet<&str> = pipeline.stages.iter().map(String::as_str).collect();
+        let conformance_params = serde_json::json!({ "stages": pipeline.stages });
+        for doc in &documents {
+            if staged.contains(doc.id.namespace.as_str()) {
+                diagnostics.extend(agent_guide::check_pipeline_conformance(
+                    doc,
+                    Some(&conformance_params),
+                    root,
+                ));
+            }
+        }
+    }
+
     // 7: external rules — one subprocess per (namespace, rule) batch
     // (ADR-002 § RUL-001). Group docs by namespace, then run each
     // configured external rule once over all docs in that namespace.
@@ -668,12 +752,16 @@ pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
         .map(|ns| config.namespace_config(ns).rules.len())
         .sum();
 
-    Ok(LintOutcome {
-        diagnostics,
-        kernel_messages,
-        exit,
-        documents_linted,
-        rules_active,
+    Ok(LintRun {
+        outcome: LintOutcome {
+            diagnostics,
+            kernel_messages,
+            exit,
+            documents_linted,
+            rules_active,
+        },
+        config,
+        documents,
     })
 }
 

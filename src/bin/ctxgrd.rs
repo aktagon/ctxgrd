@@ -59,6 +59,8 @@ Examples:
   ctxgrd rules                 # list resolved rules
   ctxgrd rules core.cross-ref  # show details for one rule
   ctxgrd refs ADR-001          # list every pointer to a document
+  ctxgrd status                # show pipeline position: stages, blockers, next action
+  ctxgrd status --format json  # same, as a JSON object for agent routers
   ctxgrd docs rules            # learn how to write your own rules
 
 Exit codes:  0 clean · 1 diagnostics · 2 kernel/config error
@@ -111,6 +113,18 @@ enum Format {
 enum ListFormat {
     Rich,
     Markdown,
+    Json,
+}
+
+/// Output format for `ctxgrd status`.
+///
+/// Dedicated enum (like [`ListFormat`]) because `status` has no
+/// `simple` one-line form: `text` is the human ladder, `json` the
+/// SPEC-002 § Data model object for agent routers (ADR-032).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum StatusFormat {
+    Text,
     Json,
 }
 
@@ -204,6 +218,15 @@ enum Cmd {
         /// line; `json` emits the structured array.
         #[arg(long, value_enum, default_value_t = Format::Rich)]
         format: Format,
+    },
+    /// Report the project's pipeline position (SPEC-002): the resolved
+    /// namespace DAG, per-stage verdicts, the current position, any
+    /// open-BUG blockers, and the next action.
+    Status {
+        /// Output format. `text` is the human ladder; `json` emits the
+        /// SPEC-002 § Data model object for agent routers.
+        #[arg(long, value_enum, default_value_t = StatusFormat::Text)]
+        format: StatusFormat,
     },
     /// Start the Language Server Protocol (LSP) server over stdio.
     Lsp,
@@ -316,6 +339,7 @@ fn dispatch() -> Result<ExitCode> {
         Cmd::List { namespace, format } => list_cmd(&cli.root, namespace.as_deref(), format),
         Cmd::Docs { topic } => docs_cmd(topic.as_deref()),
         Cmd::Refs { id, format } => refs_cmd(&cli.root, &id, format),
+        Cmd::Status { format } => status_cmd(&cli.root, format),
         Cmd::Lsp => lsp_cmd(),
         Cmd::Hooks { action } => match action {
             HooksAction::Install { force, dry_run } => hooks_install_cmd(&cli.root, force, dry_run),
@@ -456,6 +480,41 @@ impl<'a> From<&'a run::ReferenceHit> for WireRefHit<'a> {
             col: hit.col,
             kind,
             from,
+        }
+    }
+}
+
+/// `ctxgrd status` — resolve the namespace DAG, compute per-stage
+/// verdicts, sweep the BUG tripwire, and render the result (SPEC-002).
+///
+/// Exit-code matrix (EARS-05.1/05.2): a successful computation exits 0
+/// regardless of pipeline position — early, blocked, or complete is
+/// data, not failure. A config error or a namespace cycle exits 2.
+fn status_cmd(root: &PathBuf, format: StatusFormat) -> Result<ExitCode> {
+    match ctxgrd::status::report(root) {
+        Ok(report) => {
+            match format {
+                StatusFormat::Text => print!("{}", ctxgrd::status::render_report(&report)),
+                StatusFormat::Json => println!("{}", ctxgrd::status::render_json(&report)),
+            }
+            // EARS-05.1: stage position is data — exit 0.
+            Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+        }
+        // EARS-05.2: an invalid configuration is a kernel error (exit 2).
+        Err(ctxgrd::status::StatusError::Lint(e)) => {
+            emit_error(&e.to_diagnostic(root), root);
+            Ok(ExitCode::from(run::ExitStatus::KernelError.code()))
+        }
+        // EARS-01.5/05.2: a cyclic namespace graph is reported and
+        // exits non-zero (kernel error, exit 2).
+        Err(cycle @ ctxgrd::status::StatusError::Cycle { .. }) => {
+            let d = Diagnostic::error("pipeline.namespace-cycle", "", 0, 0, cycle.to_string())
+                .with_help(
+                    "break the loop by removing one of the cross-namespace depends_on \
+                     edges between these namespaces",
+                );
+            emit_error(&d, root);
+            Ok(ExitCode::from(run::ExitStatus::KernelError.code()))
         }
     }
 }

@@ -140,6 +140,37 @@ pub fn list_rules(
             });
         }
     }
+
+    // `pipeline.conformance` is auto-activated by a declared `[pipeline]`
+    // table for each staged namespace (SPEC-002 EARS-06.1) — it lives in
+    // no namespace `rules` list, so synthesize its entries here. Without a
+    // declared pipeline the rule is inert and absent from this output.
+    if let Some(pipeline) = &config.pipeline {
+        let (source, summary, description) =
+            resolve("pipeline.conformance", discovered, &core_map);
+        for stage in &pipeline.stages {
+            if filter.is_some_and(|ns| ns != stage) {
+                continue;
+            }
+            // Defensive: don't duplicate if a namespace lists it explicitly.
+            let listed = config
+                .namespaces
+                .get(stage)
+                .is_some_and(|c| c.rules.iter().any(|r| r == "pipeline.conformance"));
+            if listed {
+                continue;
+            }
+            entries.push(RuleEntry {
+                namespace: stage.clone(),
+                code: "pipeline.conformance".to_string(),
+                source: source.clone(),
+                params: Value::Object(Default::default()),
+                summary: summary.clone(),
+                description: description.clone(),
+            });
+        }
+    }
+
     entries.sort_by(|a, b| {
         (a.namespace.as_str(), a.code.as_str()).cmp(&(b.namespace.as_str(), b.code.as_str()))
     });
@@ -737,6 +768,60 @@ mod tests {
     #[test]
     fn render_json_empty_returns_empty_array() {
         assert_eq!(render_json(&[]), "[]");
+    }
+
+    #[test]
+    fn pipeline_conformance_appears_only_under_a_declared_pipeline() {
+        use crate::config::PipelineConfig;
+
+        // No [pipeline] → the rule is absent (it is not in any rules list).
+        let mut config = Config::default();
+        config.namespaces.insert(
+            "ADR".to_string(),
+            NamespaceConfig {
+                rules: vec!["core.frontmatter".to_string()],
+                params: Default::default(),
+                paths: None,
+                path_patterns: Vec::new(),
+            },
+        );
+        let discovered = BTreeMap::new();
+        let without = list_rules(&config, &discovered, None);
+        assert!(
+            without.iter().all(|e| e.code != "pipeline.conformance"),
+            "rule must not show without a declared pipeline"
+        );
+
+        // Declare a pipeline → one entry per staged namespace.
+        config.namespaces.insert(
+            "SPEC".to_string(),
+            NamespaceConfig {
+                rules: vec!["core.frontmatter".to_string()],
+                params: Default::default(),
+                paths: None,
+                path_patterns: Vec::new(),
+            },
+        );
+        config.pipeline = Some(PipelineConfig {
+            stages: vec!["ADR".to_string(), "SPEC".to_string()],
+            gates: std::collections::BTreeMap::new(),
+        });
+        let with = list_rules(&config, &discovered, None);
+        let conformance: Vec<&RuleEntry> = with
+            .iter()
+            .filter(|e| e.code == "pipeline.conformance")
+            .collect();
+        assert_eq!(
+            conformance.len(),
+            2,
+            "one pipeline.conformance entry per staged namespace"
+        );
+        assert_eq!(conformance[0].namespace, "ADR");
+        assert_eq!(conformance[1].namespace, "SPEC");
+        assert_eq!(conformance[0].source, "pack");
+        assert!(conformance[0]
+            .summary
+            .contains("skip declared pipeline stages"));
     }
 
     #[test]

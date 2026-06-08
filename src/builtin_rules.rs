@@ -140,8 +140,13 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             repo-root TODO.md. Opt-in — not in any pack default.",
     },
     BuiltinRule {
+        // File-level: DESIGN.md is a path-claimed id-less singleton, so it
+        // never becomes an id-keyed Document. A document-level registration
+        // (the original ADR-027 wiring) made this rule dead on a real
+        // DESIGN.md and also left the spurious `core.id` parse error
+        // unsuppressed (BUG-007). The file-level pass builds a full AST.
         code: "design.section-order",
-        level: Level::Document,
+        level: Level::File,
         check: crate::agent_guide::check_design_section_order,
         summary: "DESIGN.md H2 sections must follow canonical order.",
         description: "Errors when a recognized section heading appears after \
@@ -164,14 +169,64 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             and the project-docs pack's [PRD] — fires in any namespace that lists it.",
     },
     BuiltinRule {
+        // File-level for the same reason as design.section-order (BUG-007):
+        // DESIGN.md is path-claimed. The synthetic file-level document parses
+        // frontmatter into `metadata`, which this rule reads.
         code: "design.token-ref",
-        level: Level::Document,
+        level: Level::File,
         check: crate::agent_guide::check_design_token_ref,
         summary: "DESIGN.md {token.ref} references must resolve.",
         description: "Warns when a {path.to.token} reference in YAML \
             frontmatter string values does not resolve to a defined scalar \
             in the same file's frontmatter. Mapping and array nodes do not \
             count as resolved. Body prose is not scanned.",
+    },
+    BuiltinRule {
+        // File-level, NOT Document-level: STYLE.md is a path-claimed id-less
+        // singleton (like CLAUDE.md/TODO.md/SKILL.md per ADR-020), so it never
+        // becomes an id-keyed Document and the per-document loop never sees it.
+        // A document-level registration would make this rule dead code on a
+        // real STYLE.md (the latent state of `design.section-order`). The
+        // file-level pass builds a full AST, so the heading-order check runs.
+        code: "style.section-order",
+        level: Level::File,
+        check: crate::agent_guide::check_style_section_order,
+        summary: "STYLE.md sections follow the template order; no duplicates.",
+        description: "Warns on a duplicate recognized `##` section, and \
+            advisorily when a recognized section appears after one with a \
+            higher template index. Both warnings — the SOUL.md spec mandates \
+            no order, so this nudges toward the template sequence (Voice \
+            Principles, Vocabulary, Punctuation & Formatting, Platform \
+            Differences, Quick Reactions, Rhetorical Moves, Anti-Patterns, \
+            Examples of Right Voice). Unrecognized sections are skipped.",
+    },
+    BuiltinRule {
+        code: "style.soul-pair",
+        level: Level::File,
+        check: crate::agent_guide::check_style_soul_pair,
+        summary: "STYLE.md has a SOUL.md sibling.",
+        description: "Warns when a claimed STYLE.md has no SOUL.md in the same \
+            directory — the spec's recommended persona pairing (identity + \
+            voice). Warning only: the files may exist independently, so a \
+            deliberately standalone STYLE.md is not blocked.",
+    },
+    BuiltinRule {
+        // Document-level, but auto-activated by a declared `[pipeline]`
+        // table rather than a namespace `rules` list (SPEC-002 EARS-06.1):
+        // run.rs invokes it for every document in a staged namespace and
+        // feeds the declared stage order through params. Registering it
+        // here reserves the `pipeline.` prefix (ADR-020 § ACX-010) and
+        // gives it a `ctxgrd rules` description.
+        code: "pipeline.conformance",
+        level: Level::Document,
+        check: crate::agent_guide::check_pipeline_conformance,
+        summary: "Dependency edges must not skip declared pipeline stages.",
+        description: "Errors when a `depends_on` edge between two namespaces listed in \
+            `[pipeline].stages` skips one or more stages between them (declared distance \
+            > 1) — e.g. a TASK depending directly on a PRD under a PRD → ADR → SPEC → TASK \
+            pipeline. The diagnostic names the skipped stages. Edges touching a namespace \
+            absent from `stages` are exempt. Active only when a `[pipeline]` table is \
+            declared.",
     },
 ];
 
@@ -211,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn all_thirteen_builtin_rules_are_registered() {
+    fn all_builtin_rules_are_registered() {
         let codes: Vec<&str> = BUILTIN_RULES.iter().map(|r| r.code).collect();
         for expected in [
             "agents.context-headings",
@@ -227,13 +282,16 @@ mod tests {
             "design.section-order",
             "design.token-ref",
             "ears.clause-syntax",
+            "style.section-order",
+            "style.soul-pair",
+            "pipeline.conformance",
         ] {
             assert!(
                 codes.contains(&expected),
                 "BUILTIN_RULES missing '{expected}'"
             );
         }
-        assert_eq!(codes.len(), 13, "expected exactly 13 builtin rules");
+        assert_eq!(codes.len(), 16, "expected exactly 16 builtin rules");
     }
 
     #[test]

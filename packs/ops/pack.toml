@@ -1,0 +1,57 @@
+# summary: RUN (runbooks) and PMR (postmortems) — the incident-management doc lifecycle, grounded in Google's SRE Book.
+
+# Runbooks ("playbooks" in Google SRE terminology — SRE Book ch. 11,
+# "Being On-Call"): per-alert response procedures written calm,
+# executed under pressure. The shape forces the two sections most
+# often missing when they matter: Rollback and Verification.
+[RUN]
+paths = ["docs/runbooks/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[RUN."core.required-headings"]
+headings = ["Trigger", "Prerequisites", "Steps", "Rollback", "Verification"]
+
+[RUN."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[RUN."core.allowed-values"]
+status = ["draft", "active", "deprecated"]
+
+# Postmortem reports, following the blameless-postmortem template from
+# the SRE Book Appendix D ("Example Postmortem"; culture in ch. 15,
+# "Postmortem Culture: Learning from Failure"). Headings track the
+# template's body sections; "Supporting information" is omitted as
+# optional. Status mirrors the template's lifecycle (the example ships
+# as "Complete, action items in progress").
+[PMR]
+paths = ["docs/pmrs/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[PMR."core.required-headings"]
+headings = ["Summary", "Impact", "Root Causes", "Trigger", "Resolution", "Detection", "Action Items", "Lessons Learned", "Timeline"]
+
+# `incident_date` is required beyond the standard id/title/status —
+# a postmortem without the incident date is unanchored in time.
+[PMR."core.required-metadata"]
+keys = ["id", "title", "status", "incident_date"]
+
+[PMR."core.allowed-values"]
+status = ["draft", "in-review", "complete"]

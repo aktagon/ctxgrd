@@ -1,0 +1,16 @@
+# summary: DESIGN.md structural linting — section order and token reference checks
+# For semantic checks (WCAG contrast, orphaned tokens, missing-primary), use
+# @google/design.md lint. ctxgrd handles structure; @google/design.md handles
+# visual/semantic validity. See ADR-027 § DES-005.
+
+[DESIGN]
+paths = ["DESIGN.md"]
+rules = [
+    "core.frontmatter",
+    "core.required-metadata",
+    "design.section-order",
+    "design.token-ref",
+]
+
+[DESIGN."core.required-metadata"]
+keys = ["name"]

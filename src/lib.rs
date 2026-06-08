@@ -15,7 +15,7 @@
 //!
 //! `pub` modules — consumer-facing entry points and their types:
 //! [`config`], [`diagnostic`], [`document`], [`id`], [`introspect`],
-//! [`reporter`], [`run`], [`scaffold`], [`source`].
+//! [`reporter`], [`run`], [`scaffold`], [`source`], [`status`].
 //!
 //! `pub(crate)` modules — kernel internals; semver-volatile and not
 //! part of any contract. Do not depend on these from outside the crate.
@@ -42,4 +42,5 @@ pub(crate) mod rules;
 pub mod run;
 pub mod scaffold;
 pub mod source;
+pub mod status;
 pub(crate) mod subprocess;

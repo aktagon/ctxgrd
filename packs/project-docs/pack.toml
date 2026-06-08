@@ -1,0 +1,107 @@
+# summary: ADR, PRD, RFC, BUG doc types plus the TODO state file — engineering doc lifecycle with status vocabularies and required headings.
+
+[ADR]
+paths = ["docs/adrs/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[ADR."core.required-headings"]
+headings = ["Status", "Context", "Requirements", "Consequences", "Open Questions", "References", "Change log"]
+
+[ADR."core.required-metadata"]
+keys = ["id", "title", "status", "date"]
+
+[ADR."core.allowed-values"]
+status = ["draft", "accepted", "rejected", "superseded"]
+
+[PRD]
+paths = ["docs/prds/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "ears.clause-syntax",
+]
+
+[PRD."core.required-headings"]
+headings = ["Context", "Goals", "Non-goals", "User stories", "Requirements", "Definition of Done", "Open Questions", "References", "Change log"]
+
+[PRD."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[PRD."core.allowed-values"]
+status = ["draft", "accepted", "superseded"]
+
+[RFC]
+paths = ["docs/rfcs/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+# Headings track the author-written [Required] sections of RFC 7322 §4
+# (the RFC Style Guide; see the 7322bis draft for the current structure:
+# https://www.ietf.org/archive/id/draft-flanagan-7322bis-07.html#name-structure-of-an-rfc):
+# Abstract, Introduction, Security Considerations,
+# References. The document body (§3-6) is free-form and not a fixed heading;
+# Editor-supplied / IETF-publication sections (Status of This Memo, Copyright,
+# Table of Contents, IANA Considerations, Author's Address) are intentionally
+# omitted — they would false-positive on an internal proposal doc.
+[RFC."core.required-headings"]
+headings = ["Abstract", "Introduction", "Security Considerations", "References"]
+
+[RFC."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[RFC."core.allowed-values"]
+status = ["draft", "accepted", "rejected", "superseded"]
+
+[BUG]
+paths = ["docs/bugs/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[BUG."core.required-headings"]
+headings = ["Summary", "Repro", "Root cause", "Fix"]
+
+[BUG."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[BUG."core.allowed-values"]
+status = ["open", "fixed", "wontfix", "invalid", "duplicate"]
+
+[TODO]
+paths = ["TODO.md"]
+rules = ["todo.freshness", "todo.structure"]
+
+[TODO."todo.freshness"]
+stale_days = 30

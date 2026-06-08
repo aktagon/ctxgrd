@@ -138,6 +138,10 @@ pub struct Config {
     /// of whether the namespace lists the rule explicitly. Set via
     /// `[todo.listed]\nenabled = true` in `ctxgrd.toml`.
     pub todo_listed_global: bool,
+    /// Declared `[pipeline]` table (SPEC-002 § Data model). `None`
+    /// means no pipeline is declared — `ctxgrd status` falls back to
+    /// inference / the default ladder (EARS-01.2, EARS-01.3).
+    pub pipeline: Option<PipelineConfig>,
     /// Kernel-level advisories raised during config loading — e.g.,
     /// `[sources.markdown-file]` was in the file but ignored
     /// (CORE-001). Surfaced through the same channel as runtime
@@ -166,6 +170,55 @@ pub struct NamespaceConfig {
     pub path_patterns: Vec<String>,
 }
 
+/// Declared pipeline (SPEC-002 § Data model). `stages` is the
+/// namespace DAG as a chain in declared order (EARS-01.1); `gates`
+/// holds the explicit `[pipeline.gate]` predicates. Namespaces
+/// without an entry get the EARS-02.4 defaults at evaluation time
+/// (Sprint 2) — parsing stores only what the author wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineConfig {
+    /// Ordered list of active namespace names; order = declared DAG.
+    pub stages: Vec<String>,
+    /// Explicit gate predicates, keyed by staged namespace.
+    pub gates: BTreeMap<String, GatePredicate>,
+}
+
+/// Parsed `("any" | "all") ":" <status>` gate predicate (EARS-02.3).
+/// The grammar is enforced at parse time (EARS-05.2); whether
+/// `status` is a member of the namespace's `core.allowed-values`
+/// list is the evaluation layer's check (Sprint 2, T2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatePredicate {
+    pub quantifier: GateQuantifier,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateQuantifier {
+    Any,
+    All,
+}
+
+impl GatePredicate {
+    /// Parse `any:<status>` / `all:<status>`. `None` means malformed —
+    /// the caller attaches namespace context to the error.
+    fn parse(raw: &str) -> Option<Self> {
+        let (quantifier, status) = raw.split_once(':')?;
+        let quantifier = match quantifier {
+            "any" => GateQuantifier::Any,
+            "all" => GateQuantifier::All,
+            _ => return None,
+        };
+        if status.is_empty() {
+            return None;
+        }
+        Some(Self {
+            quantifier,
+            status: status.to_string(),
+        })
+    }
+}
+
 impl NamespaceConfig {
     /// Zero-config default — the six non-parameterized core rules,
     /// no params, no path declarations.
@@ -179,6 +232,22 @@ impl NamespaceConfig {
     /// True if `code` is listed in this namespace's active rule set.
     pub fn enables(&self, code: &str) -> bool {
         self.rules.iter().any(|r| r == code)
+    }
+
+    /// The `status` allow-list this namespace declares via
+    /// `core.allowed-values`, if any. `None` means the namespace does
+    /// not constrain `status` — callers treat that as "no list to
+    /// validate against" rather than an empty list. Used by the
+    /// pipeline gate validator (T2.1) and gate evaluation (T2.2).
+    pub fn allowed_status_values(&self) -> Option<Vec<String>> {
+        let values = self.params.get("core.allowed-values")?;
+        let statuses = values.get("status")?.as_array()?;
+        Some(
+            statuses
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        )
     }
 }
 
@@ -245,6 +314,18 @@ pub enum ConfigError {
         pattern: String,
         detail: String,
     },
+    #[error("[cfg.pipeline-invalid] `[pipeline]` invalid: {detail}")]
+    PipelineInvalid { detail: String },
+    #[error(
+        "[cfg.pipeline-stage-unknown] `[pipeline].stages` entry '{stage}' is not an active namespace"
+    )]
+    PipelineStageUnknown { stage: String },
+    #[error("[cfg.pipeline-gate-invalid] `[pipeline.gate].{namespace}`: {detail}")]
+    PipelineGateInvalid { namespace: String, detail: String },
+    #[error(
+        "[cfg.pipeline-gate-status] `[pipeline.gate].{namespace}` status '{status}' is not a member of {namespace}'s core.allowed-values status list"
+    )]
+    PipelineGateStatusUnknown { namespace: String, status: String },
 }
 
 impl ConfigError {
@@ -260,6 +341,10 @@ impl ConfigError {
             Self::IgnorePatternInvalid { .. } => Some("cfg.ignore-invalid"),
             Self::ReferencesInvalid { .. } => Some("cfg.references-invalid"),
             Self::PathsInvalid { .. } => Some("cfg.paths-invalid"),
+            Self::PipelineInvalid { .. } => Some("cfg.pipeline-invalid"),
+            Self::PipelineStageUnknown { .. } => Some("cfg.pipeline-stage-unknown"),
+            Self::PipelineGateInvalid { .. } => Some("cfg.pipeline-gate-invalid"),
+            Self::PipelineGateStatusUnknown { .. } => Some("cfg.pipeline-gate-status"),
             _ => None,
         }
     }
@@ -306,7 +391,54 @@ pub fn load_with_global(root: &Path, global_dir: Option<&Path>) -> Result<Config
     })?;
     let local = parse_and_validate(value, &external, root)?;
     merge_local_over_global(&mut config, local);
+    validate_pipeline_stages(&config)?;
+    validate_pipeline_gates(&config)?;
     Ok(config)
+}
+
+/// T2.1 / EARS-05.2: every explicit `[pipeline.gate]` predicate must
+/// name a status that is a member of that namespace's
+/// `core.allowed-values` status list. Runs post-merge so the list may
+/// come from a global namespace file. A namespace that does not
+/// constrain `status` has no list to check against — the gate is
+/// accepted (we reject only statuses that contradict an explicit
+/// allow-list, never invent one). Default gates (EARS-02.4) are not
+/// checked here: they are built-in and apply only when no explicit
+/// gate is written.
+fn validate_pipeline_gates(config: &Config) -> Result<(), ConfigError> {
+    let Some(pipeline) = &config.pipeline else {
+        return Ok(());
+    };
+    for (namespace, predicate) in &pipeline.gates {
+        let ns_cfg = config.namespace_config(namespace);
+        let Some(allowed) = ns_cfg.allowed_status_values() else {
+            continue;
+        };
+        if !allowed.iter().any(|s| s == &predicate.status) {
+            return Err(ConfigError::PipelineGateStatusUnknown {
+                namespace: namespace.clone(),
+                status: predicate.status.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// EARS-05.2 (parse-time half): every `[pipeline].stages` entry must
+/// name an active namespace. Runs after the local/global merge so a
+/// stage configured only in `~/.ctxgrd/namespaces/` is still active.
+fn validate_pipeline_stages(config: &Config) -> Result<(), ConfigError> {
+    let Some(pipeline) = &config.pipeline else {
+        return Ok(());
+    };
+    for stage in &pipeline.stages {
+        if !config.namespaces.contains_key(stage) {
+            return Err(ConfigError::PipelineStageUnknown {
+                stage: stage.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Load every `~/.ctxgrd/namespaces/<NS>.toml` as a per-namespace
@@ -375,6 +507,12 @@ fn merge_local_over_global(global: &mut Config, local: Config) {
     // even less sense (paths only resolve against the lint root).
     if !local.reference_scan_globs.is_empty() {
         global.reference_scan_globs = local.reference_scan_globs;
+    }
+    // [pipeline] is local-only for v1 — a global pipeline would claim
+    // a process shape for every repo on the machine; deferred until a
+    // consumer asks (same posture as [ignore]).
+    if local.pipeline.is_some() {
+        global.pipeline = local.pipeline;
     }
     global.kernel_messages.extend(local.kernel_messages);
 }
@@ -529,6 +667,10 @@ fn parse_and_validate(
             parse_references(val, &mut config)?;
             continue;
         }
+        if key == "pipeline" {
+            config.pipeline = Some(parse_pipeline(val)?);
+            continue;
+        }
         if key == "todo" {
             if let TomlValue::Table(mut t) = val {
                 if let Some(TomlValue::Table(listed)) = t.remove("listed") {
@@ -578,6 +720,91 @@ fn parse_references(val: TomlValue, config: &mut Config) -> Result<(), ConfigErr
     }
     config.reference_scan_globs = globs;
     Ok(())
+}
+
+/// Parse the top-level `[pipeline]` block (SPEC-002 § Data model).
+/// Structural shape and gate-predicate grammar are rejected here with
+/// named errors (T1.1's half of EARS-05.2); whether each stage names
+/// an active namespace is checked post-merge by
+/// [`validate_pipeline_stages`]. Unknown keys inside `[pipeline]` are
+/// silently ignored, matching the top-level future-proofing posture.
+fn parse_pipeline(val: TomlValue) -> Result<PipelineConfig, ConfigError> {
+    let TomlValue::Table(mut table) = val else {
+        return Err(ConfigError::PipelineInvalid {
+            detail: "`[pipeline]` must be a table".into(),
+        });
+    };
+
+    let stages = match table.remove("stages") {
+        Some(TomlValue::Array(items)) => items
+            .into_iter()
+            .map(|v| match v {
+                TomlValue::String(s) => Ok(s),
+                _ => Err(ConfigError::PipelineInvalid {
+                    detail: "`stages` must be an array of namespace-name strings".into(),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(ConfigError::PipelineInvalid {
+                detail: "`stages` must be an array of namespace-name strings".into(),
+            });
+        }
+        None => {
+            return Err(ConfigError::PipelineInvalid {
+                detail: "`stages` is required — a declared pipeline without stages is meaningless"
+                    .into(),
+            });
+        }
+    };
+    if stages.is_empty() {
+        return Err(ConfigError::PipelineInvalid {
+            detail: "`stages` must list at least one namespace".into(),
+        });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for stage in &stages {
+        if !seen.insert(stage.as_str()) {
+            return Err(ConfigError::PipelineInvalid {
+                detail: format!("duplicate `stages` entry '{stage}'"),
+            });
+        }
+    }
+
+    let mut gates = BTreeMap::new();
+    if let Some(gate_val) = table.remove("gate") {
+        let TomlValue::Table(gate_table) = gate_val else {
+            return Err(ConfigError::PipelineInvalid {
+                detail: "`[pipeline.gate]` must be a table of `<NS> = \"<predicate>\"` entries"
+                    .into(),
+            });
+        };
+        for (namespace, value) in gate_table {
+            if !stages.contains(&namespace) {
+                return Err(ConfigError::PipelineGateInvalid {
+                    namespace,
+                    detail: "names a namespace not listed in `stages`".into(),
+                });
+            }
+            let TomlValue::String(raw) = value else {
+                return Err(ConfigError::PipelineGateInvalid {
+                    namespace,
+                    detail: "predicate must be a string".into(),
+                });
+            };
+            let Some(predicate) = GatePredicate::parse(&raw) else {
+                return Err(ConfigError::PipelineGateInvalid {
+                    namespace,
+                    detail: format!(
+                        "predicate {raw:?} is malformed — expected `any:<status>` or `all:<status>`"
+                    ),
+                });
+            };
+            gates.insert(namespace, predicate);
+        }
+    }
+
+    Ok(PipelineConfig { stages, gates })
 }
 
 fn parse_ignore(val: TomlValue, config: &mut Config) -> Result<(), ConfigError> {
@@ -1597,6 +1824,326 @@ paths = ["docs/adrs/**"]
         let tmp = tempfile::tempdir().unwrap();
         let config = load_with_global(tmp.path(), None).unwrap();
         assert!(config.namespaces.is_empty());
+    }
+
+    // -- SPEC-002 T1.1: `[pipeline]` parsing (EARS-05.2, parse-time) ----
+
+    #[test]
+    fn pipeline_absent_is_none() {
+        let config = parse("[ADR]\nrules = []\n").unwrap();
+        assert!(config.pipeline.is_none());
+    }
+
+    #[test]
+    fn pipeline_parses_stages_and_gates_typed() {
+        let text = r#"
+[ADR]
+rules = []
+[PRD]
+rules = []
+[TASK]
+rules = []
+
+[pipeline]
+stages = ["PRD", "ADR", "TASK"]
+
+[pipeline.gate]
+PRD = "any:accepted"
+TASK = "all:done"
+"#;
+        let config = parse(text).unwrap();
+        let pipeline = config.pipeline.as_ref().expect("pipeline parsed");
+        assert_eq!(pipeline.stages, vec!["PRD", "ADR", "TASK"]);
+        assert_eq!(
+            pipeline.gates.get("PRD"),
+            Some(&GatePredicate {
+                quantifier: GateQuantifier::Any,
+                status: "accepted".to_string(),
+            })
+        );
+        assert_eq!(
+            pipeline.gates.get("TASK"),
+            Some(&GatePredicate {
+                quantifier: GateQuantifier::All,
+                status: "done".to_string(),
+            })
+        );
+        assert!(!pipeline.gates.contains_key("ADR"), "no explicit ADR gate");
+    }
+
+    #[test]
+    fn pipeline_gate_table_is_optional() {
+        let text = "[ADR]\nrules = []\n\n[pipeline]\nstages = [\"ADR\"]\n";
+        let config = parse(text).unwrap();
+        let pipeline = config.pipeline.as_ref().unwrap();
+        assert_eq!(pipeline.stages, vec!["ADR"]);
+        assert!(pipeline.gates.is_empty());
+    }
+
+    #[test]
+    fn pipeline_stages_missing_errors() {
+        let err = parse("[pipeline]\ngate = {}\n").unwrap_err();
+        match err {
+            ConfigError::PipelineInvalid { detail } => {
+                assert!(detail.contains("stages"), "got detail: {detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_stages_must_be_array_of_strings() {
+        let not_array = parse("[pipeline]\nstages = \"PRD\"\n").unwrap_err();
+        assert!(matches!(not_array, ConfigError::PipelineInvalid { .. }));
+        let mixed = parse("[pipeline]\nstages = [\"PRD\", 42]\n").unwrap_err();
+        assert!(matches!(mixed, ConfigError::PipelineInvalid { .. }));
+    }
+
+    #[test]
+    fn pipeline_stages_empty_errors() {
+        let err = parse("[pipeline]\nstages = []\n").unwrap_err();
+        match err {
+            ConfigError::PipelineInvalid { detail } => {
+                assert!(detail.contains("at least one"), "got detail: {detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_stages_duplicate_errors() {
+        let err = parse("[pipeline]\nstages = [\"PRD\", \"ADR\", \"PRD\"]\n").unwrap_err();
+        match err {
+            ConfigError::PipelineInvalid { detail } => {
+                assert!(detail.contains("duplicate"), "got detail: {detail}");
+                assert!(detail.contains("PRD"), "got detail: {detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_gate_for_unstaged_namespace_errors() {
+        let text =
+            "[pipeline]\nstages = [\"PRD\", \"ADR\"]\n\n[pipeline.gate]\nSPEC = \"any:accepted\"\n";
+        let err = parse(text).unwrap_err();
+        match err {
+            ConfigError::PipelineGateInvalid { namespace, detail } => {
+                assert_eq!(namespace, "SPEC");
+                assert!(detail.contains("stages"), "got detail: {detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_gate_predicate_grammar_rejections() {
+        // EARS-02.3 grammar is `("any" | "all") ":" <status>` — anything
+        // else is a parse-time configuration error (EARS-05.2).
+        for bad in ["accepted", "some:accepted", "any:", "ANY:accepted", ""] {
+            let text =
+                format!("[pipeline]\nstages = [\"PRD\"]\n\n[pipeline.gate]\nPRD = \"{bad}\"\n");
+            let err = parse(&text).unwrap_err();
+            match err {
+                ConfigError::PipelineGateInvalid { namespace, .. } => {
+                    assert_eq!(namespace, "PRD", "predicate {bad:?}");
+                }
+                other => panic!("predicate {bad:?}: unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_gate_predicate_must_be_string() {
+        let text = "[pipeline]\nstages = [\"PRD\"]\n\n[pipeline.gate]\nPRD = 42\n";
+        let err = parse(text).unwrap_err();
+        assert!(matches!(err, ConfigError::PipelineGateInvalid { .. }));
+    }
+
+    #[test]
+    fn pipeline_stage_unknown_namespace_rejected_at_load() {
+        // `stages` may only name active namespaces (SPEC-002 § Data
+        // model). SPEC is not declared anywhere → cfg error.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("ctxgrd.toml"),
+            r#"
+[ADR]
+rules = []
+
+[pipeline]
+stages = ["ADR", "SPEC"]
+"#,
+        );
+        let err = load_with_global(tmp.path(), None).unwrap_err();
+        match err {
+            ConfigError::PipelineStageUnknown { stage } => assert_eq!(stage, "SPEC"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_stage_active_via_global_namespace_is_accepted() {
+        // Activeness is checked against the *merged* config: a stage
+        // configured only in ~/.ctxgrd/namespaces/ is still active.
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        write(
+            &global.join("namespaces/SPEC.toml"),
+            r#"rules = ["core.frontmatter"]"#,
+        );
+        write(
+            &tmp.path().join("ctxgrd.toml"),
+            r#"
+[ADR]
+rules = []
+
+[pipeline]
+stages = ["ADR", "SPEC"]
+"#,
+        );
+        let config = load_with_global(tmp.path(), Some(&global)).unwrap();
+        let pipeline = config.pipeline.as_ref().unwrap();
+        assert_eq!(pipeline.stages, vec!["ADR", "SPEC"]);
+    }
+
+    // -- SPEC-002 T2.1: gate status validated against allowed-values ----
+
+    #[test]
+    fn pipeline_gate_status_outside_allowed_values_rejected_at_load() {
+        // EARS-05.2 / SPEC § Error model: a gate predicate naming a
+        // status that is not in the namespace's core.allowed-values
+        // list is a configuration error.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("ctxgrd.toml"),
+            r#"
+[ADR]
+rules = ["core.allowed-values"]
+[ADR."core.allowed-values"]
+status = ["draft", "accepted", "rejected"]
+
+[pipeline]
+stages = ["ADR"]
+
+[pipeline.gate]
+ADR = "any:shipped"
+"#,
+        );
+        let err = load_with_global(tmp.path(), None).unwrap_err();
+        match err {
+            ConfigError::PipelineGateStatusUnknown { namespace, status } => {
+                assert_eq!(namespace, "ADR");
+                assert_eq!(status, "shipped");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_gate_status_in_allowed_values_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("ctxgrd.toml"),
+            r#"
+[ADR]
+rules = ["core.allowed-values"]
+[ADR."core.allowed-values"]
+status = ["draft", "accepted", "rejected"]
+
+[pipeline]
+stages = ["ADR"]
+
+[pipeline.gate]
+ADR = "any:accepted"
+"#,
+        );
+        let config = load_with_global(tmp.path(), None).unwrap();
+        assert!(config.pipeline.is_some());
+    }
+
+    #[test]
+    fn pipeline_gate_status_unchecked_when_namespace_has_no_allowed_values() {
+        // A namespace that does not constrain `status` has no list to
+        // be a member of — the gate is accepted (lenient: we only
+        // reject statuses that contradict an explicit allow-list).
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("ctxgrd.toml"),
+            r#"
+[ADR]
+rules = ["core.frontmatter"]
+
+[pipeline]
+stages = ["ADR"]
+
+[pipeline.gate]
+ADR = "any:whatever"
+"#,
+        );
+        let config = load_with_global(tmp.path(), None).unwrap();
+        assert!(config.pipeline.is_some());
+    }
+
+    #[test]
+    fn pipeline_gate_status_validated_against_merged_global_allowed_values() {
+        // Activeness AND allowed-values both resolve against the merged
+        // config: a namespace configured only in ~/.ctxgrd/namespaces/
+        // still contributes its allowed-values status list.
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        write(
+            &global.join("namespaces/SPEC.toml"),
+            r#"
+rules = ["core.allowed-values"]
+["core.allowed-values"]
+status = ["draft", "accepted"]
+"#,
+        );
+        write(
+            &tmp.path().join("ctxgrd.toml"),
+            r#"
+[pipeline]
+stages = ["SPEC"]
+
+[pipeline.gate]
+SPEC = "all:shipped"
+"#,
+        );
+        let err = load_with_global(tmp.path(), Some(&global)).unwrap_err();
+        match err {
+            ConfigError::PipelineGateStatusUnknown { namespace, status } => {
+                assert_eq!(namespace, "SPEC");
+                assert_eq!(status, "shipped");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_gate_status_error_code_is_named() {
+        let err = ConfigError::PipelineGateStatusUnknown {
+            namespace: "ADR".into(),
+            status: "shipped".into(),
+        };
+        assert_eq!(err.code(), Some("cfg.pipeline-gate-status"));
+    }
+
+    #[test]
+    fn pipeline_error_codes_are_named() {
+        // T1.1 done-when: invalid configs are rejected with *named*
+        // errors — the `cfg.pipeline-*` codes the CLI prints.
+        let invalid = ConfigError::PipelineInvalid { detail: "x".into() };
+        assert_eq!(invalid.code(), Some("cfg.pipeline-invalid"));
+        let unknown = ConfigError::PipelineStageUnknown {
+            stage: "SPEC".into(),
+        };
+        assert_eq!(unknown.code(), Some("cfg.pipeline-stage-unknown"));
+        let gate = ConfigError::PipelineGateInvalid {
+            namespace: "PRD".into(),
+            detail: "x".into(),
+        };
+        assert_eq!(gate.code(), Some("cfg.pipeline-gate-invalid"));
     }
 
     #[test]

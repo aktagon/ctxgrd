@@ -1,0 +1,15 @@
+# summary: STYLE.md persona linting — section order and SOUL.md pairing
+# SOUL.md / STYLE.md is a community convention (github.com/aaronjmars/soul.md,
+# MIT) for describing an AI agent's persona and voice. ctxgrd lints structure
+# only: section order (advisory) and the recommended SOUL.md sibling. Voice
+# quality — the rules-vs-adjectives test that makes a STYLE.md work — is
+# semantic and is NOT linted; validate it by running prompts through a model
+# (the spec's own method). See ADR-034 § STY-005.
+
+[STYLE]
+paths = ["STYLE.md"]
+rules = [
+    "core.frontmatter",
+    "style.section-order",
+    "style.soul-pair",
+]
