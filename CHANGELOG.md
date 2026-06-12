@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Nothing yet.**
 
+## [0.16.0] — 2026-06-09
+
+### Changed
+
+- **`ctxgrd init` namespace blocks now follow the built-in doc packs in
+  full.** 0.13.0 sourced only `required-headings` from the packs;
+  `required-metadata` and `allowed-values` stayed hardcoded generic
+  (`id`/`title`/`status`; `draft`/`accepted`/`rejected`/`superseded`),
+  so an init-generated block could be a chimera — e.g. a PMR with SRE-book
+  headings but no required `incident_date` and an ADR-flavored status
+  vocabulary. All three param tables now come from the owning pack
+  (`project-docs` or `ops`) when one defines the namespace, making
+  `ctxgrd init` and `ctxgrd pack add` produce identical shapes.
+  Vocabularies follow the pack silently (no commented alternative —
+  that remains headings-only). Pack-uncovered namespaces (DDR, unknown
+  namespaces) keep the generic defaults.
+
 ## [0.15.0] — 2026-06-08
 
 ### Added
@@ -25,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actually makes a STYLE.md work — is a semantic call that belongs to a model
   eval, not a structural linter, so ctxgrd declines it and says so in the pack
   comment. Opt in with `ctxgrd pack add persona`.
+- **`ctxgrd status` (SPEC-002).** A read-only subcommand that reports where the
+  project sits in its pipeline. It resolves a namespace DAG — a declared
+  `[pipeline].stages` order if you have one, else the shape inferred from your
+  `depends_on` edges, else the built-in `PRD → ADR → SPEC → TASK` ladder — and
+  names which of the three it used. A stage is done only when its gate status is
+  reached and every document under it is lint-clean, so an accepted-but-failing
+  doc holds the stage instead of passing it; a join stage waits on all its
+  parents. An open BUG citing a document in the active line blocks the stage it
+  points at, and the block clears when the BUG leaves `open`. The output is a
+  text ladder, or `--format json` for an agent that would rather route by table
+  than re-read the docs every turn — current stage, blockers, and one next
+  action from a fixed template, never lifted from document prose. It writes
+  nothing and exits 0 at any position.
 - **`pipeline.conformance` (SPEC-002).** When a `[pipeline].stages` order is
   declared — say `PRD → ADR → SPEC → TASK` — a `depends_on` edge that jumps a
   stage now errors, and the diagnostic names the stages it skipped. A TASK that
@@ -303,7 +333,10 @@ OQ-2 (LSP behavior on file rename) and OQ-6 (CLI override for
 - `cargo clippy --lib --no-deps -- -D warnings` reports clean.
 - `make check` reports clean (6 documents · 9 rules · 0 diagnostics).
 
-[Unreleased]: https://github.com/aktagon/ctxgrd/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/aktagon/ctxgrd/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/aktagon/ctxgrd/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/aktagon/ctxgrd/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/aktagon/ctxgrd/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/aktagon/ctxgrd/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/aktagon/ctxgrd/compare/v0.5.0...v0.12.0
 [0.5.0]: https://github.com/aktagon/ctxgrd/compare/v0.4.0...v0.5.0

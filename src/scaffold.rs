@@ -512,6 +512,18 @@ pub fn render_init_toml(active: &[&str], commented: &[&str], paths: &DetectedPat
     out
 }
 
+/// Append a one-line TOML string array (`["a", "b"]`) plus newline.
+fn push_toml_list<'a>(buf: &mut String, items: impl Iterator<Item = &'a str>) {
+    buf.push('[');
+    for (i, item) in items.enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        buf.push_str(&format!("\"{item}\""));
+    }
+    buf.push_str("]\n");
+}
+
 fn render_namespace_block(
     namespace: &str,
     out: &mut String,
@@ -572,32 +584,36 @@ fn render_namespace_block(
         Some(p) => p.iter().map(String::as_str).collect(),
         None => conventional.clone(),
     };
-    buf.push_str("headings = [");
-    for (i, h) in active.iter().enumerate() {
-        if i > 0 {
-            buf.push_str(", ");
-        }
-        buf.push_str(&format!("\"{h}\""));
-    }
-    buf.push_str("]\n");
+    buf.push_str("headings = ");
+    push_toml_list(&mut buf, active.iter().copied());
     if pack_shape.is_some() {
         buf.push_str("# Conventional minimal shape, if you prefer it:\n");
-        buf.push_str("# headings = [");
-        for (i, h) in conventional.iter().enumerate() {
-            if i > 0 {
-                buf.push_str(", ");
-            }
-            buf.push_str(&format!("\"{h}\""));
-        }
-        buf.push_str("]\n");
+        buf.push_str("# headings = ");
+        push_toml_list(&mut buf, conventional.iter().copied());
     }
     buf.push('\n');
 
+    // Metadata keys and the status vocabulary follow the pack outright
+    // (no commented alternative — vocabularies are pack-specific, e.g.
+    // PMR's incident_date key or RUN's active/deprecated lifecycle).
+    let metadata_keys = crate::pack::builtin_pack_metadata_keys(namespace)
+        .unwrap_or_else(|| vec!["id".into(), "title".into(), "status".into()]);
     buf.push_str(&format!("[{namespace}.\"core.required-metadata\"]\n"));
-    buf.push_str("keys = [\"id\", \"title\", \"status\"]\n\n");
+    buf.push_str("keys = ");
+    push_toml_list(&mut buf, metadata_keys.iter().map(String::as_str));
+    buf.push('\n');
 
+    let status_values = crate::pack::builtin_pack_status_values(namespace).unwrap_or_else(|| {
+        vec![
+            "draft".into(),
+            "accepted".into(),
+            "rejected".into(),
+            "superseded".into(),
+        ]
+    });
     buf.push_str(&format!("[{namespace}.\"core.allowed-values\"]\n"));
-    buf.push_str("status = [\"draft\", \"accepted\", \"rejected\", \"superseded\"]\n");
+    buf.push_str("status = ");
+    push_toml_list(&mut buf, status_values.iter().map(String::as_str));
 
     if comment {
         for line in buf.lines() {
@@ -1130,6 +1146,16 @@ depends_on: []
                 .contains("# headings = [\"Status\", \"Context\", \"Decision\", \"Consequences\"]"),
             "expected Nygard headings as comment"
         );
+        // Metadata keys and status vocabulary follow the pack too.
+        let keys: Vec<&str> = adr
+            .get("core.required-metadata")
+            .and_then(|v| v.get("keys"))
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(keys, vec!["id", "title", "status", "date"]);
     }
 
     #[test]
@@ -1153,6 +1179,17 @@ depends_on: []
         assert!(toml_text.contains(
             "# headings = [\"Overview\", \"Goals\", \"Requirements\", \"Success metrics\"]"
         ));
+        // PRD status vocabulary follows the pack (no "rejected").
+        let status: Vec<&str> = value
+            .get("PRD")
+            .and_then(|v| v.get("core.allowed-values"))
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(status, vec!["draft", "accepted", "superseded"]);
     }
 
     #[test]
@@ -1170,6 +1207,11 @@ depends_on: []
         let names: Vec<&str> = headings.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(names, vec!["Status", "Context", "Decision", "State Matrix"]);
         assert!(!toml_text.contains("# Conventional minimal shape"));
+        // Pack-uncovered namespaces keep the generic metadata and status.
+        assert!(toml_text.contains("keys = [\"id\", \"title\", \"status\"]"));
+        assert!(
+            toml_text.contains("status = [\"draft\", \"accepted\", \"rejected\", \"superseded\"]")
+        );
     }
 
     #[test]

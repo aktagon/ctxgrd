@@ -7,6 +7,9 @@
 .antigravitycli/
 .copilot/
 
+# Session handoff (local, per-session; not tracked)
+HANDOFF.md
+
 # Environments / Secrets
 .env
 .env.local

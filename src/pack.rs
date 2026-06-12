@@ -442,15 +442,16 @@ fn summary_of(toml: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The `core.required-headings.headings` list a built-in doc pack
-/// defines for `namespace`, or `None` when no pack defines it. Used by
-/// `ctxgrd init` to render the pack's shape as the active default,
-/// keeping the embedded `pack.toml` files the single source of truth.
+/// A string list from a built-in doc pack's param table for
+/// `namespace` (e.g. `core.required-headings` / `headings`), or `None`
+/// when no pack defines it. Used by `ctxgrd init` to render the pack's
+/// shape as the active default, keeping the embedded `pack.toml` files
+/// the single source of truth.
 ///
 /// Scans `project-docs` and `ops` only — the `agents` and `design`
 /// packs use builtin-compiled rules, not the core nine that init
 /// renders, so their namespaces are out of init's catalogue.
-pub(crate) fn builtin_pack_headings(namespace: &str) -> Option<Vec<String>> {
+fn builtin_pack_list(namespace: &str, table: &str, key: &str) -> Option<Vec<String>> {
     [PROJECT_DOCS_TOML, OPS_TOML]
         .into_iter()
         .find_map(|toml_text| {
@@ -458,14 +459,29 @@ pub(crate) fn builtin_pack_headings(namespace: &str) -> Option<Vec<String>> {
             Some(
                 value
                     .get(namespace)?
-                    .get("core.required-headings")?
-                    .get("headings")?
+                    .get(table)?
+                    .get(key)?
                     .as_array()?
                     .iter()
                     .filter_map(|h| h.as_str().map(str::to_string))
                     .collect(),
             )
         })
+}
+
+/// `core.required-headings.headings` from a built-in doc pack.
+pub(crate) fn builtin_pack_headings(namespace: &str) -> Option<Vec<String>> {
+    builtin_pack_list(namespace, "core.required-headings", "headings")
+}
+
+/// `core.required-metadata.keys` from a built-in doc pack.
+pub(crate) fn builtin_pack_metadata_keys(namespace: &str) -> Option<Vec<String>> {
+    builtin_pack_list(namespace, "core.required-metadata", "keys")
+}
+
+/// `core.allowed-values.status` from a built-in doc pack.
+pub(crate) fn builtin_pack_status_values(namespace: &str) -> Option<Vec<String>> {
+    builtin_pack_list(namespace, "core.allowed-values", "status")
 }
 
 /// Namespace keys already defined in a `ctxgrd.toml`. Parse failure
