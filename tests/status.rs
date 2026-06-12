@@ -440,7 +440,17 @@ fn scenario_7_json_output_validates_against_schema() {
     assert!(parsed["blockers"].is_array(), "json:\n{parsed:#}");
     assert!(parsed["next_action"].is_string(), "json:\n{parsed:#}");
 
-    // Each stage carries exactly namespace / state / docs / verdict.
+    // ADR-037: edges mirror the declared chain; blocker_stages is an
+    // object (here empty — no open BUG cites the lineage).
+    assert_eq!(
+        parsed["edges"],
+        serde_json::json!([{"from": "ADR", "to": "SPEC"}]),
+        "json:\n{parsed:#}"
+    );
+    assert!(parsed["blocker_stages"].is_object(), "json:\n{parsed:#}");
+
+    // Each stage carries namespace / state / docs / verdict plus the
+    // ADR-037 gate_met / hold fields.
     let stages = parsed["stages"].as_array().unwrap();
     assert_eq!(stages.len(), 2);
     for stage in stages {
@@ -448,12 +458,17 @@ fn scenario_7_json_output_validates_against_schema() {
         assert!(stage["state"].is_string(), "json:\n{parsed:#}");
         assert!(stage["docs"].is_array(), "json:\n{parsed:#}");
         assert!(stage["verdict"].is_string(), "json:\n{parsed:#}");
+        assert!(stage["gate_met"].is_boolean(), "json:\n{parsed:#}");
+        assert!(stage["hold"].is_array(), "json:\n{parsed:#}");
     }
-    // ADR accepted+clean → done; SPEC draft → current.
+    // ADR accepted+clean → done, gate met; SPEC draft → current, gate
+    // not met.
     assert_eq!(stages[0]["namespace"], "ADR");
     assert_eq!(stages[0]["state"], "done");
+    assert_eq!(stages[0]["gate_met"], true);
     assert_eq!(stages[1]["namespace"], "SPEC");
     assert_eq!(stages[1]["state"], "current");
+    assert_eq!(stages[1]["gate_met"], false);
     assert_eq!(parsed["current"], "SPEC");
 }
 

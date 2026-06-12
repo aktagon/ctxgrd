@@ -3,6 +3,9 @@
 **/*.rs.bk
 *.pdb
 
+# insta snapshot scratch files
+*.pending-snap
+
 # Local agent / assistant directories
 .antigravitycli/
 .copilot/

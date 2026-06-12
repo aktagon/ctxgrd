@@ -1,5 +1,6 @@
 //! Integration tests for the AGENTS + TODO namespaces and their five
-//! builtin-compiled `agents.*` / `todo.*` rules (ADR-020).
+//! builtin-compiled `agents.*` / `todo.*` rules (ADR-020; the lazy-link
+//! flip of `agents.context-headings` is ADR-036).
 //!
 //! CLAUDE.md / AGENTS.md / TODO.md are id-less singletons, so these tests
 //! exercise the file-level pass end-to-end through the real binary —
@@ -63,7 +64,7 @@ fn instruction_file_with_volatile_state_and_missing_reference_fails() {
         "forbidden-heading error missing:\n{stdout}"
     );
     assert!(
-        stdout.contains("does not import it"),
+        stdout.contains("does not link to it"),
         "missing-reference error missing:\n{stdout}"
     );
     assert!(
@@ -86,7 +87,7 @@ fn well_formed_instruction_file_and_state_file_pass() {
     fs::write(tmp.path().join("ctxgrd.toml"), config).unwrap();
     fs::write(
         tmp.path().join("CLAUDE.md"),
-        "# Payments service\n\nBuild with `cargo build`. Current state:\n\n@TODO.md\n",
+        "# Payments service\n\nBuild with `cargo build`. Current state:\n\n[TODO.md](TODO.md)\n",
     )
     .unwrap();
     fs::write(
@@ -115,7 +116,7 @@ fn summary_counts_path_claimed_singletons() {
     fs::write(tmp.path().join("ctxgrd.toml"), config).unwrap();
     fs::write(
         tmp.path().join("CLAUDE.md"),
-        "# Payments service\n\nBuild with `cargo build`.\n\n@TODO.md\n",
+        "# Payments service\n\nBuild with `cargo build`.\n\n[TODO.md](TODO.md)\n",
     )
     .unwrap();
     fs::write(
@@ -135,11 +136,64 @@ fn summary_counts_path_claimed_singletons() {
 }
 
 #[test]
-fn nested_claude_with_parent_relative_import_passes_both_rules() {
-    // A nested `cli/CLAUDE.md` importing the root TODO.md with the
-    // file-relative `@../TODO.md` must satisfy `agents.context-headings`
-    // AND produce no `agents.context-budget` dangling-import warning —
-    // the two rules were mutually unsatisfiable before finding #1.
+fn nested_claude_with_parent_relative_link_passes_clean() {
+    // A nested `cli/CLAUDE.md` linking the root TODO.md with the
+    // file-relative `[TODO.md](../TODO.md)` must satisfy
+    // `agents.context-headings` with no diagnostic at all — neither the
+    // missing-link error nor the eager-import warning — and produce no
+    // `agents.context-budget` dangling-import warning. File-relative
+    // resolution (ADR-036) keeps the two rules jointly satisfiable.
+    let config = r#"
+[AGENTS]
+paths = ["**/CLAUDE.md", "**/AGENTS.md"]
+rules = ["agents.context-headings", "agents.context-budget"]
+
+[TODO]
+paths = ["TODO.md"]
+rules = ["todo.freshness", "todo.structure"]
+
+[TODO."todo.freshness"]
+stale_days = 100000
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), config).unwrap();
+    fs::create_dir_all(tmp.path().join("cli")).unwrap();
+    fs::write(
+        tmp.path().join("CLAUDE.md"),
+        "# Root\n\n[TODO.md](TODO.md)\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("cli/CLAUDE.md"),
+        "# CLI\n\n[TODO.md](../TODO.md)\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("TODO.md"),
+        "# TODO\n\n_Last updated: 2026-05-26_\n\n### Context\n- x\n\n### TODO\n- [ ] do it\n",
+    )
+    .unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "clean run expected\n{stdout}");
+    assert!(
+        !stdout.contains("agents.context-headings"),
+        "headings rule must accept a file-relative TODO.md link with no diagnostic:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("does not exist"),
+        "budget rule must not warn on a markdown link:\n{stdout}"
+    );
+}
+
+#[test]
+fn eager_todo_import_warns_but_does_not_fail() {
+    // `@TODO.md` keeps the state discoverable, so it is not an error —
+    // but it pays TODO.md's full token cost in every session's prefix, so
+    // the rule warns and suggests the lazy link. A warning does not change
+    // the exit status (the run still exits 0). Covers a nested
+    // `@../TODO.md` too.
     let config = r#"
 [AGENTS]
 paths = ["**/CLAUDE.md", "**/AGENTS.md"]
@@ -156,7 +210,11 @@ stale_days = 100000
     fs::write(tmp.path().join("ctxgrd.toml"), config).unwrap();
     fs::create_dir_all(tmp.path().join("cli")).unwrap();
     fs::write(tmp.path().join("CLAUDE.md"), "# Root\n\n@TODO.md\n").unwrap();
-    fs::write(tmp.path().join("cli/CLAUDE.md"), "# CLI\n\n@../TODO.md\n").unwrap();
+    fs::write(
+        tmp.path().join("cli/CLAUDE.md"),
+        "# CLI\n\n@../TODO.md\n",
+    )
+    .unwrap();
     fs::write(
         tmp.path().join("TODO.md"),
         "# TODO\n\n_Last updated: 2026-05-26_\n\n### Context\n- x\n\n### TODO\n- [ ] do it\n",
@@ -165,14 +223,23 @@ stale_days = 100000
 
     let out = run(tmp.path());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(out.status.code(), Some(0), "clean run expected\n{stdout}");
-    assert!(
-        !stdout.contains("does not import it"),
-        "headings rule must accept @../TODO.md:\n{stdout}"
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a warning must not fail the run\n{stdout}"
     );
     assert!(
-        !stdout.contains("does not exist"),
-        "budget rule must not warn on the resolvable @../TODO.md:\n{stdout}"
+        stdout.contains("warning[agents.context-headings]")
+            && stdout.contains("imports TODO.md eagerly"),
+        "eager-import warning expected for the root CLAUDE.md:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[TODO.md](../TODO.md)"),
+        "nested file's warning should suggest the file-relative lazy link:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("does not link to it"),
+        "an eager import is still a reference — must not also error:\n{stdout}"
     );
 }
 
@@ -180,8 +247,8 @@ stale_days = 100000
 fn agents_md_is_checked_like_claude_md() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join("ctxgrd.toml"), CONFIG).unwrap();
-    // No TODO.md here, so the @TODO.md reference is not required — only
-    // the forbidden-heading rule should fire.
+    // No TODO.md here, so the TODO.md link is not required — only the
+    // forbidden-heading rule should fire.
     fs::write(
         tmp.path().join("AGENTS.md"),
         "# Agent guide\n\n## TODO\n\n- ship the parser\n",
@@ -200,7 +267,7 @@ fn agents_md_is_checked_like_claude_md() {
         "forbidden TODO-heading error missing:\n{stdout}"
     );
     assert!(
-        !stdout.contains("does not import it"),
+        !stdout.contains("does not link to it"),
         "reference rule should not fire without a root TODO.md:\n{stdout}"
     );
 }
@@ -226,7 +293,7 @@ stale_days = 100000
     fs::write(tmp.path().join("ctxgrd.toml"), config).unwrap();
     fs::write(
         tmp.path().join("CLAUDE.md"),
-        "# Project\n\nState:\n\n@TODO.md\n",
+        "# Project\n\nState:\n\n[TODO.md](TODO.md)\n",
     )
     .unwrap();
     fs::write(
@@ -270,7 +337,7 @@ stale_days = 100000
     fs::write(tmp.path().join("ctxgrd.toml"), config).unwrap();
     fs::write(
         tmp.path().join("CLAUDE.md"),
-        "# Project\n\nState:\n\n@TODO.md\n",
+        "# Project\n\nState:\n\n[TODO.md](TODO.md)\n",
     )
     .unwrap();
     let todo = "\
@@ -330,7 +397,7 @@ fn churn_warns_when_instruction_file_changes_twice_in_the_window() {
     // TODO.md so churn is the only thing that can fire.
     fs::write(
         root.join("CLAUDE.md"),
-        "# Payments service\n\nBuild with `cargo build`.\n\n@TODO.md\n",
+        "# Payments service\n\nBuild with `cargo build`.\n\n[TODO.md](TODO.md)\n",
     )
     .unwrap();
     fs::write(
@@ -350,7 +417,7 @@ fn churn_warns_when_instruction_file_changes_twice_in_the_window() {
     // A second commit touching CLAUDE.md, inside the 24h window.
     fs::write(
         root.join("CLAUDE.md"),
-        "# Payments service\n\nBuild with `cargo build`. Test with `cargo test`.\n\n@TODO.md\n",
+        "# Payments service\n\nBuild with `cargo build`. Test with `cargo test`.\n\n[TODO.md](TODO.md)\n",
     )
     .unwrap();
     git(root, &["add", "CLAUDE.md"]);

@@ -16,9 +16,11 @@
 //!
 //! - `agents.context-headings` — the always-loaded instruction prefix
 //!   MUST NOT carry a `Current State` or `TODO` heading (volatile state
-//!   there churns the cached prompt prefix on every edit), and MUST
-//!   reference a root `TODO.md` with `@TODO.md` when one exists so the
-//!   externalised state is still recited into context.
+//!   there churns the cached prompt prefix on every edit), and MUST link
+//!   a root `TODO.md` when one exists so the externalised state stays
+//!   discoverable. The link MUST be lazy (a plain markdown link, read on
+//!   demand); an eager `@TODO.md` import — which pays the file's tokens
+//!   every session — is flagged as wasteful (ADR-036).
 //! - `agents.context-budget` — warns on a dangling `@path` import and on
 //!   an over-budget body (`max_words`, default 4000).
 //! - `agents.context-cache` — in commit context only, warns that a staged
@@ -189,8 +191,8 @@ fn synthetic_document(namespace: &str, location: String, body: String) -> Docume
 // -- AGENTS namespace (CLAUDE.md / AGENTS.md) -------------------------
 
 /// `agents.context-headings` (ACX-005): no volatile `Current State` /
-/// `TODO` heading, and a required `@TODO.md` reference when a root
-/// TODO.md exists.
+/// `TODO` heading; a root TODO.md must be *linked* (lazily) when one
+/// exists, and an eager `@TODO.md` import is flagged as token-wasteful.
 pub(crate) fn check_context_headings(
     doc: &Document,
     _params: Option<&Value>,
@@ -198,56 +200,86 @@ pub(crate) fn check_context_headings(
 ) -> Vec<Diagnostic> {
     let mut out = forbidden_heading_diags(doc);
 
-    // When the state has been externalised to a root TODO.md, the
-    // instruction file must point at it so the state is recited into the
-    // agent's context (`@TODO.md` import). Without the reference the
-    // externalised state is invisible to the agent — restorable
-    // compression with the reference lost.
+    // A root TODO.md holds the project's volatile state. The instruction
+    // file must point at it so it stays discoverable — but as a *lazy*
+    // link, not an eager `@TODO.md` import. An `@import` pays TODO.md's
+    // full token cost in every session's context prefix, used or not; a
+    // plain link costs nothing until something opens the file. Reserve
+    // `@` for content that must be present every turn — TODO.md is
+    // reference state, consulted on demand (ADR-036, reversing the eager
+    // form ADR-020 originally required).
     //
-    // The import is resolved file-relatively — the same semantics
-    // `agents.context-budget` (dangling_import_diags) and Claude Code
-    // itself use — so a nested `cli/CLAUDE.md` satisfies the rule with
-    // `@../TODO.md`. A literal `@TODO.md` substring check would force
-    // nested files to write a token that resolves to a nonexistent
-    // `cli/TODO.md` (which the budget rule then warns on), making the two
-    // rules mutually unsatisfiable, and would let prose that merely
-    // mentions `@TODO.md` pass without a real import (finding #1).
+    // Both forms are resolved file-relatively (canonicalize) — the same
+    // semantics `agents.context-budget` and Claude Code use — so a nested
+    // `cli/CLAUDE.md` is satisfied by `[TODO.md](../TODO.md)` exactly as
+    // it would be by `@../TODO.md`. Splitting the two invariants the rule
+    // once fused: discoverability (something must point at TODO.md → an
+    // error if nothing does) and loading strategy (eager vs lazy → a warn
+    // when the pointer is an `@import`).
     let todo = root.join("TODO.md");
-    if todo.is_file() && !references_root_todo(doc, root, &todo) {
-        // Suggest the correct relative form for this file's depth, e.g.
-        // `@../TODO.md` for a nested `cli/CLAUDE.md`.
-        let suggested = suggested_todo_import(doc);
-        out.push(
-            Diagnostic::error(
-                HEADINGS,
-                doc.location.clone(),
-                0,
-                0,
-                "a root TODO.md exists but this file does not import it",
-            )
-            .with_help(format!(
-                "add an `{suggested}` import on its own line — inline imports resolve in \
-                 Claude Code, but this rule enforces the line-anchored form"
-            ))
-            .with_note(
-                "volatile state lives in TODO.md to keep this file's cached prefix stable; \
-                 the import pulls it back into the agent's context — the path is resolved \
-                 relative to this file, so nested instruction files need `@../TODO.md`",
-            ),
-        );
+    if todo.is_file() {
+        if references_root_todo_import(doc, root, &todo) {
+            // An eager import resolves to TODO.md — discoverable, but
+            // wasteful: it inflates every session's prefix. Warn, don't
+            // error; the state is still reachable.
+            out.push(
+                Diagnostic::warning(
+                    HEADINGS,
+                    doc.location.clone(),
+                    0,
+                    0,
+                    "this file imports TODO.md eagerly (`@TODO.md`), inflating every session's context",
+                )
+                .with_help(format!(
+                    "replace the import with a lazy link, e.g. `{}` — the file is read on \
+                     demand instead of being pulled into the always-loaded prefix",
+                    suggested_todo_link(doc)
+                ))
+                .with_note(
+                    "an `@import` pays TODO.md's full token cost every session, used or not; \
+                     a plain link costs nothing until something opens it. Reserve `@` for \
+                     content that must be present every turn — TODO.md is reference state.",
+                ),
+            );
+        } else if !references_root_todo_link(doc, root, &todo) {
+            // Neither an import nor a link resolves: the TODO.md is
+            // orphaned — invisible to the agent and to a reader of this
+            // file. Suggest the lazy form for this file's depth.
+            out.push(
+                Diagnostic::error(
+                    HEADINGS,
+                    doc.location.clone(),
+                    0,
+                    0,
+                    "a root TODO.md exists but this file does not link to it",
+                )
+                .with_help(format!(
+                    "add a lazy link on its own line, e.g. `{}`, so the state stays \
+                     discoverable without inflating the per-session prefix",
+                    suggested_todo_link(doc)
+                ))
+                .with_note(
+                    "use a plain link (read on demand), not an `@TODO.md` import (eager — \
+                     pays the file's tokens every session). The path resolves relative to \
+                     this file, so a nested instruction file links `../TODO.md`.",
+                ),
+            );
+        }
     }
     out
 }
 
 /// True when any `@<path>` import in `doc` resolves (relative to the
 /// importing file's directory, mirroring Claude Code and the budget
-/// rule) to the root `TODO.md` at `todo`.
+/// rule) to the root `TODO.md` at `todo`. This is the *eager* form the
+/// rule now warns on (ADR-036): the import pulls TODO.md into the
+/// session prefix on every turn.
 ///
 /// Resolution uses the filesystem (`canonicalize`): the root `TODO.md`
 /// is known to exist (the caller checked `is_file()`), so an import that
 /// fails to canonicalize is dangling and cannot match — the budget rule
 /// reports that separately.
-fn references_root_todo(doc: &Document, root: &Path, todo: &Path) -> bool {
+fn references_root_todo_import(doc: &Document, root: &Path, todo: &Path) -> bool {
     let dir = root.join(&doc.location);
     let dir = dir.parent().unwrap_or(root);
     let Ok(target) = std::fs::canonicalize(todo) else {
@@ -259,17 +291,43 @@ fn references_root_todo(doc: &Document, root: &Path, todo: &Path) -> bool {
         .any(|resolved| resolved == target)
 }
 
-/// The `@<rel>/TODO.md` import a given instruction file should carry,
-/// with `../` segments for its directory depth below the root. A
-/// root-level `CLAUDE.md` yields `@TODO.md`; a nested `cli/CLAUDE.md`
-/// yields `@../TODO.md`.
-fn suggested_todo_import(doc: &Document) -> String {
+/// True when a markdown link in `doc` resolves (file-relatively, like the
+/// import check) to the root `TODO.md`. This is the *lazy* reference the
+/// rule now prefers (ADR-036): the link is inert until something opens
+/// the file, so TODO.md's tokens stay out of the session prefix.
+///
+/// Link hrefs are read from the parsed AST, so only real markdown links
+/// count — a bare `TODO.md` in prose does not, mirroring the line-anchored
+/// strictness `import_paths` applies to the eager form. A `#fragment` or
+/// `?query` suffix is stripped before resolving.
+fn references_root_todo_link(doc: &Document, root: &Path, todo: &Path) -> bool {
+    let dir = root.join(&doc.location);
+    let dir = dir.parent().unwrap_or(root);
+    let Ok(target) = std::fs::canonicalize(todo) else {
+        return false;
+    };
+    let Some(ast) = doc.ast.as_ref() else {
+        return false;
+    };
+    ast.links
+        .iter()
+        .map(|link| link.href.split(['#', '?']).next().unwrap_or(&link.href))
+        .filter(|href| !href.is_empty())
+        .filter_map(|href| std::fs::canonicalize(dir.join(href)).ok())
+        .any(|resolved| resolved == target)
+}
+
+/// The lazy markdown link a given instruction file should carry to the
+/// root `TODO.md`, with `../` segments for its directory depth below the
+/// root. A root-level `CLAUDE.md` yields `[TODO.md](TODO.md)`; a nested
+/// `cli/CLAUDE.md` yields `[TODO.md](../TODO.md)`.
+fn suggested_todo_link(doc: &Document) -> String {
     let depth = Path::new(&doc.location)
         .parent()
         .map(|p| p.components().count())
         .unwrap_or(0);
     let prefix = "../".repeat(depth);
-    format!("@{prefix}TODO.md")
+    format!("[TODO.md]({prefix}TODO.md)")
 }
 
 /// Import paths declared on their own line — the first non-whitespace
@@ -1751,7 +1809,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Ast, Heading};
+    use crate::ast::{Ast, Heading, Link};
     use std::collections::BTreeMap;
 
     fn doc(location: &str, body: &str, headings: Vec<(u8, &str)>) -> Document {
@@ -1778,6 +1836,21 @@ mod tests {
             }),
             body: body.to_owned(),
         }
+    }
+
+    /// A `doc` whose parsed AST carries one markdown link with `href` —
+    /// the shape `references_root_todo_link` reads for the lazy form.
+    fn doc_with_link(location: &str, body: &str, href: &str) -> Document {
+        let mut d = doc(location, body, vec![]);
+        if let Some(ast) = d.ast.as_mut() {
+            ast.links.push(Link {
+                href: href.to_owned(),
+                text: "TODO.md".to_owned(),
+                line: 1,
+                col: 1,
+            });
+        }
+        d
     }
 
     #[test]
@@ -1961,47 +2034,71 @@ mod tests {
     }
 
     #[test]
-    fn headings_rule_passes_root_claude_with_todo_import() {
+    fn headings_rule_passes_root_claude_with_todo_link() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
-        let d = doc("CLAUDE.md", "# Project\n\n@TODO.md\n", vec![]);
+        let d = doc_with_link("CLAUDE.md", "# Project\n\n[TODO.md](TODO.md)\n", "TODO.md");
         assert!(
             check_context_headings(&d, None, root).is_empty(),
-            "root CLAUDE.md with @TODO.md import must pass"
+            "root CLAUDE.md with a lazy TODO.md link must pass clean"
         );
     }
 
     #[test]
-    fn headings_rule_passes_nested_claude_with_parent_relative_import() {
+    fn headings_rule_passes_nested_claude_with_parent_relative_link() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
         std::fs::create_dir_all(root.join("cli")).unwrap();
-        // `@../TODO.md` resolves from cli/ to the root TODO.md.
-        let d = doc("cli/CLAUDE.md", "# CLI\n\n@../TODO.md\n", vec![]);
+        // `[TODO.md](../TODO.md)` resolves from cli/ to the root TODO.md.
+        let d = doc_with_link("cli/CLAUDE.md", "# CLI\n\n[TODO.md](../TODO.md)\n", "../TODO.md");
         let diags = check_context_headings(&d, None, root);
         assert!(
             diags.is_empty(),
-            "nested CLAUDE.md with @../TODO.md must pass: {diags:?}"
+            "nested CLAUDE.md with a file-relative link must pass: {diags:?}"
         );
     }
 
     #[test]
-    fn headings_rule_errors_when_no_import_resolves_and_suggests_relative() {
+    fn headings_rule_warns_on_eager_import() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
+        // `@TODO.md` keeps TODO.md discoverable but eagerly — warn, don't
+        // error, and suggest the lazy link.
+        let d = doc("CLAUDE.md", "# Project\n\n@TODO.md\n", vec![]);
+        let diags = check_context_headings(&d, None, root);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "agents.context-headings");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
+        assert!(
+            diags[0].help.as_deref().unwrap().contains("[TODO.md](TODO.md)"),
+            "warning should suggest the lazy link: {:?}",
+            diags[0].help
+        );
+    }
+
+    #[test]
+    fn headings_rule_errors_when_no_reference_resolves_and_suggests_relative_link() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
         std::fs::create_dir_all(root.join("cli")).unwrap();
-        // `@TODO.md` in cli/ resolves to nonexistent cli/TODO.md — dangling,
-        // so the headings rule errors and the help suggests `@../TODO.md`.
+        // `@TODO.md` in cli/ resolves to nonexistent cli/TODO.md, and there
+        // is no link — neither form references the root TODO.md, so the rule
+        // errors and the help suggests the file-relative lazy link.
         let d = doc("cli/CLAUDE.md", "# CLI\n\n@TODO.md\n", vec![]);
         let diags = check_context_headings(&d, None, root);
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(diags[0].code, "agents.context-headings");
         assert!(
-            diags[0].help.as_deref().unwrap().contains("@../TODO.md"),
-            "help should suggest the parent-relative form: {:?}",
+            diags[0]
+                .help
+                .as_deref()
+                .unwrap()
+                .contains("[TODO.md](../TODO.md)"),
+            "help should suggest the parent-relative lazy link: {:?}",
             diags[0].help
         );
     }

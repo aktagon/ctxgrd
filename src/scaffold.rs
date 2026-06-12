@@ -8,8 +8,9 @@
 //! 1. Next ID = `max(existing ids in <NS>) + 1`, or `--id` override.
 //! 2. Slug = lowercase, non-alnum → `-`, trim, truncate to 60,
 //!    fallback `untitled`.
-//! 3. Target dir = parent of existing docs in `<NS>` if any, else
-//!    `<root>/<lowercase-ns>s/`, else `--out` override.
+//! 3. Target dir = `--out` override, else parent of existing docs in
+//!    `<NS>` (NEW-001), else literal prefix of the first `[<NS>].paths`
+//!    glob (NEW-004), else `<root>/<lowercase-ns>s/` (NEW-003).
 //! 4. Frontmatter keys: `id`, `title`, every
 //!    `core.required-metadata.keys` (stubbed empty), `depends_on: []`.
 //! 5. Body: one empty H2 per `core.required-headings.headings`.
@@ -45,7 +46,7 @@ pub fn scaffold(
     let number = id_override.unwrap_or_else(|| next_id(namespace, existing));
     let slug = slugify(title);
     let contents = render_contents(namespace, number, title, ns_cfg);
-    let dir = target_dir(namespace, existing, root, out_override);
+    let dir = target_dir(namespace, ns_cfg, existing, root, out_override);
     let filename = format!("{number:03}-{slug}.md");
     let target_path = dir.join(filename);
     Scaffold {
@@ -106,13 +107,17 @@ pub fn slugify(title: &str) -> String {
 
 fn target_dir(
     namespace: &str,
+    ns_cfg: &NamespaceConfig,
     existing: &[Document],
     root: &Path,
     out_override: Option<&Path>,
 ) -> PathBuf {
+    // 1. `--out` override always wins (ADR-010 NEW-001 precondition).
     if let Some(o) = out_override {
         return o.to_path_buf();
     }
+    // 2. NEW-001: co-locate with an existing doc of this namespace, so
+    //    a filesystem convention beats config once one exists.
     if let Some(doc) = existing.iter().find(|d| d.id.namespace == namespace) {
         if let Some(parent) = Path::new(&doc.location).parent() {
             let p = parent.as_os_str();
@@ -121,7 +126,40 @@ fn target_dir(
             }
         }
     }
+    // 3. NEW-004 (ADR-010 amendment, BUG-002): a greenfield path-claimed
+    //    namespace lands in its declared `[<NS>].paths` home, derived
+    //    from the first glob's literal prefix.
+    if let Some(prefix) = ns_cfg
+        .path_patterns
+        .first()
+        .and_then(|g| glob_literal_prefix(g))
+    {
+        return root.join(prefix);
+    }
+    // 4. NEW-003: lowercase-plural fallback — reached only when the
+    //    namespace is neither populated nor path-claimed.
     root.join(format!("{}s", namespace.to_lowercase()))
+}
+
+/// Literal directory prefix of a glob: the longest leading run of path
+/// segments containing no glob metacharacters. `docs/specs/**` →
+/// `docs/specs`; `**/specs/**` → `None` (empty prefix). Drives ADR-010
+/// NEW-004 / BUG-002 — landing a first scaffold in the namespace's
+/// declared `paths` home instead of the hardcoded `<ns>s/` fallback.
+fn glob_literal_prefix(glob: &str) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    let mut any = false;
+    for segment in glob.split('/') {
+        if segment.contains(['*', '?', '[', ']', '{', '}']) {
+            break;
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        prefix.push(segment);
+        any = true;
+    }
+    any.then_some(prefix)
 }
 
 fn render_contents(namespace: &str, number: u32, title: &str, ns_cfg: &NamespaceConfig) -> String {
@@ -1008,25 +1046,108 @@ mod tests {
         assert_eq!(next_id("ADR", &docs), 100);
     }
 
+    /// `NamespaceConfig` carrying only `path_patterns` — the field
+    /// `target_dir`'s NEW-004 step reads.
+    fn ns_cfg_with_paths(globs: &[&str]) -> NamespaceConfig {
+        NamespaceConfig {
+            path_patterns: globs.iter().map(|g| g.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn target_dir_follows_existing_docs() {
         let docs = vec![make_doc("ADR-001", "adrs/ADR-001-foo.md")];
-        let dir = target_dir("ADR", &docs, Path::new("/root"), None);
+        let dir = target_dir("ADR", &NamespaceConfig::default(), &docs, Path::new("/root"), None);
         assert_eq!(dir, Path::new("/root/adrs"));
     }
 
     #[test]
     fn target_dir_falls_back_to_lowercase_plural() {
         let docs = vec![];
-        let dir = target_dir("ADR", &docs, Path::new("/root"), None);
+        let dir = target_dir("ADR", &NamespaceConfig::default(), &docs, Path::new("/root"), None);
         assert_eq!(dir, Path::new("/root/adrs"));
     }
 
     #[test]
     fn target_dir_honours_out_override() {
         let docs = vec![make_doc("ADR-001", "adrs/ADR-001-foo.md")];
-        let dir = target_dir("ADR", &docs, Path::new("/root"), Some(Path::new("/custom")));
+        let dir = target_dir(
+            "ADR",
+            &NamespaceConfig::default(),
+            &docs,
+            Path::new("/root"),
+            Some(Path::new("/custom")),
+        );
         assert_eq!(dir, Path::new("/custom"));
+    }
+
+    // -- ADR-010 NEW-004 / BUG-002: greenfield path-claimed namespace --
+
+    #[test]
+    fn target_dir_uses_paths_prefix_when_namespace_empty() {
+        // Empty namespace + declared paths: land in the declared home,
+        // not the hardcoded `runs/` fallback (BUG-002 acceptance row 1).
+        let docs = vec![];
+        let cfg = ns_cfg_with_paths(&["docs/runbooks/**"]);
+        let dir = target_dir("RUN", &cfg, &docs, Path::new("/root"), None);
+        assert_eq!(dir, Path::new("/root/docs/runbooks"));
+    }
+
+    #[test]
+    fn target_dir_existing_doc_beats_paths() {
+        // Populated namespace: NEW-001 still wins over config, so
+        // mid-migration co-location is unchanged (acceptance row 3).
+        let docs = vec![make_doc("RUN-001", "ops/RUN-001-deploy.md")];
+        let cfg = ns_cfg_with_paths(&["docs/runbooks/**"]);
+        let dir = target_dir("RUN", &cfg, &docs, Path::new("/root"), None);
+        assert_eq!(dir, Path::new("/root/ops"));
+    }
+
+    #[test]
+    fn target_dir_out_override_beats_paths() {
+        // `--out` still wins over a declared paths home (acceptance row 4).
+        let docs = vec![];
+        let cfg = ns_cfg_with_paths(&["docs/runbooks/**"]);
+        let dir = target_dir("RUN", &cfg, &docs, Path::new("/root"), Some(Path::new("/custom")));
+        assert_eq!(dir, Path::new("/custom"));
+    }
+
+    #[test]
+    fn target_dir_empty_prefix_glob_falls_through() {
+        // A wildcard in the first segment has no literal prefix, so the
+        // ladder falls through to NEW-003 (acceptance row 5).
+        let docs = vec![];
+        let cfg = ns_cfg_with_paths(&["**/runbooks/**"]);
+        let dir = target_dir("RUN", &cfg, &docs, Path::new("/root"), None);
+        assert_eq!(dir, Path::new("/root/runs"));
+    }
+
+    #[test]
+    fn target_dir_uses_first_glob_when_multiple() {
+        // First-entry prefix is deterministic when globs disagree.
+        let docs = vec![];
+        let cfg = ns_cfg_with_paths(&["docs/runbooks/**", "ops/runbooks/**"]);
+        let dir = target_dir("RUN", &cfg, &docs, Path::new("/root"), None);
+        assert_eq!(dir, Path::new("/root/docs/runbooks"));
+    }
+
+    #[test]
+    fn glob_literal_prefix_cases() {
+        assert_eq!(
+            glob_literal_prefix("docs/runbooks/**"),
+            Some(PathBuf::from("docs/runbooks"))
+        );
+        assert_eq!(
+            glob_literal_prefix("docs/specs/*.md"),
+            Some(PathBuf::from("docs/specs"))
+        );
+        assert_eq!(
+            glob_literal_prefix("docs/runbooks"),
+            Some(PathBuf::from("docs/runbooks"))
+        );
+        assert_eq!(glob_literal_prefix("**/runbooks/**"), None);
+        assert_eq!(glob_literal_prefix("**"), None);
     }
 
     #[test]

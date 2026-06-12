@@ -52,10 +52,11 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
         code: "agents.context-headings",
         level: Level::File,
         check: crate::agent_guide::check_context_headings,
-        summary: "Instruction files stay free of volatile state and recite TODO.md.",
+        summary: "Instruction files stay free of volatile state and link TODO.md lazily.",
         description: "Errors on any `Current State`/`TODO` heading in CLAUDE.md/AGENTS.md \
-            (volatile state churns the cached prefix), and errors when a root TODO.md exists \
-            but the file has no `@TODO.md` import to recite it back into context.",
+            (volatile state churns the cached prefix), errors when a root TODO.md exists but \
+            the file does not link to it, and warns when that pointer is an eager `@TODO.md` \
+            import (which pays the file's tokens every session) rather than a lazy plain link.",
     },
     BuiltinRule {
         code: "agents.context-budget",

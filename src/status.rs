@@ -226,8 +226,15 @@ pub struct Stage {
     /// terminal status when satisfied, `held`, or the status of the next
     /// document to advance. A fixed vocabulary — never body text.
     pub verdict: String,
+    /// This stage's own gate result (ADR-037 § WIRE-002): predicate
+    /// satisfied AND every counted document clean, independent of
+    /// parent-stage state (EARS-02.6) and the BUG tripwire. JSON
+    /// `gate_met` — the field to read beside `verdict`, which can render
+    /// a non-terminal status when the gate is met but a parent is not.
+    pub gate_met: bool,
     /// Documents carrying the gate's terminal status that nonetheless
-    /// produced diagnostics (EARS-02.2). Drives the "held by" text.
+    /// produced diagnostics (EARS-02.2). Drives the "held by" text and
+    /// the JSON `hold` array.
     pub held: Vec<String>,
     /// The document `next_action` targets for this stage, if any.
     /// Internal — feeds the fixed next-action template, not serialized.
@@ -248,6 +255,10 @@ pub struct Report {
     /// `open` BUG documents citing a document in the active lineage
     /// (EARS-03.1). Name-sorted; empty when the tripwire is clear.
     pub blockers: Vec<String>,
+    /// Per-blocker attribution (ADR-037 § WIRE-004): each id in
+    /// `blockers` mapped to the name-sorted namespaces it blocks. Empty
+    /// keys match `blockers`; JSON `blocker_stages`.
+    pub blocker_stages: BTreeMap<String, Vec<String>>,
     /// The single next action, from a fixed template keyed by (state,
     /// verdict) — never document body text (EARS-04.3/04.4).
     pub next_action: String,
@@ -293,6 +304,7 @@ pub fn report(root: &Path) -> Result<Report, StatusError> {
         stages,
         current,
         blockers: tripwire.blockers,
+        blocker_stages: tripwire.blocker_stages,
         next_action,
     })
 }
@@ -352,6 +364,11 @@ struct Tripwire {
     /// Namespaces (within the DAG) that have a document cited by an
     /// `open` BUG — each such stage is overridden to `Blocked`.
     blocked_namespaces: BTreeSet<String>,
+    /// Per-blocker attribution (ADR-037 § WIRE-004): each blocking BUG id
+    /// mapped to the name-sorted lineage namespaces it cites. The union
+    /// of the values equals `blocked_namespaces`; the map keeps which BUG
+    /// holds which stage, which the flat sets discard.
+    blocker_stages: BTreeMap<String, Vec<String>>,
 }
 
 /// Reverse-edge query (SPEC-002 § Workflows step 4): find every `open`
@@ -371,6 +388,7 @@ fn sweep_tripwire(dag: &NamespaceDag, documents: &[Document]) -> Tripwire {
 
     let mut blockers: Vec<String> = Vec::new();
     let mut blocked_namespaces: BTreeSet<String> = BTreeSet::new();
+    let mut blocker_stages: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for bug in documents.iter().filter(|d| d.id.namespace == "BUG") {
         let open = bug
             .metadata
@@ -385,6 +403,9 @@ fn sweep_tripwire(dag: &NamespaceDag, documents: &[Document]) -> Tripwire {
             continue;
         }
         blockers.push(bug.raw_id.clone());
+        // Record this BUG's own cited namespaces before draining `cited`
+        // into the flat set (BTreeSet → already name-sorted).
+        blocker_stages.insert(bug.raw_id.clone(), cited.iter().cloned().collect());
         blocked_namespaces.extend(cited);
     }
     blockers.sort();
@@ -392,6 +413,7 @@ fn sweep_tripwire(dag: &NamespaceDag, documents: &[Document]) -> Tripwire {
     Tripwire {
         blockers,
         blocked_namespaces,
+        blocker_stages,
     }
 }
 
@@ -455,6 +477,7 @@ fn compute_stages(
         held: Vec<String>,
         docs: Vec<String>,
         verdict: String,
+        gate_met: bool,
         actionable: Option<String>,
     }
 
@@ -492,6 +515,9 @@ fn compute_stages(
             held: outcome.held,
             docs,
             verdict,
+            // The stage's own gate, before parent-gating (EARS-02.6) and
+            // the tripwire override (ADR-037 § WIRE-002).
+            gate_met: outcome.done,
             actionable,
         });
     }
@@ -512,6 +538,7 @@ fn compute_stages(
                 state,
                 docs: a.docs,
                 verdict: a.verdict,
+                gate_met: a.gate_met,
                 held: a.held,
                 actionable: a.actionable,
             }
@@ -626,33 +653,54 @@ pub fn render_report(report: &Report) -> String {
     out.push_str("next: ");
     out.push_str(&report.next_action);
     out.push('\n');
+    // Point tools and agents at the structured projection — the text
+    // ladder is the human view; `--format json` is the machine contract.
+    out.push('\n');
+    out.push_str("tip: run with --format json for machine-readable output\n");
     out
 }
 
 /// `ctxgrd status --format json` (EARS-04.2): a single JSON object
-/// conforming to SPEC-002 § Data model — `source`, `stages`
-/// (`namespace`/`state`/`docs`/`verdict`), `current`, `blockers`,
-/// `next_action`. The wire shape is a dedicated struct so the JSON
-/// contract is pinned independently of the in-memory [`Report`] (the
-/// internal `dag` and per-stage `held`/`actionable` fields stay out).
+/// conforming to SPEC-002 § Data model — `source`, `edges`, `stages`
+/// (`namespace`/`state`/`docs`/`verdict`/`gate_met`/`hold`), `current`,
+/// `blockers`, `blocker_stages`, `next_action`. The wire shape is a
+/// dedicated struct so the JSON contract is pinned independently of the
+/// in-memory [`Report`]: the internal `dag` field is projected to
+/// `edges`, `held` to `hold`, and `actionable` stays out entirely
+/// (ADR-037 § WIRE-005).
 pub fn render_json(report: &Report) -> String {
+    #[derive(serde::Serialize)]
+    struct WireEdge<'a> {
+        from: &'a str,
+        to: &'a str,
+    }
     #[derive(serde::Serialize)]
     struct WireStage<'a> {
         namespace: &'a str,
         state: &'a str,
         docs: &'a [String],
         verdict: &'a str,
+        gate_met: bool,
+        hold: &'a [String],
     }
     #[derive(serde::Serialize)]
     struct Wire<'a> {
         source: &'a str,
+        edges: Vec<WireEdge<'a>>,
         stages: Vec<WireStage<'a>>,
         current: Option<&'a str>,
         blockers: &'a [String],
+        blocker_stages: &'a BTreeMap<String, Vec<String>>,
         next_action: &'a str,
     }
     let wire = Wire {
         source: report.source.as_str(),
+        edges: report
+            .dag
+            .edges
+            .iter()
+            .map(|(from, to)| WireEdge { from, to })
+            .collect(),
         stages: report
             .stages
             .iter()
@@ -661,10 +709,13 @@ pub fn render_json(report: &Report) -> String {
                 state: s.state.as_str(),
                 docs: &s.docs,
                 verdict: &s.verdict,
+                gate_met: s.gate_met,
+                hold: &s.held,
             })
             .collect(),
         current: report.current.as_deref(),
         blockers: &report.blockers,
+        blocker_stages: &report.blocker_stages,
         next_action: &report.next_action,
     };
     serde_json::to_string_pretty(&wire).unwrap_or_else(|_| "{}".to_string())
@@ -1025,6 +1076,11 @@ mod tests {
         let trip = sweep_tripwire(&dag, &docs);
         assert_eq!(trip.blockers, vec!["BUG-001".to_string()]);
         assert!(trip.blocked_namespaces.contains("SPEC"));
+        // ADR-037 § WIRE-004: the sweep retains per-BUG attribution.
+        assert_eq!(
+            trip.blocker_stages,
+            BTreeMap::from([("BUG-001".to_string(), vec!["SPEC".to_string()])])
+        );
     }
 
     #[test]
@@ -1103,11 +1159,13 @@ mod tests {
                 state: StageState::Blocked,
                 docs: vec!["SPEC-001".to_string()],
                 verdict: "draft".to_string(),
+                gate_met: false,
                 held: vec![],
                 actionable: Some("SPEC-001".to_string()),
             }],
             current: Some("SPEC".to_string()),
             blockers: vec!["BUG-001".to_string()],
+            blocker_stages: BTreeMap::from([("BUG-001".to_string(), vec!["SPEC".to_string()])]),
             next_action: "resolve BUG-001".to_string(),
         };
         let out = render_report(&report);
@@ -1177,6 +1235,9 @@ mod tests {
             state,
             docs: actionable.iter().map(|s| s.to_string()).collect(),
             verdict: verdict.to_string(),
+            // Default: a done stage has its gate met. Tests needing the
+            // gate-met-but-not-done case build a Stage literal directly.
+            gate_met: matches!(state, StageState::Done),
             held: Vec::new(),
             actionable: actionable.map(str::to_string),
         }
@@ -1184,9 +1245,10 @@ mod tests {
 
     #[test]
     fn render_json_emits_the_data_model_schema() {
-        // EARS-04.2: the JSON object carries source / stages
-        // (namespace, state, docs, verdict) / current / blockers /
-        // next_action and nothing from the internal Report.
+        // EARS-04.2 + ADR-037: the JSON object carries source / edges /
+        // stages (namespace, state, docs, verdict, gate_met, hold) /
+        // current / blockers / blocker_stages / next_action and nothing
+        // from the internal Report under its internal field names.
         let report = Report {
             source: DagSource::Inferred,
             dag: dag::chain_dag(&["ADR".to_string(), "SPEC".to_string()]),
@@ -1196,6 +1258,7 @@ mod tests {
             ],
             current: Some("SPEC".to_string()),
             blockers: Vec::new(),
+            blocker_stages: BTreeMap::new(),
             next_action: "accept SPEC-001".to_string(),
         };
         let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
@@ -1209,10 +1272,80 @@ mod tests {
         assert_eq!(stages[1]["state"], "current");
         assert_eq!(stages[1]["verdict"], "draft");
         assert_eq!(stages[1]["docs"][0], "SPEC-001");
-        // Internal fields never leak to the wire.
+        // ADR-037 § WIRE-001: edges mirror the resolved DAG as {from,to}.
+        assert_eq!(parsed["edges"], serde_json::json!([{"from": "ADR", "to": "SPEC"}]));
+        // ADR-037 § WIRE-002/003: per-stage gate result and hold list.
+        assert_eq!(stages[0]["gate_met"], true, "ADR is done → its gate is met");
+        assert_eq!(stages[1]["gate_met"], false, "SPEC draft → gate not met");
+        assert!(stages[1]["hold"].as_array().unwrap().is_empty());
+        // ADR-037 § WIRE-004: blocker_stages is a (here empty) object.
+        assert_eq!(parsed["blocker_stages"], serde_json::json!({}));
+        // Internal field names never leak to the wire (WIRE-005).
         assert!(parsed.get("dag").is_none());
         assert!(stages[1].get("held").is_none());
         assert!(stages[1].get("actionable").is_none());
+    }
+
+    #[test]
+    fn render_json_gate_met_is_true_on_a_parent_gated_pending_stage() {
+        // ADR-037 § WIRE-002: the load-bearing distinction. SPEC's own
+        // gate is met (accepted+clean) but it is `pending` because a
+        // parent is unfinished (EARS-02.6); `verdict` renders a
+        // non-terminal token, so `gate_met` is the field that tells the
+        // truth about SPEC's own gate.
+        let report = Report {
+            source: DagSource::Inferred,
+            dag: dag::chain_dag(&["ADR".to_string(), "SPEC".to_string()]),
+            stages: vec![
+                stage("ADR", StageState::Current, "draft", Some("ADR-001")),
+                Stage {
+                    namespace: "SPEC".to_string(),
+                    state: StageState::Pending,
+                    docs: vec!["SPEC-001".to_string()],
+                    verdict: "superseded".to_string(),
+                    gate_met: true,
+                    held: Vec::new(),
+                    actionable: None,
+                },
+            ],
+            current: Some("ADR".to_string()),
+            blockers: Vec::new(),
+            blocker_stages: BTreeMap::new(),
+            next_action: "accept ADR-001".to_string(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
+        let spec = &parsed["stages"][1];
+        assert_eq!(spec["state"], "pending");
+        assert_eq!(spec["verdict"], "superseded");
+        assert_eq!(spec["gate_met"], true, "own gate is met despite pending state");
+    }
+
+    #[test]
+    fn render_json_blocker_stages_attributes_each_bug_to_its_stages() {
+        // ADR-037 § WIRE-004: the map keys are the blockers and the
+        // values name the stages each BUG blocks.
+        let report = Report {
+            source: DagSource::Declared,
+            dag: dag::chain_dag(&["ADR".to_string(), "SPEC".to_string()]),
+            stages: vec![
+                stage("ADR", StageState::Blocked, "accepted", None),
+                stage("SPEC", StageState::Blocked, "draft", Some("SPEC-001")),
+            ],
+            current: Some("ADR".to_string()),
+            blockers: vec!["BUG-001".to_string(), "BUG-002".to_string()],
+            blocker_stages: BTreeMap::from([
+                ("BUG-001".to_string(), vec!["ADR".to_string()]),
+                ("BUG-002".to_string(), vec!["ADR".to_string(), "SPEC".to_string()]),
+            ]),
+            next_action: "resolve BUG-001".to_string(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
+        assert_eq!(
+            parsed["blocker_stages"],
+            serde_json::json!({"BUG-001": ["ADR"], "BUG-002": ["ADR", "SPEC"]})
+        );
+        // The flat v1 list is still present, unchanged (WIRE-005).
+        assert_eq!(parsed["blockers"], serde_json::json!(["BUG-001", "BUG-002"]));
     }
 
     #[test]
@@ -1223,6 +1356,7 @@ mod tests {
             stages: vec![stage("ADR", StageState::Done, "accepted", None)],
             current: None,
             blockers: Vec::new(),
+            blocker_stages: BTreeMap::new(),
             next_action: "pipeline complete".to_string(),
         };
         let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
@@ -1249,6 +1383,7 @@ mod tests {
             ],
             current: Some("ADR".to_string()),
             blockers: Vec::new(),
+            blocker_stages: BTreeMap::new(),
             next_action: "create the first ADR document".to_string(),
         };
         insta::assert_snapshot!(render_report(&report), @r"
@@ -1262,6 +1397,8 @@ mod tests {
 
         current: ADR
         next: create the first ADR document
+
+        tip: run with --format json for machine-readable output
         ");
     }
 

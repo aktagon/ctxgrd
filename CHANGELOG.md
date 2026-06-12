@@ -7,9 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-06-13
+
+### Added
+
+- **`ctxgrd status --format json` now also emits `edges`, per-stage `gate_met`
+  and `hold`, and a `blocker_stages` map (ADR-037).** The v1 shape let an agent
+  navigate the pipeline; these fields let it reason about one. `edges` is the
+  resolved DAG as `{from, to}` objects (reconstruct a branching shape, not only
+  the flattened order); per-stage `gate_met` is the stage's own-gate result —
+  independent of parent-gating and the BUG tripwire — and is the honest field to
+  read beside `verdict`, which can render a non-terminal status when a gate is met
+  but a parent is unfinished; per-stage `hold` names the terminal-but-dirty
+  documents holding a stage; `blocker_stages` maps each open BUG to the namespaces
+  it blocks. Additive only — the flat `blockers` list and `verdict` keep their
+  shape and meaning, and `--format text` is unchanged. SPEC-002 § Data model is
+  updated to match.
+
 ### Changed
 
-- **Nothing yet.**
+- **`agents.context-headings` now prefers a lazy `TODO.md` link over an eager
+  `@TODO.md` import (ADR-036, amending ADR-020 § ACX-005).** A plain markdown
+  link whose href resolves to the root `TODO.md` is the canonical, diagnostic-free
+  form; an `@TODO.md` import — which pays the file's full token cost in every
+  session's always-loaded context — now raises a non-fatal warning suggesting the
+  link; a `TODO.md` that no instruction file references at all is still an error.
+  Both forms resolve file-relatively, so a nested `cli/CLAUDE.md` is satisfied by
+  `[TODO.md](../TODO.md)`. Projects using `@TODO.md` will see one new warning
+  until they switch to a link (no build breaks — warnings do not change exit
+  status). ctxgrd's own `CLAUDE.md`/`TODO.md` move to the link form.
+- **`ctxgrd status` text output ends with a hint pointing at `--format json`.**
+  The human ladder now closes with a tip line so tools and agents reading stdout
+  discover the machine-readable projection.
+
+### Fixed
+
+- **`ctxgrd new <NS>` on an empty path-claimed namespace now lands the file in
+  the `[<NS>].paths` home instead of a hardcoded `<ns>s/` fallback (BUG-002).**
+  `target_dir` derives the home from the first `[<NS>].paths` glob's literal
+  prefix. ADR-010 amended (NEW-004).
 
 ## [0.16.0] — 2026-06-09
 
