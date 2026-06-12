@@ -37,6 +37,14 @@ jobs:
         with:
           targets: ${{ matrix.target.triple }}
 
+      # rust-toolchain.toml pins the channel, which overrides the `stable`
+      # toolchain the action just set up — so the target std added above
+      # lands on the wrong toolchain. Add it to the pinned one too. Run
+      # inside the repo so the rust-toolchain.toml override applies; a
+      # no-op for host targets, the fix for the x86_64-on-arm64 cross build.
+      - name: Add target std to the pinned toolchain
+        run: rustup target add ${{ matrix.target.triple }}
+
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
