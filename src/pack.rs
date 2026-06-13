@@ -94,7 +94,8 @@ pub struct AddPlan {
 }
 
 /// The built-in packs (PACK-009). Four packs: `project-docs`, `ops`,
-/// `agents`, `design`, and `persona` (ADR-023 § PKC-001, ADR-027, ADR-034).
+/// `agents`, `design`, and `persona` (ADR-023 § PKC-001, ADR-027, ADR-034,
+/// ADR-035).
 pub fn builtin_packs() -> Vec<Pack> {
     vec![
         Pack {
@@ -141,10 +142,12 @@ pub fn builtin_packs() -> Vec<Pack> {
             rules: Vec::new(),
         },
         Pack {
-            // STYLE namespace — path-claimed on STYLE.md. Structural checks
-            // only (section order, SOUL.md pairing). Voice quality
-            // (rules-vs-adjectives) is semantic and declined — there is no
-            // companion linter to delegate it to (ADR-034 § STY-005). Kept
+            // SOUL/STYLE namespaces — path-claimed on SOUL.md / STYLE.md.
+            // Structural checks only: SOUL.md high-signal section presence
+            // (ADR-035), STYLE.md section order and SOUL.md pairing (ADR-034).
+            // The semantic quality tests (STYLE rules-vs-adjectives, SOUL
+            // prediction test) are declined — there is no companion linter to
+            // delegate them to (ADR-034 § STY-005, ADR-035 § SOUL-005). Kept
             // standalone, not folded into `agents`, because persona/voice is
             // orthogonal to the coding-agent workflow (ADR-034 § Context,
             // following the ADR-027 precedent for `design`).
@@ -1160,6 +1163,29 @@ mod tests {
         assert_eq!(
             providers_of(tmp.path(), "design.section-order"),
             vec!["design".to_string()]
+        );
+    }
+
+    #[test]
+    fn persona_pack_produces_soul_block_with_soul_sections() {
+        let pack = builtin_packs()
+            .into_iter()
+            .find(|p| p.name == "persona")
+            .unwrap();
+        let plan = plan_add(&pack, "", Path::new("/nonexistent-root"));
+        assert!(plan.added.contains(&"SOUL".to_string()));
+        assert!(plan.added.contains(&"STYLE".to_string()));
+        assert!(plan.blocks_text.contains("[SOUL]"));
+        assert!(plan.blocks_text.contains("SOUL.md"));
+        assert!(plan.blocks_text.contains("soul.sections"));
+    }
+
+    #[test]
+    fn providers_of_soul_sections_names_persona_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            providers_of(tmp.path(), "soul.sections"),
+            vec!["persona".to_string()]
         );
     }
 

@@ -65,6 +65,7 @@ const DESIGN_TOKEN_REF: &str = "design.token-ref";
 const EARS_SYNTAX: &str = "ears.clause-syntax";
 const STYLE_SECTION_ORDER: &str = "style.section-order";
 const STYLE_SOUL_PAIR: &str = "style.soul-pair";
+const SOUL_SECTIONS: &str = "soul.sections";
 const PIPELINE_CONFORMANCE: &str = "pipeline.conformance";
 
 const DEFAULT_STALE_DAYS: i64 = 30;
@@ -1697,6 +1698,58 @@ pub(crate) fn check_style_soul_pair(
     ]
 }
 
+/// `soul.sections` (SOUL-002): the three high-signal sections the SOUL.md
+/// spec says to fill first — Worldview, Opinions, Boundaries — must be
+/// present. One **warning** per missing section. The remaining spec
+/// sections (Who I Am, Interests, Current Focus, Influences, Vocabulary,
+/// Tensions & Contradictions, Pet Peeves) are optional and unrecognized
+/// `##` headings pass silently — the spec instructs authors to delete
+/// sections that do not apply, so v1 checks presence only (order and
+/// empty-body checks are deferred, SOUL-003).
+///
+/// Severity is **warning**, not error: the persona pack is uniformly
+/// advisory (recommended shape, not spec enforcement), `SOUL.md` is a young
+/// community convention, and the sibling `style.*` rules are warnings too.
+/// Matching is case-insensitive and trims surrounding whitespace.
+pub(crate) fn check_soul_sections(
+    doc: &Document,
+    _params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(ast) = doc.ast.as_ref() else {
+        return Vec::new();
+    };
+
+    // The spec's high-signal trio: "Fill Worldview, Opinions, and
+    // Boundaries first; they carry the most signal."
+    const REQUIRED: [&str; 3] = ["Worldview", "Opinions", "Boundaries"];
+
+    let mut out = Vec::new();
+    for name in REQUIRED {
+        let present = ast
+            .headings
+            .iter()
+            .any(|h| h.level == 2 && h.text.trim().eq_ignore_ascii_case(name));
+        if !present {
+            out.push(
+                Diagnostic::warning(
+                    SOUL_SECTIONS,
+                    doc.location.clone(),
+                    0,
+                    0,
+                    format!("SOUL.md is missing the high-signal section '{name}'"),
+                )
+                .with_help(
+                    "the spec says fill Worldview, Opinions, and Boundaries first — they \
+                     carry the most signal; add the section, or drop soul.sections if this \
+                     persona deliberately omits it",
+                ),
+            );
+        }
+    }
+    out
+}
+
 fn has_h3(doc: &Document, normalized_text: &str) -> bool {
     doc.ast.as_ref().is_some_and(|ast| {
         ast.headings
@@ -3181,6 +3234,103 @@ shall is discussed in the EARS paper.
             "must never be an error — files may exist independently"
         );
         assert!(diags[0].message.contains("SOUL.md"), "{}", diags[0].message);
+    }
+
+    // -- soul.sections (ADR-035 § SOUL-002) -------------------------------
+
+    fn soul_section_doc(headings: &[&str]) -> Document {
+        let ast_headings: Vec<Heading> = headings
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Heading {
+                level: 2,
+                text: text.to_string(),
+                line: (i + 1) as u32,
+                col: 1,
+            })
+            .collect();
+        Document {
+            id: "SOUL-0".parse().unwrap(),
+            raw_id: String::new(),
+            location: "SOUL.md".to_owned(),
+            depends_on: Vec::new(),
+            frontmatter_lines: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            ast: Some(Ast {
+                headings: ast_headings,
+                ..Ast::default()
+            }),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn soul_sections_all_three_present_passes() {
+        let d = soul_section_doc(&["Who I Am", "Worldview", "Opinions", "Boundaries"]);
+        let diags = check_soul_sections(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "the high-signal trio present must pass: {diags:?}");
+    }
+
+    #[test]
+    fn soul_sections_missing_opinions_fires_once() {
+        let d = soul_section_doc(&["Worldview", "Boundaries"]);
+        let diags = check_soul_sections(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "exactly one missing-section warning: {diags:?}");
+        assert_eq!(diags[0].code, "soul.sections");
+        assert_eq!(
+            diags[0].severity,
+            crate::diagnostic::Severity::Warning,
+            "soul.sections must be a warning, never an error"
+        );
+        assert!(diags[0].message.contains("Opinions"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn soul_sections_optional_section_absent_passes() {
+        // Pet Peeves is an optional section — its absence must not fire,
+        // only the three high-signal sections are required.
+        let d = soul_section_doc(&["Worldview", "Opinions", "Boundaries"]);
+        let diags = check_soul_sections(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "absent optional section must pass: {diags:?}");
+    }
+
+    #[test]
+    fn soul_sections_unknown_heading_skipped() {
+        // An unrecognized heading neither satisfies nor fires a requirement;
+        // the three required sections are still all present here.
+        let d = soul_section_doc(&["Worldview", "Catchphrases", "Opinions", "Boundaries"]);
+        let diags = check_soul_sections(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "unknown heading must be skipped: {diags:?}");
+    }
+
+    #[test]
+    fn soul_sections_tensions_alias_recognized() {
+        // "Tensions and Contradictions" (the & alias spelled out) is an
+        // optional section — it must pass silently, not be penalized, when
+        // the required trio is present.
+        let d = soul_section_doc(&[
+            "Worldview",
+            "Opinions",
+            "Boundaries",
+            "Tensions and Contradictions",
+        ]);
+        let diags = check_soul_sections(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "optional alias section must pass: {diags:?}");
+    }
+
+    #[test]
+    fn soul_sections_case_insensitive_match() {
+        // SOUL-002: matching is case-insensitive and trims whitespace.
+        let d = soul_section_doc(&["  worldview  ", "OPINIONS", "Boundaries"]);
+        let diags = check_soul_sections(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "case-insensitive trimmed match must pass: {diags:?}");
+    }
+
+    #[test]
+    fn soul_sections_all_three_missing_fires_three() {
+        let d = soul_section_doc(&["Who I Am", "Interests"]);
+        let diags = check_soul_sections(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 3, "one warning per missing required section: {diags:?}");
     }
 
     // -- pipeline.conformance (EARS-06.2/06.3) --------------------------

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-06-13
+
+### Added
+
+- **`soul.sections` rule and a `[SOUL]` namespace complete the `persona` pack
+  (ADR-035).** ctxgrd now structurally lints `SOUL.md` — the identity half of the
+  SOUL.md/STYLE.md community convention (github.com/aaronjmars/soul.md, MIT) —
+  alongside the `STYLE.md` voice half shipped in 0.15.0. `soul.sections` warns once
+  per missing high-signal section (Worldview, Opinions, Boundaries), the trio the
+  spec says to fill first; the other spec sections are optional and unrecognized
+  headings pass silently (v1 checks presence only — order and empty-body checks are
+  deferred, ADR-035 § SOUL-003). `ctxgrd pack add persona` now activates both
+  namespaces, so one `pack add` covers identity + voice. The semantic prediction
+  test (can a reader predict the persona's take on an unmentioned topic) stays out
+  of scope — it is a model eval, not a structural lint (ADR-035 § SOUL-005). Adding
+  a builtin rule is a MINOR bump (0.17.0 → 0.18.0).
+- The rule is registered **`Level::File`**, not the `Level::Document` ADR-035
+  originally specified: `SOUL.md` is a path-claimed id-less singleton, so a
+  document-level rule would be dead code on a real file — the same correction
+  ADR-034 made for `style.section-order` (BUG-007).
+
 ## [0.17.0] — 2026-06-13
 
 ### Added

@@ -1,6 +1,7 @@
 //! Integration tests for the structural rules on path-claimed id-less
-//! singletons: DESIGN.md (`design.section-order`, `design.token-ref`) and
-//! STYLE.md (`style.section-order`, `style.soul-pair`).
+//! singletons: DESIGN.md (`design.section-order`, `design.token-ref`),
+//! STYLE.md (`style.section-order`, `style.soul-pair`), and SOUL.md
+//! (`soul.sections`).
 //!
 //! These files never become id-keyed documents, so the rules must run via
 //! the file-level pass. Exercising them through the real binary is the
@@ -32,6 +33,12 @@ const STYLE_CONFIG: &str = r#"
 [STYLE]
 paths = ["STYLE.md"]
 rules = ["core.frontmatter", "style.section-order", "style.soul-pair"]
+"#;
+
+const SOUL_CONFIG: &str = r#"
+[SOUL]
+paths = ["SOUL.md", "soul/SOUL.md"]
+rules = ["core.frontmatter", "soul.sections"]
 "#;
 
 #[test]
@@ -135,6 +142,55 @@ fn style_md_with_malformed_frontmatter_does_not_panic() {
     assert!(
         !stdout.contains("core.frontmatter"),
         "core.frontmatter is suppressed for a file-level namespace:\n{stdout}"
+    );
+}
+
+#[test]
+fn soul_sections_fire_on_real_soul_md() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), SOUL_CONFIG).unwrap();
+    // Worldview and Boundaries present, Opinions missing → one warning.
+    fs::write(
+        tmp.path().join("SOUL.md"),
+        "---\nname: Acme\n---\n\n## Worldview\n\nx\n\n## Boundaries\n\nx\n",
+    )
+    .unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+
+    // soul.sections is a warning, so the run exits 0.
+    assert_eq!(out.status.code(), Some(0), "soul.sections is a warning\n{stdout}");
+    assert!(
+        stdout.contains("soul.sections"),
+        "soul.sections must fire on a path-claimed SOUL.md:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Opinions"),
+        "the diagnostic must name the missing section:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("core.id"),
+        "path-claimed SOUL.md must not emit core.id:\n{stdout}"
+    );
+}
+
+#[test]
+fn well_formed_soul_md_is_clean() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), SOUL_CONFIG).unwrap();
+    fs::write(
+        tmp.path().join("SOUL.md"),
+        "---\nname: Acme\n---\n\n## Worldview\n\nx\n\n## Opinions\n\nx\n\n## Boundaries\n\nx\n",
+    )
+    .unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "well-formed SOUL.md must be clean\n{stdout}");
+    assert!(
+        !stdout.contains("soul."),
+        "no soul diagnostics expected:\n{stdout}"
     );
 }
 

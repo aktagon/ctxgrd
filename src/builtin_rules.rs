@@ -212,6 +212,24 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             deliberately standalone STYLE.md is not blocked.",
     },
     BuiltinRule {
+        // File-level, NOT Document-level: SOUL.md is a path-claimed id-less
+        // singleton, like STYLE.md/DESIGN.md. ADR-035 § SOUL-002 specified
+        // Level::Document, but that is the same latent bug ADR-034 corrected
+        // for style.section-order (BUG-007) — a document-level rule never
+        // fires on a path-claimed singleton through the CLI. File-level runs
+        // it on the synthetic AST scan_file_level builds.
+        code: "soul.sections",
+        level: Level::File,
+        check: crate::agent_guide::check_soul_sections,
+        summary: "SOUL.md has the three high-signal sections.",
+        description: "Warns once per missing high-signal section — Worldview, \
+            Opinions, Boundaries — the trio the SOUL.md spec says carries the \
+            most signal and to fill first. The other spec sections (Who I Am, \
+            Interests, Current Focus, Influences, Vocabulary, Tensions & \
+            Contradictions, Pet Peeves) are optional and unrecognized headings \
+            pass silently; v1 checks presence only, not order or empty bodies.",
+    },
+    BuiltinRule {
         // Document-level, but auto-activated by a declared `[pipeline]`
         // table rather than a namespace `rules` list (SPEC-002 EARS-06.1):
         // run.rs invokes it for every document in a staged namespace and
@@ -285,6 +303,7 @@ mod tests {
             "ears.clause-syntax",
             "style.section-order",
             "style.soul-pair",
+            "soul.sections",
             "pipeline.conformance",
         ] {
             assert!(
@@ -292,7 +311,7 @@ mod tests {
                 "BUILTIN_RULES missing '{expected}'"
             );
         }
-        assert_eq!(codes.len(), 16, "expected exactly 16 builtin rules");
+        assert_eq!(codes.len(), 17, "expected exactly 17 builtin rules");
     }
 
     #[test]
