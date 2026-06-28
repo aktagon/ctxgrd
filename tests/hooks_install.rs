@@ -151,3 +151,182 @@ fn install_outside_git_repo_exits_2() {
         "error explains the missing git repo; got:\n{stderr}"
     );
 }
+
+// --- HOOK-008 / HOOK-009: hooksPath-aware composable drop-in (BUG-012) ---
+//
+// These tests need a real git repo so `git config core.hooksPath` is readable.
+// They are skipped when `git` is not on PATH rather than failing the suite.
+
+fn git(root: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {args:?} succeeded");
+}
+
+/// A real git repo with `core.hooksPath` set to `.githooks`. Returns `None`
+/// (test skips) when `git` is unavailable.
+fn git_repo_with_hooks_path(dir: &str) -> Option<tempfile::TempDir> {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return None;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    git(tmp.path(), &["init", "-q"]);
+    git(tmp.path(), &["config", "core.hooksPath", dir]);
+    Some(tmp)
+}
+
+#[test]
+fn nondefault_hookspath_installs_dropin_fragment_not_git_hooks() {
+    let Some(tmp) = git_repo_with_hooks_path(".githooks") else {
+        return;
+    };
+
+    let output = run_hooks_install(tmp.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "drop-in install exits 0");
+
+    let fragment = tmp.path().join(".githooks/pre-commit.d/10-ctxgrd");
+    assert!(fragment.is_file(), "ctxgrd installed as 10-ctxgrd fragment");
+    assert!(
+        !tmp.path().join(".git/hooks/pre-commit").exists(),
+        "never writes the dead .git/hooks/pre-commit under a non-default hooksPath"
+    );
+
+    let body = fs::read_to_string(&fragment).expect("fragment readable");
+    assert!(body.contains("command -v ctxgrd"), "fragment hard-gates");
+    assert!(
+        body.contains("exit 1") && !body.contains("exit 0"),
+        "hard-gate aborts (exit 1), never fails open (exit 0); got:\n{body}"
+    );
+    assert!(
+        body.contains("export CTXGRD_COMMIT_CONTEXT=1"),
+        "fragment keeps the commit-context export; got:\n{body}"
+    );
+    assert!(
+        body.contains("exec ctxgrd --root \".\""),
+        "fragment ends in the ctxgrd invocation; got:\n{body}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&fragment).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "fragment is executable (0o755)");
+        let runner = tmp.path().join(".githooks/pre-commit");
+        let rmode = fs::metadata(&runner).unwrap().permissions().mode();
+        assert_eq!(rmode & 0o777, 0o755, "runner is executable (0o755)");
+    }
+}
+
+#[test]
+fn dropin_runner_dispatches_fragments_and_aborts_on_nonzero() {
+    let Some(tmp) = git_repo_with_hooks_path(".githooks") else {
+        return;
+    };
+    assert_eq!(run_hooks_install(tmp.path(), &[]).status.code(), Some(0));
+
+    let runner = tmp.path().join(".githooks/pre-commit");
+    let body = fs::read_to_string(&runner).expect("runner readable");
+    assert!(body.contains("pre-commit.d"), "runner sources pre-commit.d/");
+    assert!(
+        body.contains("for fragment in") && body.contains("|| exit $?"),
+        "runner dispatches fragments and aborts on first non-zero; got:\n{body}"
+    );
+
+    // Drive the runner under sh with a failing fragment ahead of a sentinel; the
+    // runner must abort with the fragment's code and never reach the sentinel.
+    let frag_dir = tmp.path().join(".githooks/pre-commit.d");
+    fs::write(frag_dir.join("00-fail"), "#!/bin/sh\nexit 7\n").unwrap();
+    fs::write(frag_dir.join("99-sentinel"), "#!/bin/sh\ntouch reached\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in ["00-fail", "99-sentinel"] {
+            fs::set_permissions(frag_dir.join(f), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let status = std::process::Command::new("sh")
+        .arg(&runner)
+        .current_dir(tmp.path())
+        .status()
+        .expect("sh runs the runner");
+    assert_eq!(status.code(), Some(7), "runner propagates the failing code");
+    assert!(
+        !tmp.path().join("reached").exists(),
+        "a non-zero fragment stops the runner before later fragments"
+    );
+}
+
+#[test]
+fn reinstall_preserves_a_foreign_fragment() {
+    let Some(tmp) = git_repo_with_hooks_path(".githooks") else {
+        return;
+    };
+    assert_eq!(run_hooks_install(tmp.path(), &[]).status.code(), Some(0));
+
+    // A sibling tool's fragment lands in the same directory.
+    let foreign = tmp.path().join(".githooks/pre-commit.d/50-wrkgrd");
+    let foreign_body = "#!/bin/sh\nexec wrkgrd verify\n";
+    fs::write(&foreign, foreign_body).unwrap();
+
+    // Re-running ctxgrd install is idempotent and must not touch the foreign one.
+    assert_eq!(
+        run_hooks_install(tmp.path(), &[]).status.code(),
+        Some(0),
+        "re-install is idempotent (no refuse-without-force in the drop-in path)"
+    );
+    assert_eq!(
+        fs::read_to_string(&foreign).unwrap(),
+        foreign_body,
+        "the foreign 50-wrkgrd fragment is left byte-identical"
+    );
+    assert!(
+        tmp.path().join(".githooks/pre-commit.d/10-ctxgrd").is_file(),
+        "ctxgrd's own fragment is still present after re-install"
+    );
+}
+
+#[test]
+fn dropin_runner_skips_a_non_executable_fragment() {
+    let Some(tmp) = git_repo_with_hooks_path(".githooks") else {
+        return;
+    };
+    assert_eq!(run_hooks_install(tmp.path(), &[]).status.code(), Some(0));
+
+    let runner = tmp.path().join(".githooks/pre-commit");
+    let frag_dir = tmp.path().join(".githooks/pre-commit.d");
+
+    // A fragment that would fail *if run*, but without the execute bit — the
+    // runner's `[ -x ]` guard must skip it, so the commit is not aborted.
+    let inert = frag_dir.join("20-inert");
+    fs::write(&inert, "#!/bin/sh\nexit 9\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&inert, fs::Permissions::from_mode(0o644)).unwrap();
+        // Keep ctxgrd's own fragment from failing the run (no ctxgrd on the
+        // test PATH would `exit 1`): strip its execute bit too so only the
+        // skip behaviour is under test.
+        let ctx = frag_dir.join("10-ctxgrd");
+        fs::set_permissions(&ctx, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let status = std::process::Command::new("sh")
+        .arg(&runner)
+        .current_dir(tmp.path())
+        .status()
+        .expect("sh runs the runner");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a non-executable fragment is silently skipped, so the runner exits clean"
+    );
+}

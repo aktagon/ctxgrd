@@ -286,6 +286,21 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
             format!("[{namespace}] `rules` must be an array of strings"),
         )
         .with_help("rules = [\"core.frontmatter\", \"core.id\", …]".to_string()),
+        C::NamespaceNameNotIdLegal { namespace } => Diagnostic::error(
+            "cfg.namespace-name-invalid",
+            "ctxgrd.toml",
+            0,
+            0,
+            format!(
+                "[{namespace}] lists `core.id` but '{namespace}' is not a legal id prefix — \
+                 an id `{namespace}-<number>` cannot be parsed"
+            ),
+        )
+        .with_help(
+            "rename the namespace to uppercase ASCII with no hyphen (regex `^[A-Z][A-Z0-9]*$`), \
+             e.g. `SAFEGUARD` not `SR-MAP`",
+        )
+        .with_note("the hyphen separates the namespace from the number in an id, so it cannot appear inside the namespace"),
         C::NamespaceReserved { path } => Diagnostic::error(
             "ext.namespace-reserved",
             relative(path),
@@ -494,6 +509,32 @@ pub(crate) struct LintRun {
     pub(crate) documents: Vec<Document>,
 }
 
+/// Discover every directory under `root` that holds a `ctxgrd.toml`,
+/// for `--recursive` multi-project linting. Each such directory is an
+/// independent project root that [`lint`] can be called on directly.
+///
+/// Walks with the `ignore` crate — the ripgrep stack the reference
+/// scanner already uses — so configs under `.gitignore`'d or hidden
+/// directories (vendored deps, build output, `.git`) are skipped. The
+/// markdown walker's `walkdir`/`globset` stack is deliberately *not*
+/// reused here: its ignore set is keyed to one `ctxgrd.toml`, but
+/// discovery runs before any single config is chosen.
+///
+/// Roots are returned sorted and de-duplicated for deterministic
+/// output, and include `root` itself when it carries a config.
+pub fn discover_config_roots(root: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = ignore::WalkBuilder::new(root)
+        .standard_filters(true) // honour .gitignore / .ignore / hidden (matches REF-010)
+        .build()
+        .flatten()
+        .filter(|entry| entry.file_name() == "ctxgrd.toml")
+        .filter_map(|entry| entry.path().parent().map(Path::to_path_buf))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
     lint_run(root).map(|r| r.outcome)
 }
@@ -543,8 +584,12 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     // --- Step 5: aggregate core rules, filtered by per-namespace config. ---
     let mut aggregate: Vec<Diagnostic> = Vec::new();
     aggregate.extend(rules::id_unique(&documents));
-    aggregate.extend(rules::dep_resolved(&documents));
-    aggregate.extend(rules::dep_cycle(&documents));
+    // ADR-064 § DAG-001: build the document dependency graph once and
+    // share it between the two dep rules, instead of each rebuilding the
+    // node index and re-parsing `depends_on`.
+    let dep_graph = crate::dag::DepGraph::new(&documents);
+    aggregate.extend(rules::dep_resolved(&dep_graph));
+    aggregate.extend(rules::dep_cycle(&dep_graph));
     let declared_namespaces: BTreeSet<&str> =
         config.namespaces.keys().map(String::as_str).collect();
     // ADR-001 § REF-002: scan non-markdown files for pointer mentions
@@ -614,11 +659,25 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
         None => None,
     };
 
+    // ADR-073 § SUCC-001: an empty params table so `core.successor-link`
+    // runs on its documented defaults when a namespace lists it without a
+    // `[NS."core.successor-link"]` block.
+    let empty_params = Value::Object(Default::default());
+
     for doc in &documents {
         let ns_cfg = config.namespace_config(&doc.id.namespace);
 
         // 6: core parameterised rules
         for code in &ns_cfg.rules {
+            // `core.successor-link` resolves its successor against the shared
+            // document graph (the same index `core.dep-resolved` uses,
+            // ADR-029), and its params are optional — so it runs even when
+            // `ns_cfg.params.get(code)` is `None`.
+            if code == "core.successor-link" {
+                let params = ns_cfg.params.get(code).unwrap_or(&empty_params);
+                diagnostics.extend(rules::successor_link(doc, params, &dep_graph));
+                continue;
+            }
             let Some(params) = ns_cfg.params.get(code) else {
                 continue;
             };
@@ -645,39 +704,57 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
         .map_err(LintError::MarkdownScan)?;
     diagnostics.extend(file_level_scan.diagnostics);
 
+    // 6b': core.min-docs (ADR-048 § SEED-001) — the node-existence seed. It
+    // fires on a declared namespace that opted in but holds zero documents,
+    // so it runs after both presence corpora are known: id-keyed `documents`
+    // and the file-level singletons (CLAUDE.md / TODO.md) just scanned, which
+    // never become id-keyed documents. (The aggregate phase above runs before
+    // the file-level scan, so a file-level charter's presence is not yet
+    // established there.)
+    diagnostics.extend(rules::min_docs(
+        &config.namespaces,
+        &documents,
+        &file_level_scan.namespaces,
+    ));
+
     // 6c: document-level builtin-compiled rules (id-claim namespaces, e.g.
     // `tasks.*`). Unlike 6b these lint real id-keyed documents in the
     // per-document loop — `tasks.files-allowed` is the first (ADR-022 §
     // ABP-004), dispatched by code via `agent_guide::document_check`.
+    // The "managed" namespace set (ADR-039 § DAG-003): every namespace
+    // that appears in some `core.dep-shape` `requires`/`allows` anywhere
+    // in the config. `core.dep-shape`'s admissibility half needs this
+    // cross-config view, so we thread it through a synthesized `managed`
+    // param — the same edge-level channel `pipeline.conformance` used for
+    // `stages` (which it replaces). Computed once here.
+    let managed: Vec<String> = config.dep_shape_managed().into_iter().collect();
+    let managed_json = Value::Array(managed.iter().map(|s| Value::String(s.clone())).collect());
+
     for doc in &documents {
         let ns_cfg = config.namespace_config(&doc.id.namespace);
         for code in &ns_cfg.rules {
             if let Some(check_fn) = agent_guide::document_check(code) {
-                diagnostics.extend(check_fn(doc, ns_cfg.params.get(code), root));
+                // core.dep-shape's admissibility half reads the managed set
+                // (ADR-039 § DAG-003); merge it into the namespace's own
+                // dep-shape params before dispatch.
+                let params = if code == "core.dep-shape" {
+                    let mut merged = ns_cfg
+                        .params
+                        .get(code)
+                        .cloned()
+                        .unwrap_or_else(|| Value::Object(Default::default()));
+                    if let Value::Object(map) = &mut merged {
+                        map.insert("managed".to_string(), managed_json.clone());
+                    }
+                    Some(merged)
+                } else {
+                    ns_cfg.params.get(code).cloned()
+                };
+                diagnostics.extend(check_fn(doc, params.as_ref(), root));
             }
         }
         if config.todo_listed_global && !ns_cfg.rules.iter().any(|c| c == "todo.listed") {
             diagnostics.extend(agent_guide::check_todo_listed(doc, None, root));
-        }
-    }
-
-    // 6d: pipeline.conformance — auto-active when a `[pipeline]` table is
-    // declared (SPEC-002 § EARS-06.1). Unlike the 6c rules it lives in no
-    // namespace `rules` list; activate it for every document in a staged
-    // namespace and thread the declared stage order through params so the
-    // edge-distance check can name skipped stages (EARS-06.2). Edges
-    // touching an unstaged namespace are exempt inside the check (EARS-06.3).
-    if let Some(pipeline) = &config.pipeline {
-        let staged: BTreeSet<&str> = pipeline.stages.iter().map(String::as_str).collect();
-        let conformance_params = serde_json::json!({ "stages": pipeline.stages });
-        for doc in &documents {
-            if staged.contains(doc.id.namespace.as_str()) {
-                diagnostics.extend(agent_guide::check_pipeline_conformance(
-                    doc,
-                    Some(&conformance_params),
-                    root,
-                ));
-            }
         }
     }
 
@@ -941,13 +1018,67 @@ pub fn render_json_outcome(outcome: &LintOutcome) -> String {
         exit_code: u8,
         diagnostics: &'a [Diagnostic],
         kernel_messages: &'a [KernelMessage],
+        // ADR-038 § HINT-002/003: the "fix the documents, not the
+        // config" advisory, present only when rule diagnostics were
+        // emitted. Additive optional field — absent on a clean run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<&'static str>,
     }
     let wire = Wire {
         exit_code: outcome.exit.code(),
         diagnostics: &outcome.diagnostics,
         kernel_messages: &outcome.kernel_messages,
+        hint: (!outcome.diagnostics.is_empty()).then_some(crate::reporter::LINT_HINT),
     };
     serde_json::to_string_pretty(&wire).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Render the Claude Code `Stop`-hook decision for a completed lint
+/// (ADR-062 § STOP-001).
+///
+/// Returns `Some(json)` — the `{"decision":"block","reason":…}` object —
+/// when the run failed (`exit == LintFailure`, i.e. at least one
+/// error-severity diagnostic *or* kernel message), and `None` when it is
+/// clean or carries warnings only. Driving the choice off `exit` rather
+/// than re-counting keeps the block decision identical to the `0/1/2`
+/// exit-code contract: warnings never block, exactly as they never
+/// escalate past exit 0.
+///
+/// The config/kernel-error path (where [`lint`] returns `Err`, with no
+/// `LintOutcome`) blocks too — the binary builds that body and calls
+/// [`claude_stop_block`] directly, so a broken setup fails closed rather
+/// than letting the turn pass silently.
+pub fn render_claude_stop(outcome: &LintOutcome) -> Option<String> {
+    if !matches!(outcome.exit, ExitStatus::LintFailure) {
+        return None;
+    }
+    let mut body = String::new();
+    for m in outcome
+        .kernel_messages
+        .iter()
+        .filter(|m| m.severity == Severity::Error)
+    {
+        body.push_str(&reporter::render_kernel_message_simple(m));
+    }
+    let errors: Vec<Diagnostic> = outcome
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .cloned()
+        .collect();
+    body.push_str(&reporter::render(&errors));
+    Some(claude_stop_block(&body))
+}
+
+/// Wrap a compact, colour-free failure body in the Stop decision JSON.
+/// Shared by [`render_claude_stop`] and the binary's kernel-error path so
+/// the `{"decision":"block",…}` shape lives in exactly one place. The
+/// `reason` mirrors the bash-era hook: a `Verification failed:` header,
+/// the failing diagnostics, and a `Fix before completing.` trailer, so the
+/// agent receives the same actionable detail the commit hook would.
+pub fn claude_stop_block(reason_body: &str) -> String {
+    let reason = format!("Verification failed:\n{reason_body}Fix before completing.\n");
+    serde_json::json!({ "decision": "block", "reason": reason }).to_string()
 }
 
 fn any_doc_has_external_rule(documents: &[Document], config: &config::Config) -> bool {
@@ -1015,16 +1146,16 @@ mod tests {
 
     #[test]
     fn rule_unknown_suggests_pack_add_when_a_pack_provides_the_code() {
-        // ADR-025 § PKD-002: `skills.frontmatter` is bundled by the
-        // `agents` pack, so the help points at `pack add agents` rather
-        // than telling the user to author a `run` script.
+        // ADR-025 § PKD-002: `agent.frontmatter` is bundled by the `claude`
+        // pack (ADR-051), so the help points at `pack add claude` rather than
+        // telling the user to author a `run` script.
         let tmp = tempfile::tempdir().unwrap();
         let err = LintError::Config(ConfigError::RuleUnknown {
-            namespace: "SKILLS".into(),
-            code: "skills.frontmatter".into(),
+            namespace: "CLAUDEAGENTS".into(),
+            code: "agent.frontmatter".into(),
             expected_path: tmp
                 .path()
-                .join("rules/skills/frontmatter/run")
+                .join("rules/agent/frontmatter/run")
                 .display()
                 .to_string(),
         });
@@ -1032,11 +1163,11 @@ mod tests {
         assert_eq!(d.code, "cfg.rule-unknown");
         let help = d.help.as_deref().unwrap();
         assert!(
-            help.contains("ctxgrd pack add agents"),
+            help.contains("ctxgrd pack add claude"),
             "expected pack-add suggestion, got: {help}"
         );
         assert!(
-            help.contains("provided by pack `agents`"),
+            help.contains("provided by pack `claude`"),
             "expected pack provenance, got: {help}"
         );
     }
@@ -1159,6 +1290,123 @@ mod tests {
     }
 
     #[test]
+    fn json_outcome_carries_hint_when_diagnostics_present() {
+        // ADR-038 § HINT-002/003: a failing run carries the canonical
+        // hint verbatim in the additive `hint` field.
+        let outcome = LintOutcome {
+            diagnostics: vec![Diagnostic::error(
+                "core.dep-resolved",
+                "adrs/ADR-099.md",
+                5,
+                0,
+                "PRD-999 does not resolve",
+            )],
+            kernel_messages: vec![],
+            exit: ExitStatus::LintFailure,
+            documents_linted: 1,
+            rules_active: 6,
+        };
+        let json = render_json_outcome(&outcome);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["hint"], crate::reporter::LINT_HINT);
+    }
+
+    #[test]
+    fn claude_stop_blocks_on_error_diagnostic() {
+        // ADR-062 § STOP-001: a failing run yields a block decision whose
+        // reason carries the failing rule, location, and the fix trailer.
+        let outcome = LintOutcome {
+            diagnostics: vec![Diagnostic::error(
+                "core.dep-resolved",
+                "adrs/099-broken-demo.md",
+                5,
+                0,
+                "PRD-999 does not resolve",
+            )],
+            kernel_messages: vec![],
+            exit: ExitStatus::LintFailure,
+            documents_linted: 1,
+            rules_active: 6,
+        };
+        let json = render_claude_stop(&outcome).expect("error run blocks");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["decision"], "block");
+        let reason = parsed["reason"].as_str().unwrap();
+        assert!(reason.contains("Verification failed:"));
+        assert!(reason.contains("core.dep-resolved"));
+        assert!(reason.contains("099-broken-demo.md"));
+        assert!(reason.contains("Fix before completing."));
+    }
+
+    #[test]
+    fn claude_stop_blocks_on_error_kernel_message() {
+        // A source runtime error is an error-severity kernel message, not
+        // a per-document diagnostic — it must still block (exit == 1).
+        let outcome = LintOutcome {
+            diagnostics: vec![],
+            kernel_messages: vec![KernelMessage::error(
+                "src.runtime-error",
+                "source 'jira' timed out",
+            )],
+            exit: ExitStatus::LintFailure,
+            documents_linted: 0,
+            rules_active: 0,
+        };
+        let json = render_claude_stop(&outcome).expect("kernel error blocks");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["decision"], "block");
+        assert!(parsed["reason"].as_str().unwrap().contains("src.runtime-error"));
+    }
+
+    #[test]
+    fn claude_stop_allows_clean_run() {
+        // ADR-062 § STOP-001: a clean run emits nothing (None) — the agent
+        // stops freely.
+        let outcome = LintOutcome {
+            diagnostics: vec![],
+            kernel_messages: vec![],
+            exit: ExitStatus::Ok,
+            documents_linted: 7,
+            rules_active: 6,
+        };
+        assert_eq!(render_claude_stop(&outcome), None);
+    }
+
+    #[test]
+    fn claude_stop_allows_warnings_only_run() {
+        // Warnings never block (they keep exit == Ok), so the gate stays
+        // silent even though diagnostics are present — mirrors the
+        // exit-code contract where a warning never escalates past 0.
+        let outcome = LintOutcome {
+            diagnostics: vec![Diagnostic::warning(
+                "core.cross-ref",
+                "adrs/058-scaffolding.md",
+                12,
+                0,
+                "ADR-999 does not resolve",
+            )],
+            kernel_messages: vec![],
+            exit: ExitStatus::Ok,
+            documents_linted: 1,
+            rules_active: 6,
+        };
+        assert_eq!(render_claude_stop(&outcome), None);
+    }
+
+    #[test]
+    fn claude_stop_block_wraps_a_kernel_error_body() {
+        // The binary's Err path (no LintOutcome) builds a body and calls
+        // claude_stop_block directly; the shape must match the outcome path.
+        let json = claude_stop_block("cfg.missing: no ctxgrd.toml found\n");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["decision"], "block");
+        let reason = parsed["reason"].as_str().unwrap();
+        assert!(reason.starts_with("Verification failed:\n"));
+        assert!(reason.contains("cfg.missing"));
+        assert!(reason.ends_with("Fix before completing.\n"));
+    }
+
+    #[test]
     fn json_outcome_ok_run_has_empty_arrays_and_zero_exit() {
         let outcome = LintOutcome {
             diagnostics: vec![],
@@ -1171,5 +1419,53 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["exit_code"], 0);
         assert!(parsed["diagnostics"].as_array().unwrap().is_empty());
+        // ADR-038 § HINT-002: the field is absent on a clean run, not
+        // null — skip_serializing_if keeps the v1 shape for OK runs.
+        assert!(parsed.get("hint").is_none(), "no hint on a clean run");
+    }
+
+    #[test]
+    fn discover_config_roots_finds_every_config_dir_sorted() {
+        // `--recursive` discovery: each directory holding a ctxgrd.toml
+        // is its own project root, returned sorted and de-duplicated.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for sub in ["", "services/billing", "services/auth"] {
+            let dir = root.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("ctxgrd.toml"), "[ADR]\npaths = [\"docs/**\"]\n").unwrap();
+        }
+        // A directory with no config must not appear.
+        std::fs::create_dir_all(root.join("services/web")).unwrap();
+
+        let found = discover_config_roots(root);
+        assert_eq!(
+            found,
+            vec![
+                root.to_path_buf(),
+                root.join("services/auth"),
+                root.join("services/billing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn discover_config_roots_skips_gitignored_dirs() {
+        // Discovery uses the `ignore` crate, so a config under a
+        // .gitignore'd build/vendor directory is not treated as a
+        // project root — only real source projects are linted.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // The `ignore` crate only applies .gitignore inside a git repo
+        // (require_git defaults true) — same as the reference scanner.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("ctxgrd.toml"), "[ADR]\npaths = [\"docs/**\"]\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "vendored/\n").unwrap();
+        let vendored = root.join("vendored/dep");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(vendored.join("ctxgrd.toml"), "[ADR]\npaths = [\"d/**\"]\n").unwrap();
+
+        let found = discover_config_roots(root);
+        assert_eq!(found, vec![root.to_path_buf()]);
     }
 }

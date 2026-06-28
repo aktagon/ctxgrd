@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::ast::Ast;
+use crate::frontmatter::Pin;
 use crate::id::DocumentId;
 
 /// In-memory representation of a single document the kernel has ingested.
@@ -30,6 +31,12 @@ pub struct Document {
     /// the offending YAML key.
     pub frontmatter_lines: BTreeMap<String, u32>,
     pub metadata: BTreeMap<String, Value>,
+    /// The parsed `pin` block (ADR-040 § PIN-001), or `None` when the
+    /// document declares no pin. Carried on the shared `Document` so the
+    /// `core.commit-freshness` rule reads it without re-parsing the body
+    /// — the git query stays in the rule layer (PIN-006), this is just
+    /// the declarative data parsed once at ingest (PIP-001).
+    pub pin: Option<Pin>,
     /// Typed AST produced by the source (CORE-006). `None` when the
     /// source did not populate `ast`; in that case the structural
     /// rules (`core.cross-ref`, `core.required-headings`) silently
@@ -86,6 +93,7 @@ mod tests {
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
+            pin: None,
             ast: None,
             body: String::new(),
         }

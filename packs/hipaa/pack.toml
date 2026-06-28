@@ -1,0 +1,43 @@
+# summary: HIPAA Security Rule safeguard register (SAFEGUARD) and Business Associate Agreement register (BAA) over the security base — 45 CFR 164.308/310/312, Security Rule as in force 2026. Paperwork existence/metadata/freshness only, never legal adequacy.
+# depends: security
+
+# Security Rule safeguard-to-evidence register (45 CFR 164.308/310/312, HIPAA-001/002). Each entry maps one Security Rule safeguard (from the closed catalog, projected into core.allowed-values) to its implementing evidence — a reused POLICY, an ADR, or a control decision — resolved by core.cross-ref. Path-claim with an `id` so a BAA or an audit can cross-ref a safeguard mapping. hipaa.safeguard-evidence (HIPAA-002) enforces the addressable/required distinction: every in-scope safeguard needs an implementing POLICY/ADR cross-ref, and an addressable one may substitute a `justification` field where a required one may not. The generator emits the Addressable id subset (the `requirement` flag from this extract) as that rule's `addressable` param.
+[SAFEGUARD]
+paths = ["docs/compliance/hipaa/safeguards/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "hipaa.safeguard-evidence",
+]
+
+[SAFEGUARD."core.required-metadata"]
+keys = ["id", "title", "status", "safeguard"]
+
+[SAFEGUARD."core.allowed-values"]
+safeguard = ["164.308.risk_analysis", "164.308.risk_management", "164.308.sanction_policy", "164.308.activity_review", "164.308.assigned_responsibility", "164.308.authorization_supervision", "164.308.workforce_clearance", "164.308.termination_procedures", "164.308.isolating_clearinghouse", "164.308.access_authorization", "164.308.access_establishment", "164.308.security_reminders", "164.308.malicious_software", "164.308.login_monitoring", "164.308.password_management", "164.308.incident_response", "164.308.data_backup_plan", "164.308.disaster_recovery", "164.308.emergency_mode", "164.308.contingency_testing", "164.308.criticality_analysis", "164.308.evaluation", "164.308.business_associate_contracts", "164.310.contingency_operations", "164.310.facility_security_plan", "164.310.access_control_validation", "164.310.maintenance_records", "164.310.workstation_use", "164.310.workstation_security", "164.310.device_disposal", "164.310.media_reuse", "164.310.accountability", "164.310.data_backup_storage", "164.312.unique_user_id", "164.312.emergency_access", "164.312.automatic_logoff", "164.312.encryption_decryption", "164.312.audit_controls", "164.312.integrity_authentication", "164.312.person_authentication", "164.312.transmission_integrity", "164.312.transmission_encryption"]
+
+[SAFEGUARD."hipaa.safeguard-evidence"]
+addressable = ["164.308.authorization_supervision", "164.308.workforce_clearance", "164.308.termination_procedures", "164.308.access_authorization", "164.308.access_establishment", "164.308.security_reminders", "164.308.malicious_software", "164.308.login_monitoring", "164.308.password_management", "164.308.contingency_testing", "164.308.criticality_analysis", "164.310.contingency_operations", "164.310.facility_security_plan", "164.310.access_control_validation", "164.310.maintenance_records", "164.310.accountability", "164.310.data_backup_storage", "164.312.automatic_logoff", "164.312.encryption_decryption", "164.312.integrity_authentication", "164.312.transmission_integrity", "164.312.transmission_encryption"]
+
+# Business Associate Agreement register (45 CFR 164.308(b)(1) / 164.314, HIPAA-003). Each business associate handling ePHI carries an entry recording the contracting party and the execution date, kept fresh on a yearly review cadence (core.calendar-freshness over reviewed_date) — the same registry shape as GDPR's DPA. Path-claim with an `id` so a SAFEGUARD business-associate-contracts safeguard can cross-ref its governing agreement.
+[BAA]
+paths = ["docs/compliance/hipaa/baa/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.calendar-freshness",
+]
+
+[BAA."core.required-metadata"]
+keys = ["id", "title", "status", "party", "executed_date", "reviewed_date"]
+
+[BAA."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 365

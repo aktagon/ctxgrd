@@ -53,6 +53,13 @@ fn unconfigured_root_with_nothing_to_lint_exits_2() {
         !stderr.contains("ok:"),
         "the ok summary must not render on the failure path; stderr:\n{stderr}"
     );
+    // ADR-038 § HINT-004: the "fix the documents, not the config" hint
+    // must not fire for a config error (exit 2) — here the fault *is*
+    // the configuration, so the nudge would be self-contradictory.
+    assert!(
+        !stderr.contains("hint:"),
+        "the document-fix hint must not render for a config error; stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -84,5 +91,10 @@ fn zero_config_root_with_id_claimed_doc_still_lints_and_exits_0() {
     assert!(
         stderr.contains("ok: 1 document"),
         "the zero-config run must report the linted document; stderr:\n{stderr}"
+    );
+    // ADR-038 § HINT-002: a clean run has nothing to fix — no hint.
+    assert!(
+        !stderr.contains("hint:"),
+        "no document-fix hint on a clean run; stderr:\n{stderr}"
     );
 }

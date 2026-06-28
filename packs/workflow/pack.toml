@@ -1,0 +1,73 @@
+# summary: SPEC/TASK/PROMPT — ctxgrd's harness-neutral agent-development document pipeline: a SPEC is implemented via TASKs, and reusable PROMPTs are versioned.
+# Id-claimed: each namespace activates when you author the document. Split out of
+# the old `agents` pack by ADR-051 so the harness-neutral docs no longer ride a
+# harness-named pack.
+
+[SPEC]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.dep-shape",
+  "ears.clause-syntax",
+]
+
+[SPEC."core.required-headings"]
+headings = ["Context", "Data model", "API", "Workflows", "Error model", "Acceptance", "Out of scope", "References"]
+
+[SPEC."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[SPEC."core.allowed-values"]
+status = ["draft", "accepted", "superseded"]
+
+[SPEC."core.dep-shape"]
+requires = ["PRD"]
+
+[TASK]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.dep-resolved",
+  "core.dep-shape",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "agent.assigned",
+]
+
+[TASK."core.required-headings"]
+headings = ["Goal", "Files allowed", "Requirements", "Acceptance"]
+
+# ADR-057 § AOT-001: every TASK declares the agent(s) that do the work.
+[TASK."core.required-metadata"]
+keys = ["id", "title", "status", "agents"]
+
+[TASK."core.allowed-values"]
+status = ["todo", "doing", "done", "blocked"]
+
+# A TASK implements a SPEC, so it must cite one: core.dep-shape's `requires`
+# forces the TASK's `depends_on` to name at least one SPEC — no orphan task
+# floating free of a design. Presence, not cardinality (mirrors the SPEC→PRD
+# guard above). ADR is intentionally NOT required here: the `workflow` pack is
+# harness-neutral and does not own ADR (project-docs does, ADR-051). A project
+# that runs ADR→TASK directly should add that edge in its own ctxgrd.toml.
+[TASK."core.dep-shape"]
+requires = ["SPEC"]
+
+[PROMPT]
+rules = ["core.frontmatter", "core.id", "core.id-unique", "core.required-headings", "core.required-metadata"]
+
+[PROMPT."core.required-headings"]
+headings = ["System prompt", "Output format"]
+
+[PROMPT."core.required-metadata"]
+keys = ["id", "title"]

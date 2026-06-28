@@ -1,0 +1,138 @@
+{
+  "_note": "Catalog cross-checked against NIST SP 800-53 Revision 5 (control baselines per NIST SP 800-53B): the 20 control families AC, AT, AU, CA, CM, CP, IA, IR, MA, MP, PE, PL, PM, PS, PT, RA, SA, SC, SI, SR. The catalog grain is family-level by deliberate choice (NIST-001): Rev 5 enumerates ~1000+ individual controls and enhancements (e.g. AC-2, AC-2(1)), most of which a given system never selects; family-level ids cover the v1 need (route a control narrative or finding to the right family) with a small, maintainable vocabulary, and the grammar is reserved to add full control/enhancement ids later without a breaking change. Unlike SOC 2 (CC/A/C/PI/P over criteria) and ISO 27001 (themes over controls), NIST families are themselves the top-level grouping, so the pack carries one closed vocabulary (the family catalog), not two. Paperwork existence/metadata/freshness only; ctxgrd never attests that a control is technically enforced (ADR-071 Context).",
+  "edition": "NIST SP 800-53 Revision 5 (control families; baselines per SP 800-53B)",
+  "summary": "NIST 800-53 control-to-evidence register (NIST80053) over the security base \u2014 NIST SP 800-53 Rev 5: the 20 control families (AC-SR), family-level grain. Paperwork existence/metadata/freshness only, never implementation adequacy.",
+  "depends": [
+    "security"
+  ],
+  "vocabularies": {
+    "control": {
+      "cite": "NIST SP 800-53 Rev 5 control families",
+      "values": [
+        {
+          "id": "AC",
+          "family": "Access Control"
+        },
+        {
+          "id": "AT",
+          "family": "Awareness and Training"
+        },
+        {
+          "id": "AU",
+          "family": "Audit and Accountability"
+        },
+        {
+          "id": "CA",
+          "family": "Assessment, Authorization, and Monitoring"
+        },
+        {
+          "id": "CM",
+          "family": "Configuration Management"
+        },
+        {
+          "id": "CP",
+          "family": "Contingency Planning"
+        },
+        {
+          "id": "IA",
+          "family": "Identification and Authentication"
+        },
+        {
+          "id": "IR",
+          "family": "Incident Response"
+        },
+        {
+          "id": "MA",
+          "family": "Maintenance"
+        },
+        {
+          "id": "MP",
+          "family": "Media Protection"
+        },
+        {
+          "id": "PE",
+          "family": "Physical and Environmental Protection"
+        },
+        {
+          "id": "PL",
+          "family": "Planning"
+        },
+        {
+          "id": "PM",
+          "family": "Program Management"
+        },
+        {
+          "id": "PS",
+          "family": "Personnel Security"
+        },
+        {
+          "id": "PT",
+          "family": "PII Processing and Transparency"
+        },
+        {
+          "id": "RA",
+          "family": "Risk Assessment"
+        },
+        {
+          "id": "SA",
+          "family": "System and Services Acquisition"
+        },
+        {
+          "id": "SC",
+          "family": "System and Communications Protection"
+        },
+        {
+          "id": "SI",
+          "family": "System and Information Integrity"
+        },
+        {
+          "id": "SR",
+          "family": "Supply Chain Risk Management"
+        }
+      ]
+    }
+  },
+  "namespaces": [
+    {
+      "name": "NIST80053",
+      "comment": "NIST 800-53 control-to-evidence register (NIST SP 800-53 Rev 5, NIST-001/002/003). Each entry maps one control family (from the closed family catalog, projected into core.allowed-values; grain is family-level by choice, NIST-001) to its implementing evidence \u2014 a reused POLICY, an ADR, or an `evidence_link` (an SSP narrative, assessment record, or config export). NIST 800-53 introduces no statutory document namespace of its own; the control-to-evidence mapping is its sole artifact, reusing POLICY/RISK/VULN from the security base. Path-claim with an `id` so an audit or a cross-ref can resolve a control. core.calendar-freshness over `review_date` surfaces a stale control. A `not-applicable` control is out of scope. nist.control-evidence (NIST-002) reuses the shared conditional-evidence machinery: an in-scope control asserting a family with neither a POLICY/ADR cross-ref nor a non-empty `evidence_link` fails.",
+      "paths": [
+        "docs/compliance/nist-800-53/controls/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "core.calendar-freshness",
+        "nist.control-evidence"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "control",
+        "owner",
+        "review_date"
+      ],
+      "allowed_values": [
+        "control"
+      ],
+      "calendar_freshness": {
+        "field": "review_date",
+        "stale_days": 365
+      },
+      "control_evidence": {
+        "rule": "nist.control-evidence",
+        "evidence_fields": [
+          "evidence_link"
+        ],
+        "out_of_scope_status": [
+          "not-applicable"
+        ]
+      }
+    }
+  ]
+}

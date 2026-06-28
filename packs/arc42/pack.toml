@@ -1,0 +1,77 @@
+# summary: arc42 architecture documentation — the 12 canonical arc42 sections as
+# required H2 headings (ARC42 namespace). Style pack for the ARCH family (ADR-049),
+# paid tier delivered via ADR-045. Canonical source: https://arc42.org (template
+# v8, the 12 numbered sections).
+#
+# arc42 is a documentation TEMPLATE (12 text sections), complementary to — not a
+# competitor of — the C4 diagramming notation. ctxgrd lints the section structure
+# of the markdown document, not the diagrams inside it.
+#
+# Per ADR-049 (ARCH-002) each architecture style is its own namespace: [ARC42]
+# path-claims docs/architecture/**. It and the free styleless [ARCH] base claim
+# the same path and are therefore mutually exclusive — a repo adds exactly one
+# style pack. Concurrent styles would live under disjoint sub-paths
+# (docs/architecture/arc42/** vs .../c4/**), an out-of-scope power-user case.
+#
+# id-keyed: docs/architecture/** is a glob (a directory of documents), which
+# ctxgrd treats as an id-keyed series like BUG/RUN/PMR — each doc carries an
+# `id: ARC42-<n>`. This lets a monorepo document several systems (ARC42-1
+# payments, ARC42-2 billing). (Only literal single-file claims like DESIGN.md
+# are id-less singletons.)
+
+[ARC42]
+paths = ["docs/architecture/**"]
+rules = [
+    "core.frontmatter",
+    "core.id",
+    "core.id-unique",
+    "core.cross-ref",
+    "core.required-headings",
+    "core.required-metadata",
+    "core.allowed-values",
+]
+
+# The 12 canonical arc42 sections, in template order (arc42.org v8).
+[ARC42."core.required-headings"]
+headings = [
+    "Introduction and Goals",
+    "Architecture Constraints",
+    "Context and Scope",
+    "Solution Strategy",
+    "Building Block View",
+    "Runtime View",
+    "Deployment View",
+    "Crosscutting Concepts",
+    "Architecture Decisions",
+    "Quality Requirements",
+    "Risks and Technical Debt",
+    "Glossary",
+]
+
+[ARC42."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+# A living architecture document's lifecycle (mirrors the RUN runbook vocabulary).
+[ARC42."core.allowed-values"]
+status = ["draft", "active", "deprecated"]
+
+# ── Optional lifecycle guardrail (NOT enabled by default) ────────────────────
+# arc42 §1/§2/§10 are requirements (a PRD) and §9 references decisions (ADRs), so
+# an architecture doc may legitimately link to them. To enforce that an ARC42
+# doc's `depends_on` edges point only at those namespaces, add `core.dep-shape`
+# to the rules list above and uncomment the block below — IN YOUR OWN ctxgrd.toml,
+# not here. Two reasons it is opt-in, not a pack default:
+#
+#   1. Vocabulary: this pack cannot assume your repo names requirements "PRD" or
+#      decisions "ADR". Set the names your project actually uses.
+#   2. Global effect: naming a namespace in `requires`/`allows` makes it "managed"
+#      across the ENTIRE config — every other namespace's `depends_on` edge to it
+#      is then admissibility-checked. Enabling this can make existing edges
+#      elsewhere (e.g. SPEC -> PRD) start erroring unless those namespaces also
+#      declare `core.dep-shape`. Opt in deliberately.
+#
+# `allows` permits edges; it never forces a PRD/ADR to exist (use `requires` for
+# presence — discouraged here, since architecture and requirements co-evolve).
+#
+# [ARC42."core.dep-shape"]
+# allows = ["PRD", "ADR"]

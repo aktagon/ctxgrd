@@ -1,0 +1,17 @@
+# summary: OPENCODEAGENTS — opencode agent definitions (.opencode/agent/*.md), linted via the opencode.frontmatter rule.
+# opencode's instruction file is AGENTS.md (the `agents` pack); its proprietary
+# artifact is the agent definition. Per-harness pack established by ADR-051.
+
+# OPENCODEAGENTS — opencode agent definitions. Markdown with a frontmatter
+# (description required; mode/model/temperature/permission optional) and a
+# system-prompt body. Unlike Claude Code, there is no `name` field — the agent
+# name is the filename — so it lints via the compiled `opencode.frontmatter`
+# rule, not `agent.frontmatter`. Renamed from OPENCODE in ADR-061.
+[OPENCODEAGENTS]
+paths = [".opencode/agent/**/*.md"]
+rules = ["opencode.frontmatter"]
+
+# [OPENCODEAGENTS."opencode.frontmatter"]
+# models = ["claude-sonnet-4-6", "gpt-5"]  # pin accepted `model:` values
+# desc_min_chars = 40                       # floor (default 40)
+# desc_max_chars = 1200                     # opt-in ceiling (off by default)

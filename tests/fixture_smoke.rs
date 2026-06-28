@@ -83,6 +83,18 @@ fn cli_runs_against_examples_fixture() {
         "expected 8 errors total; got:\n{stdout}"
     );
 
+    // ADR-038 § HINT-003: the "fix the documents, not the config"
+    // advisory lands on stderr (alongside the run summary), never on
+    // stdout — stdout stays a pure diagnostic stream.
+    assert!(
+        stderr.contains("hint: fix the documents the rules flag"),
+        "expected hint on stderr for a failing run; stderr was:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("hint:"),
+        "hint must not pollute stdout; got:\n{stdout}"
+    );
+
     // Reference scanner diagnostics — one per dangling pointer in
     // refs/, anchored at the exact (file, line, col) the scanner
     // emitted (ADR-001 § REF-001 attribution).

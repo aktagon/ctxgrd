@@ -40,7 +40,7 @@ pub struct RuleEntry {
     pub description: String,
 }
 
-/// Built-in `(code, summary, description)` triples for the nine
+/// Built-in `(code, summary, description)` triples for the twelve
 /// `core.*` rules. `summary` is the table cell; `description` is the
 /// wrapped paragraph in the detail box. Source of truth: the brief's
 /// "Built-in rules" table.
@@ -59,6 +59,16 @@ pub const CORE_DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "core.id-unique",
         "Document numbers must be unique per namespace.",
         "No two documents share `(namespace, number)`.",
+    ),
+    (
+        "core.min-docs",
+        "Seeded namespaces must hold at least one document.",
+        "Node-existence seed (ADR-048): fires on a declared namespace that lists \
+         `core.min-docs` but holds zero documents, anchoring the diagnostic on \
+         `ctxgrd.toml`. Presence-only for v1 (reserved `count` param); severity \
+         follows the `severity` param (`error` default). Place only on isolated \
+         charter or goal namespaces — interior existence propagates via \
+         `core.dep-shape` + `core.dep-resolved`.",
     ),
     (
         "core.dep-resolved",
@@ -96,6 +106,15 @@ pub const CORE_DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "Scans `**Satisfies:**` / `**Addressed by:**` list items; emits a warning for each \
          requirement-ID token (known prefix, missing number) that does not resolve to a heading \
          definition in the linted corpus. Foreign prefixes (HTTP, RFC) are silently ignored.",
+    ),
+    (
+        "core.successor-link",
+        "A superseded document must point at its replacement.",
+        "When a document's `status` equals the `trigger` param (default `superseded`), its \
+         frontmatter must carry a `field` (default `superseded_by`) naming a present document, \
+         resolved the same way `core.dep-resolved` resolves `depends_on`. Errors on the status \
+         line when the field is missing or names an unknown document. The optional `target` param \
+         constrains the successor to one namespace (ADR-073).",
     ),
 ];
 
@@ -141,35 +160,10 @@ pub fn list_rules(
         }
     }
 
-    // `pipeline.conformance` is auto-activated by a declared `[pipeline]`
-    // table for each staged namespace (SPEC-002 EARS-06.1) — it lives in
-    // no namespace `rules` list, so synthesize its entries here. Without a
-    // declared pipeline the rule is inert and absent from this output.
-    if let Some(pipeline) = &config.pipeline {
-        let (source, summary, description) =
-            resolve("pipeline.conformance", discovered, &core_map);
-        for stage in &pipeline.stages {
-            if filter.is_some_and(|ns| ns != stage) {
-                continue;
-            }
-            // Defensive: don't duplicate if a namespace lists it explicitly.
-            let listed = config
-                .namespaces
-                .get(stage)
-                .is_some_and(|c| c.rules.iter().any(|r| r == "pipeline.conformance"));
-            if listed {
-                continue;
-            }
-            entries.push(RuleEntry {
-                namespace: stage.clone(),
-                code: "pipeline.conformance".to_string(),
-                source: source.clone(),
-                params: Value::Object(Default::default()),
-                summary: summary.clone(),
-                description: description.clone(),
-            });
-        }
-    }
+    // ADR-039 § DAG-003: `pipeline.conformance` is gone — its job (edge
+    // admissibility) is now `core.dep-shape`'s second half, and dep-shape
+    // is a normal namespace-listed rule already emitted by the loop above.
+    // No auto-synthesized entries remain.
 
     entries.sort_by(|a, b| {
         (a.namespace.as_str(), a.code.as_str()).cmp(&(b.namespace.as_str(), b.code.as_str()))
@@ -183,12 +177,24 @@ fn resolve(
     core_map: &BTreeMap<&str, (&str, &str)>,
 ) -> (String, String, String) {
     if code.starts_with("core.") {
-        let (summary, description) = core_map.get(code).copied().unwrap_or(("", ""));
-        return (
-            "core".to_string(),
-            summary.to_string(),
-            description.to_string(),
-        );
+        if let Some((summary, description)) = core_map.get(code).copied() {
+            return (
+                "core".to_string(),
+                summary.to_string(),
+                description.to_string(),
+            );
+        }
+        // A `core.*` rule that ships compiled (ADR-040 freshness family):
+        // its summary/description live in BUILTIN_RULES, but it is still a
+        // core rule by code, so report the `core` source.
+        if let Some(rule) = crate::builtin_rules::BUILTIN_RULES.iter().find(|r| r.code == code) {
+            return (
+                "core".to_string(),
+                rule.summary.to_string(),
+                rule.description.to_string(),
+            );
+        }
+        return ("core".to_string(), String::new(), String::new());
     }
     if crate::config::is_builtin_compiled(code) {
         let (summary, description) = crate::builtin_rules::BUILTIN_RULES
@@ -771,57 +777,37 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_conformance_appears_only_under_a_declared_pipeline() {
+    fn dep_shape_listed_as_a_normal_rule_and_conformance_is_gone() {
         use crate::config::PipelineConfig;
 
-        // No [pipeline] → the rule is absent (it is not in any rules list).
+        // ADR-039 § DAG-003: `pipeline.conformance` no longer exists, and a
+        // declared `[pipeline]` no longer synthesizes auto-rule entries.
+        // `core.dep-shape` is a normal namespace-listed rule.
         let mut config = Config::default();
-        config.namespaces.insert(
-            "ADR".to_string(),
-            NamespaceConfig {
-                rules: vec!["core.frontmatter".to_string()],
-                params: Default::default(),
-                paths: None,
-                path_patterns: Vec::new(),
-            },
-        );
-        let discovered = BTreeMap::new();
-        let without = list_rules(&config, &discovered, None);
-        assert!(
-            without.iter().all(|e| e.code != "pipeline.conformance"),
-            "rule must not show without a declared pipeline"
-        );
-
-        // Declare a pipeline → one entry per staged namespace.
         config.namespaces.insert(
             "SPEC".to_string(),
             NamespaceConfig {
-                rules: vec!["core.frontmatter".to_string()],
+                rules: vec!["core.frontmatter".to_string(), "core.dep-shape".to_string()],
                 params: Default::default(),
                 paths: None,
                 path_patterns: Vec::new(),
             },
         );
         config.pipeline = Some(PipelineConfig {
-            stages: vec!["ADR".to_string(), "SPEC".to_string()],
+            stages: vec!["SPEC".to_string()],
             gates: std::collections::BTreeMap::new(),
         });
-        let with = list_rules(&config, &discovered, None);
-        let conformance: Vec<&RuleEntry> = with
-            .iter()
-            .filter(|e| e.code == "pipeline.conformance")
-            .collect();
-        assert_eq!(
-            conformance.len(),
-            2,
-            "one pipeline.conformance entry per staged namespace"
+        let discovered = BTreeMap::new();
+        let entries = list_rules(&config, &discovered, None);
+        assert!(
+            entries.iter().all(|e| e.code != "pipeline.conformance"),
+            "pipeline.conformance must not appear — it was deleted (DAG-003)"
         );
-        assert_eq!(conformance[0].namespace, "ADR");
-        assert_eq!(conformance[1].namespace, "SPEC");
-        assert_eq!(conformance[0].source, "pack");
-        assert!(conformance[0]
-            .summary
-            .contains("skip declared pipeline stages"));
+        let dep_shape: Vec<&RuleEntry> =
+            entries.iter().filter(|e| e.code == "core.dep-shape").collect();
+        assert_eq!(dep_shape.len(), 1, "core.dep-shape shows once, where listed");
+        assert_eq!(dep_shape[0].namespace, "SPEC");
+        assert_eq!(dep_shape[0].source, "core");
     }
 
     #[test]

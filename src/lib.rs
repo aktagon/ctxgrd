@@ -36,6 +36,7 @@ pub mod list;
 pub mod lsp;
 pub mod pack;
 pub mod path_claims;
+pub mod pin;
 pub(crate) mod reference;
 pub mod reporter;
 pub(crate) mod rules;

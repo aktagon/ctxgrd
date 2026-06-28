@@ -76,12 +76,12 @@ impl Envelope {
                     raw_id: self.id.clone(),
                 })?;
 
-        let (metadata, frontmatter_lines) = match Frontmatter::parse_with_lines(&self.body) {
+        let (metadata, frontmatter_lines, pin) = match Frontmatter::parse_with_lines(&self.body) {
             Ok((fm, lines)) => {
                 let merged = frontmatter::merge_metadata(&self.extra, &fm.metadata);
-                (merged, lines)
+                (merged, lines, fm.pin)
             }
-            Err(FrontmatterError::MissingFence) => (self.extra.clone(), BTreeMap::new()),
+            Err(FrontmatterError::MissingFence) => (self.extra.clone(), BTreeMap::new(), None),
             Err(e) => return Err(EnvelopeError::Frontmatter(e)),
         };
 
@@ -92,6 +92,7 @@ impl Envelope {
             depends_on: self.depends_on,
             frontmatter_lines,
             metadata,
+            pin,
             ast: self.ast,
             body: self.body,
         })

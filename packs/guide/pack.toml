@@ -1,0 +1,22 @@
+# summary: GUIDE — end-user documentation typed by the Diátaxis taxonomy (tutorial/how-to/reference/explanation) with a required title, kept discoverable from the README.
+# End-user guides are path-claimed at docs/guides/**, id-less and frontmatter-light
+# (a title and a `diataxis.type`), following the Diátaxis taxonomy (https://diataxis.fr).
+# ctxgrd lints structure only: the file carries a title and a known `diataxis.type`,
+# and the project has at least one guide. The class lives under a `diataxis` object
+# rather than a top-level `type:` because `type` is a reserved layout-selector key in
+# Hugo/Jekyll/Eleventy, which blocked publishing a lint-clean guide as-is (BUG-015).
+# Prose quality — a how-to titled by its goal, a
+# reference written dry — is the writer's job (see the writing-end-user-guide skill),
+# not a structural rule. The README→guide link that keeps the front door pointing at
+# the entry guide rides the project-docs pack's [README] namespace (core.requires-link).
+# ADR-055.
+
+[GUIDE]
+paths = ["docs/guides/**"]
+rules = ["guide.frontmatter", "core.min-docs"]
+
+# The Diátaxis taxonomy constraining `diataxis.type`. Config-driven, not baked into
+# the binary: retype the allowlist (or drop it for presence-only) if your doc model
+# differs.
+[GUIDE."guide.frontmatter"]
+types = ["tutorial", "how-to", "reference", "explanation"]

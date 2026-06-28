@@ -45,7 +45,7 @@ pub fn scaffold(
 ) -> Scaffold {
     let number = id_override.unwrap_or_else(|| next_id(namespace, existing));
     let slug = slugify(title);
-    let contents = render_contents(namespace, number, title, ns_cfg);
+    let contents = render_contents(namespace, number, title, ns_cfg, root);
     let dir = target_dir(namespace, ns_cfg, existing, root, out_override);
     let filename = format!("{number:03}-{slug}.md");
     let target_path = dir.join(filename);
@@ -162,7 +162,13 @@ fn glob_literal_prefix(glob: &str) -> Option<PathBuf> {
     any.then_some(prefix)
 }
 
-fn render_contents(namespace: &str, number: u32, title: &str, ns_cfg: &NamespaceConfig) -> String {
+fn render_contents(
+    namespace: &str,
+    number: u32,
+    title: &str,
+    ns_cfg: &NamespaceConfig,
+    root: &Path,
+) -> String {
     let mut out = String::new();
     let id = format!("{namespace}-{number:03}");
 
@@ -187,6 +193,19 @@ fn render_contents(namespace: &str, number: u32, title: &str, ns_cfg: &Namespace
         }
     }
     out.push_str("depends_on: []\n");
+    // ADR-041 § SEC-008: when this namespace requires a commit pin
+    // (`[NS."core.commit-freshness"] require-pin = true`), seed a `pin`
+    // block so the scaffold lints clean against `require-pin`. The
+    // commit is the current HEAD (its own ancestor, no drift on a clean
+    // tree); the scope is a placeholder the author edits to the code the
+    // document covers.
+    if requires_pin(ns_cfg) {
+        out.push_str("pin:\n");
+        out.push_str(&format!("  commit: {}\n", head_commit(root)));
+        out.push_str("  # edit `scope` to the path globs this document covers\n");
+        out.push_str("  scope:\n");
+        out.push_str("    - src/**\n");
+    }
     out.push_str("---\n");
 
     // --- Body ---
@@ -206,6 +225,33 @@ fn render_contents(namespace: &str, number: u32, title: &str, ns_cfg: &Namespace
         }
     }
     out
+}
+
+/// True when this namespace's `[NS."core.commit-freshness"]` config sets
+/// `require-pin = true` — the SEC-008 trigger for seeding a `pin` block.
+fn requires_pin(ns_cfg: &NamespaceConfig) -> bool {
+    ns_cfg
+        .params
+        .get("core.commit-freshness")
+        .and_then(|p| p.get("require-pin"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// The current `HEAD` commit at `root`, for seeding `pin.commit`
+/// (SEC-008). Falls back to a placeholder when git is unavailable — the
+/// author re-pins with `ctxgrd pin --bless` once the tree is in order.
+fn head_commit(root: &Path) -> String {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0000000".to_owned())
 }
 
 /// Render a string as a YAML scalar.
@@ -970,6 +1016,7 @@ mod tests {
             depends_on: vec![],
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
+            pin: None,
             ast: None,
             body: String::new(),
         }
@@ -1224,6 +1271,68 @@ depends_on: []
         // again as a stubbed required-metadata entry).
         assert_eq!(lines.iter().filter(|l| l.starts_with("id:")).count(), 1);
         assert_eq!(lines.iter().filter(|l| l.starts_with("title:")).count(), 1);
+    }
+
+    #[test]
+    fn scaffold_threat_seeds_a_pin_block_when_require_pin() {
+        // ADR-041 § SEC-008: a THREAT namespace with require-pin = true
+        // must scaffold a `pin:` block so the new doc lints clean against
+        // `core.commit-freshness` require-pin.
+        let mut params: BTreeMap<String, serde_json::Value> = Default::default();
+        params.insert(
+            "core.required-metadata".to_string(),
+            json!({ "keys": ["id", "title", "status"] }),
+        );
+        params.insert(
+            "core.required-headings".to_string(),
+            json!({ "headings": ["Spoofing", "Tampering"] }),
+        );
+        params.insert(
+            "core.commit-freshness".to_string(),
+            json!({ "require-pin": true }),
+        );
+        let cfg = NamespaceConfig {
+            rules: vec![],
+            params,
+            paths: None,
+            path_patterns: Vec::new(),
+        };
+        let s = scaffold(
+            "THREAT",
+            "Auth boundary trust model",
+            Some(1),
+            &cfg,
+            &[],
+            Path::new("."),
+            None,
+        );
+        assert!(
+            s.contents.contains("pin:"),
+            "scaffold must seed a pin block:\n{}",
+            s.contents
+        );
+        assert!(
+            s.contents.contains("commit:"),
+            "pin block must carry a commit:\n{}",
+            s.contents
+        );
+        assert!(
+            s.contents.contains("scope:") && s.contents.contains("src/**"),
+            "pin block must carry a placeholder scope:\n{}",
+            s.contents
+        );
+    }
+
+    #[test]
+    fn scaffold_omits_pin_block_without_require_pin() {
+        // A namespace with no commit-freshness require-pin gets no pin.
+        let cfg = ns_cfg(vec!["id", "title", "status"], vec!["Status"]);
+        let s = scaffold("ADR", "Some decision", Some(1), &cfg, &[], Path::new("."), None);
+        assert!(
+            !s.contents.contains("pin:"),
+            "no pin block expected:\n{}",
+            s.contents
+        );
     }
 
     // -- ctxgrd init tests -------------------------------------------

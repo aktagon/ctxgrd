@@ -18,6 +18,23 @@ use thiserror::Error;
 
 const FENCE: &str = "---";
 
+/// A `pin` frontmatter block (ADR-040 § PIN-001): the green commit a
+/// document was last validated against and the path globs it covers.
+///
+/// Parsed once at the ingest boundary alongside `id`/`depends_on`
+/// (ADR-029 § PIP-001) — `pin` is a reserved frontmatter key. The git
+/// query that consults this data lives entirely in the rule layer
+/// (`core.commit-freshness`, ADR-040 § PIN-006); the parse stays a pure
+/// function of bytes.
+///
+/// Invariant: `scope` is non-empty. An absent or empty `scope` on a
+/// present `pin` is a parse error (PIN-001), never a whole-repo default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub commit: String,
+    pub scope: Vec<String>,
+}
+
 /// Frontmatter extracted from a document body.
 ///
 /// Construction rule: `id` holds the raw string as authored (trimmed).
@@ -29,6 +46,9 @@ const FENCE: &str = "---";
 pub(crate) struct Frontmatter {
     pub id: Option<String>,
     pub depends_on: Vec<String>,
+    /// An optional `pin` block (ADR-040 § PIN-001). `None` when no `pin`
+    /// key is present; a malformed `pin` is a parse error.
+    pub pin: Option<Pin>,
     pub metadata: BTreeMap<String, Value>,
 }
 
@@ -132,6 +152,23 @@ impl Frontmatter {
             }
         };
 
+        // `pin` is a reserved frontmatter key (ADR-040 § PIN-001): peel
+        // it off here in the single pass so it never leaks into
+        // `metadata`. A present `pin` must carry a `commit` string and a
+        // non-empty `scope` list of path globs; anything else is a parse
+        // error, not a silent skip (PIN-001 — an empty scope is never a
+        // whole-repo default).
+        let pin = match map.remove("pin") {
+            Some(Value::Object(pin_map)) => Some(parse_pin(pin_map)?),
+            Some(Value::Null) | None => None,
+            Some(other) => {
+                return Err(FrontmatterError::YamlParse(format!(
+                    "'pin' must be a mapping with `commit` and `scope`, got {}",
+                    value_kind(&other)
+                )));
+            }
+        };
+
         let metadata: BTreeMap<String, Value> = map.into_iter().collect();
 
         // Key line numbers: walk the YAML slice (already located above)
@@ -148,6 +185,7 @@ impl Frontmatter {
             Self {
                 id,
                 depends_on,
+                pin,
                 metadata,
             },
             key_lines,
@@ -204,6 +242,60 @@ pub(crate) fn body_start_offset(body: &str) -> usize {
     // the whole body. The rule layer catches the missing-fence case.
     let _ = bom_len;
     0
+}
+
+/// Deserialize a `pin` mapping into a [`Pin`], enforcing PIN-001: a
+/// non-empty `commit` string and a non-empty `scope` list of strings.
+fn parse_pin(map: serde_json::Map<String, Value>) -> Result<Pin, FrontmatterError> {
+    let commit = match map.get("commit") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
+        Some(Value::String(_)) | None => {
+            return Err(FrontmatterError::YamlParse(
+                "'pin.commit' must be a non-empty git revision string".to_owned(),
+            ));
+        }
+        Some(other) => {
+            return Err(FrontmatterError::YamlParse(format!(
+                "'pin.commit' must be a string, got {}",
+                value_kind(other)
+            )));
+        }
+    };
+
+    let scope = match map.get("scope") {
+        Some(Value::Array(items)) => {
+            let globs: Vec<String> = items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            if globs.is_empty() {
+                return Err(FrontmatterError::YamlParse(
+                    "'pin.scope' must be a non-empty list of path globs — an empty scope is \
+                     not a whole-repo default (ADR-040 § PIN-001)"
+                        .to_owned(),
+                ));
+            }
+            globs
+        }
+        Some(other) => {
+            return Err(FrontmatterError::YamlParse(format!(
+                "'pin.scope' must be a sequence of path globs, got {}",
+                value_kind(other)
+            )));
+        }
+        None => {
+            return Err(FrontmatterError::YamlParse(
+                "'pin.scope' is required and must be a non-empty list of path globs \
+                 (ADR-040 § PIN-001)"
+                    .to_owned(),
+            ));
+        }
+    };
+
+    Ok(Pin { commit, scope })
 }
 
 fn top_level_key(line: &str) -> Option<String> {
@@ -416,6 +508,52 @@ mod tests {
             parse(body).unwrap_err(),
             FrontmatterError::YamlParse(_)
         ));
+    }
+
+    #[test]
+    fn pin_block_parses_commit_and_scope() {
+        let body = "---\nid: ADR-041\npin:\n  commit: a1b2c3d4\n  scope:\n    - src/auth/**\n    - Cargo.lock\n---\n";
+        let fm = parse(body).unwrap();
+        let pin = fm.pin.expect("pin present");
+        assert_eq!(pin.commit, "a1b2c3d4");
+        assert_eq!(pin.scope, vec!["src/auth/**", "Cargo.lock"]);
+        // `pin` must not leak into metadata.
+        assert!(!fm.metadata.contains_key("pin"));
+    }
+
+    #[test]
+    fn pin_absent_is_none() {
+        let body = "---\nid: ADR-041\n---\n";
+        let fm = parse(body).unwrap();
+        assert_eq!(fm.pin, None);
+    }
+
+    #[test]
+    fn pin_with_empty_scope_is_parse_error() {
+        let body = "---\nid: ADR-041\npin:\n  commit: a1b2c3d4\n  scope: []\n---\n";
+        let err = parse(body).unwrap_err();
+        assert!(matches!(err, FrontmatterError::YamlParse(_)));
+    }
+
+    #[test]
+    fn pin_with_missing_scope_is_parse_error() {
+        let body = "---\nid: ADR-041\npin:\n  commit: a1b2c3d4\n---\n";
+        let err = parse(body).unwrap_err();
+        assert!(matches!(err, FrontmatterError::YamlParse(_)));
+    }
+
+    #[test]
+    fn pin_with_missing_commit_is_parse_error() {
+        let body = "---\nid: ADR-041\npin:\n  scope:\n    - src/auth/**\n---\n";
+        let err = parse(body).unwrap_err();
+        assert!(matches!(err, FrontmatterError::YamlParse(_)));
+    }
+
+    #[test]
+    fn pin_non_mapping_is_parse_error() {
+        let body = "---\nid: ADR-041\npin: a1b2c3d4\n---\n";
+        let err = parse(body).unwrap_err();
+        assert!(matches!(err, FrontmatterError::YamlParse(_)));
     }
 
     #[test]

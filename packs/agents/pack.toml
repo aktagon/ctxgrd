@@ -1,74 +1,18 @@
-# summary: AGENTS/SKILLS/SPEC/TASK/PROMPT — everything a coding agent reads
-# (instruction + skill files), is driven by (SPEC + TASK), and reuses
-# (PROMPT). Path-claimed namespaces fire on adoption; id-claimed activate
-# when you author the document. Defined by ADR-023.
+# summary: AGENTS — the AGENTS.md cross-tool instruction standard (agents.md).
+# The context-* rules keep an always-loaded instruction file free of volatile
+# state, within budget, and cache-friendly. One owner for AGENTS.md so it never
+# conflicts with the per-harness packs. ADR-051 split the old catch-all `agents`
+# pack (ADR-023) into this + `workflow` + the per-harness packs.
 
+# AGENTS.md is read by many harnesses (Codex, opencode, and others adopting the
+# agents.md standard). It is a single shared file, so exactly one namespace
+# claims it — harness-specific instruction files (CLAUDE.md, GEMINI.md) live in
+# their own packs.
 [AGENTS]
-paths = ["CLAUDE.md", "AGENTS.md", "GEMINI.md"]
+paths = ["AGENTS.md"]
 rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
 
 # [AGENTS."agents.context-budget"]
 # max_words = 4000        # instruction-file size budget (default 4000)
 # [AGENTS."agents.context-cache"]
 # churn_min_hours = 0     # >0 enables the commit-context churn warning
-
-# SKILLS claims SKILL.md files used by Claude Code and Codex (agentskills.io
-# convention). Path-claimed. Uses a file-level compiled rule (not core.*) because
-# SKILL.md has name/description but no id: — core.* would error with IdMissing.
-[SKILLS]
-paths = [".claude/skills/**/SKILL.md", ".codex/skills/**/SKILL.md"]
-rules = ["skills.frontmatter"]
-
-[SPEC]
-rules = [
-  "core.frontmatter",
-  "core.id",
-  "core.id-unique",
-  "core.dep-resolved",
-  "core.dep-cycle",
-  "core.cross-ref",
-  "core.required-headings",
-  "core.required-metadata",
-  "core.allowed-values",
-  "spec.requires-prd",
-  "ears.clause-syntax",
-]
-
-[SPEC."core.required-headings"]
-headings = ["Context", "Data model", "API", "Workflows", "Error model", "Acceptance", "Out of scope", "References"]
-
-[SPEC."core.required-metadata"]
-keys = ["id", "title", "status"]
-
-[SPEC."core.allowed-values"]
-status = ["draft", "accepted", "superseded"]
-
-[TASK]
-rules = [
-  "core.frontmatter",
-  "core.id",
-  "core.id-unique",
-  "core.cross-ref",
-  "core.dep-resolved",
-  "core.required-headings",
-  "core.required-metadata",
-  "core.allowed-values",
-]
-
-[TASK."core.required-headings"]
-headings = ["Goal", "Files allowed", "Requirements", "Acceptance"]
-
-[TASK."core.required-metadata"]
-keys = ["id", "title", "status"]
-
-[TASK."core.allowed-values"]
-status = ["todo", "doing", "done", "blocked"]
-
-[PROMPT]
-rules = ["core.frontmatter", "core.id", "core.id-unique", "core.required-headings", "core.required-metadata"]
-
-[PROMPT."core.required-headings"]
-headings = ["System prompt", "Output format"]
-
-[PROMPT."core.required-metadata"]
-keys = ["id", "title"]

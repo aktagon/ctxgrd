@@ -19,6 +19,16 @@ use std::path::Path;
 
 use crate::diagnostic::{Diagnostic, KernelMessage};
 
+/// The run-level advisory printed whenever `ctxgrd lint` reports
+/// diagnostics (ADR-038 § HINT-001). One canonical string, reused
+/// verbatim by every output surface: the Rich and Simple text formats
+/// emit it on stderr, and the JSON wire carries it in its `hint` field.
+/// The message names the correct fix (edit the documents) over the
+/// tempting wrong one (relax `ctxgrd.toml`).
+pub const LINT_HINT: &str =
+    "fix the documents the rules flag — their content, headings, IDs, or paths — \
+     not `ctxgrd.toml`. Relaxing or removing a rule hides the problem instead of fixing it.";
+
 /// Sort `diagnostics` in place using REP-001's key order.
 pub fn sort(diagnostics: &mut [Diagnostic]) {
     diagnostics.sort_by(|a, b| {

@@ -101,6 +101,15 @@ mod tests {
     }
 
     #[test]
+    fn accepts_namespace_with_trailing_digit() {
+        // The soc2 compliance pack (ADR-069) claims ids under `SOC2`. The
+        // trailing digit is part of the namespace; the final `-001` is the
+        // counter, so this is unambiguous — `SOC2` is a legal namespace.
+        assert_eq!(parse("SOC2-001").unwrap(), DocumentId::new("SOC2", 1));
+        assert_eq!(parse("SOC2-42").unwrap(), DocumentId::new("SOC2", 42));
+    }
+
+    #[test]
     fn single_uppercase_letter_namespace_ok() {
         assert_eq!(parse("A-1").unwrap(), DocumentId::new("A", 1));
     }

@@ -1,0 +1,25 @@
+# summary: C4 — architecture-diagram docs typed by the C4 model level (context/container/component/code) plus the supplementary deployment/dynamic/landscape views, each declaring its level and carrying a title.
+# Architecture diagrams (Simon Brown's C4 model, https://c4model.com) are
+# path-claimed at docs/diagrams/**, id-less and frontmatter-light: a title and a
+# `c4.level`. ctxgrd lints the markdown envelope only — that the file declares a
+# title and a known C4 level — never the diagram's own graph. The diagram itself
+# stays diagrams-as-code: a ```mermaid``` (or ```dot```) block inside the same
+# `.md` file, which the markdown walker already lints. There is deliberately no
+# `.mmd` source support: raw Mermaid is a non-markdown format, out of scope for
+# the core walker (the supported path for non-markdown is an external source
+# script). The class lives under a `c4` object rather than a top-level `type:`
+# because `type` is a reserved layout-selector key in Hugo/Jekyll/Eleventy (the
+# same SSG clash that bit the guide pack, BUG-015). Diagram quality — the right
+# zoom level for the audience, labelled relationships, a title naming the level —
+# is the author's job, not a structural rule. ADR-075.
+
+[C4]
+paths = ["docs/diagrams/**"]
+rules = ["c4.frontmatter", "core.min-docs"]
+
+# The C4 levels constraining `c4.level`: the four model levels plus the three
+# supplementary view types (deployment, dynamic, landscape). Config-driven, not
+# baked into the binary: retype the allowlist (e.g. drop `code`, the level most
+# teams skip) or drop it for presence-only if your diagram model differs.
+[C4."c4.frontmatter"]
+levels = ["context", "container", "component", "code", "deployment", "dynamic", "landscape"]

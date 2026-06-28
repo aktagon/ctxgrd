@@ -69,6 +69,10 @@ pub enum ParseDiagnosticKind {
     /// Frontmatter had an `id` but it didn't match the CORE-003 regex.
     /// Maps to `core.id`.
     IdMalformed { raw_id: String },
+    /// The file's bytes are not valid UTF-8, so it could not be decoded
+    /// for parsing. Maps to `src.markdown-decode`. `offset` is the byte
+    /// position of the first invalid byte (`Utf8Error::valid_up_to`).
+    Undecodable { offset: usize },
 }
 
 /// Outcome of turning one file into a document.
@@ -126,9 +130,35 @@ pub fn scan(
     let mut path_conflicts = Vec::new();
 
     for path in paths {
-        let body = fs::read_to_string(&path)?;
         let location = render_location(root, &path);
-        match parse_one(&body, location, claims) {
+        // Read bytes and decode per file, so one undecodable file is a
+        // per-file outcome — never an abort of the whole walk. A genuine
+        // I/O error (vanished file, permission denied) is still fatal via
+        // `?`; only the decode is recovered here.
+        let bytes = fs::read(&path)?;
+        let outcome = match String::from_utf8(bytes) {
+            Ok(body) => parse_one(&body, location, claims),
+            // ADR-007 §DOC-001: only files that claim intent are ctxgrd
+            // documents. An undecodable *path-claimed* file is a configured
+            // record we cannot read — a real defect that earns a diagnostic.
+            // An unclaimed one (README, scratch note) is skipped silently,
+            // exactly as a decodable non-document is. An `id:`-claim is
+            // unknowable without decoding, so the path-claim is the only
+            // signal available here.
+            Err(e) => {
+                if claims.matching_namespaces(&location).next().is_some() {
+                    ParseOutcome::Diagnostic(ParseDiagnostic {
+                        location,
+                        kind: ParseDiagnosticKind::Undecodable {
+                            offset: e.utf8_error().valid_up_to(),
+                        },
+                    })
+                } else {
+                    ParseOutcome::Skip
+                }
+            }
+        };
+        match outcome {
             ParseOutcome::Document(doc) => documents.push(doc),
             ParseOutcome::Diagnostic(diag) => parse_diagnostics.push(diag),
             ParseOutcome::Conflict(conflict) => path_conflicts.push(conflict),
@@ -263,6 +293,7 @@ pub(crate) fn parse_one(body: &str, location: String, path_claims: &PathClaims) 
         depends_on: fm.depends_on,
         frontmatter_lines,
         metadata: fm.metadata,
+        pin: fm.pin,
         ast: Some(ast),
         body: body.to_owned(),
     })
@@ -1404,6 +1435,71 @@ mod tests {
         assert!(
             result.parse_diagnostics.is_empty(),
             "ignored files must not produce diagnostics: {:?}",
+            result.parse_diagnostics
+        );
+    }
+
+    #[test]
+    fn scan_undecodable_claimed_file_is_per_file_diagnostic_not_abort() {
+        // A single non-UTF-8 byte in one path-claimed file must NOT abort the
+        // whole walk; it becomes a `src.markdown-decode` diagnostic anchored
+        // at that file, and the valid sibling is still linted.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("adrs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ADR-001.md"),
+            "---\nid: ADR-001\ntitle: keep\n---\n# real\n",
+        )
+        .unwrap();
+        // 0x92 is a Windows-1252 curly apostrophe — an invalid UTF-8 start byte.
+        std::fs::write(
+            dir.join("ADR-002.md"),
+            b"---\nid: ADR-002\ntitle: bad\n---\n\x92 not utf-8\n",
+        )
+        .unwrap();
+
+        let claims = claims_for("ADR", "adrs/**");
+        let result = scan(root.path(), None, Some(&claims)).expect("scan must not abort");
+
+        assert!(
+            result.documents.iter().any(|d| d.raw_id == "ADR-001"),
+            "the valid sibling must still be linted: {:?}",
+            result.documents
+        );
+        let bad = result
+            .parse_diagnostics
+            .iter()
+            .find(|d| d.location.contains("ADR-002"))
+            .expect("undecodable claimed file must produce a diagnostic");
+        assert!(
+            matches!(bad.kind, ParseDiagnosticKind::Undecodable { .. }),
+            "expected Undecodable, got {:?}",
+            bad.kind
+        );
+    }
+
+    #[test]
+    fn scan_undecodable_unclaimed_file_is_skipped() {
+        // An undecodable file that claims no intent (a README, not path-claimed)
+        // is skipped silently regardless of encoding — like any non-document.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("adrs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ADR-001.md"),
+            "---\nid: ADR-001\ntitle: keep\n---\n# real\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("README.md"), b"a not-\x92-utf8 readme\n").unwrap();
+
+        let claims = claims_for("ADR", "adrs/**");
+        let result = scan(root.path(), None, Some(&claims)).expect("scan must not abort");
+
+        assert_eq!(result.documents.len(), 1, "only the claimed ADR is a document");
+        assert!(
+            result.parse_diagnostics.is_empty(),
+            "an unclaimed undecodable file must be silent: {:?}",
             result.parse_diagnostics
         );
     }

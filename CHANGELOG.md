@@ -7,6 +7,488 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.48.0] — 2026-06-28
+
+### Added
+
+- **`c4` pack — architecture diagrams typed by the C4 model level (ADR-075).** A
+  new built-in pack with one path-claimed namespace `C4` (`docs/diagrams/**`),
+  id-less (the filename is the slug), binding the new builtin rule
+  `c4.frontmatter` plus `core.min-docs`. `c4.frontmatter` requires a non-empty
+  `title` and a `c4.level` drawn from a config `levels` allowlist — the pack
+  ships the four C4 model levels (`context`, `container`, `component`, `code`)
+  plus the supplementary `deployment`, `dynamic`, and `landscape` views; the
+  binary hardcodes no taxonomy. The level lives under a `c4` object, never a
+  top-level `type:`, which Hugo/Jekyll/Eleventy reserve (BUG-015). ctxgrd lints
+  the markdown envelope only — diagrams stay diagrams-as-code in `mermaid`/`dot`
+  fences inside the `.md` file; there is no `.mmd` source support (raw Mermaid is
+  non-markdown, out of scope for the walker — the supported path is an external
+  source script). Adds the `linting-c4-architecture-diagrams` how-to guide.
+  Registry rule #35; MINOR bump.
+
+## [0.47.0] — 2026-06-25
+
+### Added
+
+- **`core.successor-link` rule — a superseded document must link its successor
+  (ADR-073).** A new builtin rule bound on the status-carrying namespaces
+  (ADR/PRD/PMR): when a document's `status` is `superseded`, its frontmatter must
+  name a present successor (default field `superseded_by`), resolved the same way
+  `depends_on` is resolved by `core.dep-resolved`. The trigger value, successor
+  field name, and an optional target namespace are config parameters. Closes the
+  dead-end left by `core.allowed-values` (a doc could be `superseded` with nothing
+  recording what replaced it). Registry rule #34; MINOR bump.
+
+## [0.46.0] — 2026-06-24
+
+### Changed
+
+- **BREAKING — guide frontmatter: the Diátaxis class moved from a top-level
+  `type:` key to a `diataxis` object (`diataxis.type`).** `type` is a reserved
+  layout-selector key in Hugo, Jekyll, and Eleventy, so a guide that was
+  lint-clean under the `guide` pack could not be published as docs-as-code
+  without rewriting its frontmatter — defeating the pack's purpose (BUG-015). The
+  `guide.frontmatter` rule now reads `diataxis.type`; the `types` allowlist
+  constrains that value unchanged. No back-compat alias: a guide using the old
+  top-level `type:` now fails. Migrate by nesting the key:
+
+  ```yaml
+  # before
+  type: how-to
+  # after
+  diataxis:
+    type: how-to
+  ```
+
+  Updates ADR-055 (GDE-002/GDE-003), the `guide` pack, the four shipped guides,
+  and the `end-user-guide-writer` agent.
+
+## [0.43.0] — 2026-06-24
+
+### Added
+
+- **`soc2` compliance pack (ADR-069).** A third member of the ADR-066
+  compliance family, after `gdpr`/`hipaa` — and the thinnest. SOC 2 introduces
+  no statutory document namespace of its own (no ROPA/DPIA/BAA analogue); its
+  sole artifact is the `SOC2` control-to-evidence register over the AICPA Trust
+  Services Criteria, reusing `POLICY`/`RISK`/`VULN` from the `security` base
+  (`pack add soc2` pulls it transitively via the ADR-068 `depends` edge). The
+  catalog ships the mandatory Common Criteria CC1–CC9 (33 individual criteria)
+  plus the four optional categories — Availability, Confidentiality, Processing
+  Integrity, Privacy (28 ids, in-scope-by-choice) — as a `core.allowed-values`
+  vocabulary generated from `packs/soc2/regulation.json`, never hand-authored
+  (SOC-001/004). A control's `criterion` is parse-validated against the catalog,
+  and `core.calendar-freshness` over `review_date` surfaces a stale review — the
+  closest a paperwork linter gets to the Type I / Type II distinction.
+- **`soc2.control-evidence` builtin rule (the registry grows 31 → 32).** An
+  in-scope `SOC2` control asserting a criterion with neither a `POLICY`/`ADR`
+  cross-ref nor a non-empty `evidence_link` is flagged; a `not-applicable`
+  control is out of scope (SOC-002). It reuses the same conditional-evidence
+  machinery as `hipaa.safeguard-evidence` rather than forking it — both now
+  delegate to a shared `evidence_gap` decision core — so there is one
+  asserted-but-unevidenced check across the compliance family.
+
+### Changed
+
+- **`gen_compliance_pack` gains a generic control-evidence block.** The example
+  generator now projects a `control_evidence` extract field into a rule param
+  block (`evidence-fields`, `out-of-scope-status`), alongside the existing
+  HIPAA-specific `safeguard_evidence` (Addressable-subset) projection. The
+  `hipaa`/`gdpr` `pack.toml` outputs are byte-for-byte unchanged.
+
+### Deprecated
+
+- ADR-044's thin soc2 control-framework sketch is superseded by ADR-069 (the
+  family shape). Teams that read ADR-044 should follow the supersession pointer.
+
+## [0.42.0] — 2026-06-24
+
+### Added
+
+- **`status` done-gate + per-lineage scope (ADR-056, ADR-059; SPEC-003).** Three
+  additive surfaces that turn `ctxgrd status` into a pollable per-feature
+  done-signal for the Claude Code `loop` skill:
+  - **`core.acceptance-complete`** — a new opt-in, namespace-agnostic builtin
+    rule (the registry grows 30 → 31). WHERE a document is at a terminal status,
+    it emits one diagnostic per unchecked `- [ ]` under its configured acceptance
+    heading(s) (`headings` param, default `Acceptance`/`Definition of Done`;
+    `terminal` param, default the shared terminal-status set) — and only under
+    those headings, so deferred work under `Out of scope`/`Open Questions` never
+    fires. Because the diagnostic marks the document dirty, an open acceptance box
+    holds its stage through the existing terminal-but-dirty path — no new `status`
+    logic. Off by default.
+  - **`status --exit-code`** — projects the empty-frontier + no-blocker done
+    verdict onto the process exit (0 complete / 1 incomplete / 2 config-or-cycle
+    error). A pure function of the same read that produces `--format json`; touches
+    no file.
+  - **`status --lineage <ID>`** — scopes the report to one feature: the transitive
+    dependents of `<ID>` over the transpose of the `depends_on` graph. The engine
+    is unchanged; only the counted document set differs. Shared nodes (reachable
+    from another lineage root) are counted lineage-locally and disclosed — a
+    per-stage `shared` array in JSON, a `shared with …` marker in text — never
+    folded into a cross-lineage debt. An unresolved id exits 2. Without
+    `--lineage`, output is byte-identical to before (the additive `lineage`/`shared`
+    keys are omitted globally).
+  - The `any:`-over-empty gate pin: an `any:<status>` gate over a namespace with
+    zero counted documents is unsatisfied, matching `all:`-over-empty — so a
+    pruned/empty lineage stage holds rather than passing vacuously.
+
+  Both new flags and the new rule are backward-compatible additions — a MINOR
+  bump. No previously-clean project changes verdict.
+
+## [0.38.0] — 2026-06-23
+
+### Added
+
+- **`hipaa` pack — HIPAA Security Rule safeguard register and BAA register over
+  the security base (ADR-066).** The second per-regulation compliance pack:
+  `SR-MAP` (the 45 CFR 164.308/310/312 safeguard-to-evidence register, with the
+  full administrative / physical / technical safeguard catalog as a closed
+  `core.allowed-values` vocabulary) and `BAA` (the Business Associate Agreement
+  register), path-claimed under `docs/compliance/hipaa/` (CMP-004). SR-MAP
+  records require a `safeguard` drawn from the closed catalog; BAA entries record
+  the contracting `party` and `executed_date` and stay calendar-fresh on a
+  365-day `reviewed_date` cadence — the same registry shape as GDPR's DPA. A thin
+  pack on `security` (POLICY/RISK/VULN reused from there, added separately for
+  now — pack-to-pack dependencies are deferred, CMP-002). The Security Rule
+  edition is recorded in the pack summary (HIPAA-001). Scope is paperwork
+  existence/metadata/freshness only, never legal adequacy. The `pack.toml` is
+  **generated** from a canonical, version-controlled extract
+  (`packs/hipaa/regulation.json`) by the in-repo cargo example
+  (`cargo run --example gen_compliance_pack -- hipaa`), so a Security Rule
+  revision is a regenerate-and-diff step auditable against the law (CMP-005). The
+  generator now accepts tagged vocabulary terms (`{ id, requirement, citation }`)
+  so the safeguard catalog can carry the Required/Addressable flag for a future
+  conditional rule while emitting only the id list. The conditional
+  addressable-needs-justification rule (HIPAA-002) is a deferred phase.
+
+## [0.37.0] — 2026-06-23
+
+### Added
+
+- **`gdpr` pack — GDPR documentary artifacts over the security base (ADR-066).**
+  The first per-regulation compliance pack: `ROPA` (Art. 30 records of processing
+  activities), `DPIA` (Art. 35 data protection impact assessments), and `DPA`
+  (Art. 28 processor / subprocessor agreement register) namespaces, path-claimed
+  under `docs/compliance/gdpr/` (CMP-004). ROPA records require a
+  `controller_or_processor` role and an Art. 6(1) `lawful_basis`, each drawn from a
+  closed `core.allowed-values` vocabulary; DPIAs stay calendar-fresh on a 365-day
+  `reviewed_date` cadence; DPA entries record the contracting `party` and
+  `executed_date`. A thin pack on `security` (POLICY/RISK/VULN reused from there,
+  added separately for now — pack-to-pack dependencies are deferred, CMP-002).
+  Scope is paperwork existence/metadata/freshness only, never legal adequacy.
+  The `pack.toml` is **generated** from a canonical, version-controlled extract
+  (`packs/gdpr/regulation.json`) by an in-repo cargo example
+  (`cargo run --example gen_compliance_pack -- gdpr`), so a regulation revision is
+  a regenerate-and-diff step auditable against the law (CMP-005). The conditional
+  processor→DPA cross-ref (GDPR-002) and the `hipaa` pack are deferred phases.
+
+## [0.35.0] — 2026-06-21
+
+### Added
+
+- **`pack migrate` and `pack outdated` — propagate a pack-definition change into
+  adopted configs (ADR-053).** Provenance comments gain a version and a content
+  fingerprint — `# pack: <name>@<version> sha:<hash>` (the bare `# pack: <name>`
+  form stays valid; older binaries treat the suffix as an inert comment).
+  `ctxgrd pack outdated` reports drift read-only (exit `0` clean / `1` drift / `2`
+  config error); `ctxgrd pack migrate` rewrites fingerprint-clean blocks to the
+  pack's current shape and re-stamps them, while leaving hand-edited blocks intact
+  and surfacing each as a structured diff (`--dry-run`, `--format json`). The
+  first compiled-in recipes encode the ADR-061 renames (`CLAUDECODE`→`CLAUDEAGENTS`,
+  `OPENCODE`→`OPENCODEAGENTS`) and the ADR-051 `agents`-pack split (`AGENTS`,
+  `SKILLS`), plus the SPEC/TASK/PROMPT `agents`→`workflow` provenance relabel.
+  Migration is idempotent and purely structural — it introduces no new
+  diagnostics. The `cfg.path-conflict` diagnostic now hints to run `pack migrate`
+  when a renamed namespace left a stale block claiming the same files.
+
+- **`agent.assigned` rule — every TASK names a resolvable agent (ADR-057).** The
+  `workflow` pack's `[TASK]` namespace now requires an `agents` metadata list
+  (via `core.required-metadata`) and lints, with the new builtin-compiled
+  `agent.assigned` rule, that each named agent resolves — as a markdown
+  agent-definition file under the harness's agent directories, or as an entry in
+  an explicit `builtin_agents` allow-list (harness built-ins like `Explore` have
+  no file on disk). One generic, parameterized rule rather than a per-harness
+  pair: `search_dirs` (default: Claude conventions — `.claude/agents`,
+  `~/.claude/plugins/*/agents`, `~/.claude/agents`), `name_source`
+  (`frontmatter` default, or `filename` for opencode), and `builtin_agents`
+  (empty by default) carry the harness differences. The unresolved-agent
+  diagnostic names the searched locations, the available file agents, and a
+  nearest-match suggestion. **Contract note:** `agents` is now required on the
+  `workflow` pack's TASK — an existing TASK without it newly fails
+  `core.required-metadata` (a deliberate, surfaced migration). Existing adopters
+  add the rule by hand-editing `ctxgrd.toml`; `pack add` cannot merge a rule into
+  an existing namespace, so fresh adopters get it from `pack add workflow`.
+
+### Changed
+
+- **`soul.sections` enforces the soul.md template shape (`#` title + `##`
+  sections); reverses the v0.23.1 any-level relaxation (BUG-009, ADR-035 §
+  SOUL-002 amended).** The cited spec — the
+  [soul.md template](https://github.com/aaronjmars/soul.md/blob/main/SOUL.template.md)
+  — is unambiguous: a single `#` title followed by `##` sections. The rule now
+  (1) requires the Worldview / Opinions / Boundaries trio at `##`, (2) reports a
+  trio heading found at the wrong level (e.g. `# Worldview`) with an actionable
+  "section 'X' is an H{n} — sections must be `##` under a single `#` title"
+  message instead of the old misleading "missing", and (3) requires an H1 title.
+  This is a contract **tightening**: a `SOUL.md` that was clean under
+  0.23.1–0.31.0 (trio at `#`, or `##` sections with no `#` title) now emits
+  warnings. Fleet projects with the `persona` pack should re-lint their
+  `SOUL.md` against the template shape.
+- **`ctxgrd status` text output drops the `source:` line.** `declared` vs
+  `default` is provenance for agent routing, not a token a person reading the
+  terminal needs decoded — and an undocumented bare word fails the "humans +
+  agents both first-class" DX bar. The human table now leads straight with the
+  per-stage rows. Provenance moves entirely onto `--format json` (see Added).
+  Not a wire-contract change: the text rendering is not a frozen surface.
+
+### Added
+
+- **End-user documentation pack — the `guide` namespace (ADR-055).** A new
+  built-in `guide` pack lints user-facing guides under `docs/guides/**`, typed by
+  the Diátaxis taxonomy (`tutorial` / `how-to` / `reference` / `explanation`).
+  Guides are id-less — the filename is the slug — and linted by a new file-level
+  rule `guide.frontmatter` (the 27th builtin): it errors on a missing frontmatter
+  fence, an absent/empty `title` or `type`, or a `type` outside the pack-supplied
+  `types` allowlist (the binary hardcodes no taxonomy; the list is config-only).
+  The `project-docs` pack gains a `README` namespace so the repo's front door
+  exists (`core.min-docs`) and links the entry guide (`core.requires-link`,
+  skip-if-missing, warning). MINOR: registry 26 → 27 builtins, 12 → 13 packs.
+- **Per-provider agent packs — the `agents` catch-all split by harness (ADR-051).**
+  Coding-agent files are now packaged per provider so each pack name says what it
+  lints: `agents` owns just `AGENTS.md` (the cross-tool agents.md standard);
+  `claude` owns `CLAUDE.md`, `.claude/skills`, and `.claude/agents`; `codex` owns
+  `.codex/skills`; `gemini` owns `GEMINI.md`; `opencode` owns `.opencode/agent`;
+  and ctxgrd's harness-neutral `SPEC`/`TASK`/`PROMPT` docs move to a new `workflow`
+  pack. Each is opt-in via `pack add <name>` — because a pack inlines its config
+  on add (a generator, not a live dependency), existing projects are unaffected
+  until they re-adopt. A single `AGENTS.md` has exactly one owner (the `agents`
+  pack), so multi-harness repos never hit a path-conflict.
+- **New `agent.frontmatter` rule (Claude Code subagents) and `opencode.frontmatter`
+  rule (opencode agents).** `agent.frontmatter` (`.claude/agents/*.md`, the 25th
+  builtin) errors on a missing fence or absent/empty `name`/`description` and warns
+  when `name` does not match the filename, when `description` falls outside a
+  length band (`desc_min_chars` default 40; opt-in `desc_max_chars`), or when
+  `model` is outside a team-pinned `models` allowlist. `opencode.frontmatter`
+  (`.opencode/agent/*.md`, the 26th builtin) is the same minus the name checks —
+  opencode derives the agent name from the filename, so only `description` is
+  required. No model names are hardcoded; the allowlist is config-only.
+- **`status --format json` gains a `source_hint` companion to `source`.** The
+  `source` enum (`declared` / `default`) stays the stable token a strict parser
+  switches on; the new `source_hint` carries the plain-language gloss ("order
+  you set in ctxgrd.toml" / "ctxgrd's default order (you haven't set one)") so a
+  person or LLM reading the JSON need not decode the const. Backward-compatible
+  field add; EARS-01.4 and SPEC-002 § Data model updated.
+- **`ctxgrd --recursive` (`-r`) lints every `ctxgrd.toml` under `--root`.**
+  Discovers each config-bearing directory (via the `ignore` crate, so
+  `.gitignore`'d build/vendor trees are skipped) and lints it as its own
+  project — for monorepos and multi-project repos. The aggregate exit code is
+  the worst across all roots (2 if any config errored, 1 if any had
+  diagnostics, else 0). Per-root headers go to stderr so stdout stays a clean
+  diagnostic stream; `--format json` emits one `{recursive, exit_code,
+  roots:[…]}` object attributing every finding to its config. Works as a bare
+  `ctxgrd -r [--format json]` or the explicit `ctxgrd lint -r`.
+
+### Fixed
+
+- **Global `--root` works again before a subcommand** (`ctxgrd --root <path>
+  lint`, `… pin`). Enabling the bare-lint form above had added
+  `args_conflicts_with_subcommands` to the top-level command; that attribute is
+  command-level and clap 4 does not exempt global args from it, so a `--root`
+  given *ahead* of the subcommand was rejected as a conflict — breaking the
+  position CI scripts use. The attribute is removed: bare-lint dispatch keys off
+  `command: Option<Cmd>` and never needed it. Regression was unreleased
+  (caught before ship); restores both argument orders for every subcommand.
+- **`core.min-docs` diagnostics stop misleading.** Two post-roll fixes to the
+  node-existence seed (ADR-048): (1) the help line now names the two invisible
+  reasons a required file can be "missing" while it sits on disk — a symlink
+  (the markdown walker uses `follow_links(false)`) or an `[ignore]` pattern in
+  `ctxgrd.toml` — so "the run found none" no longer reads as a lie. (2) A
+  reserved `count` other than 1 (ADR-048 § SEED-002 pins the floor to 1) was
+  read by nobody and lint-clean; it now emits a `cfg.reserved-param` warning
+  while leaving the seed active, so config and behaviour no longer diverge
+  silently.
+
+## [0.27.0] — 2026-06-16
+
+### Added
+
+- **`ctxgrd pack list --paid` advertises paid, non-built-in packs (ADR-045 §
+  ENT-001).** A small compiled-in storefront catalog names the commercial
+  packs the binary does not ship — arc42 (ADR-049) is the first — carrying
+  metadata only (name, namespaces, summary, availability status), never the
+  pack's heading/rule content. Default `pack list` output is unchanged. The
+  `status` is verb-neutral ("commercial license, coming soon") because the
+  licensed install path (ENT-005) is not yet built, so no install command is
+  implied. Feeds the marketing site's paid-pack section.
+
+## [0.25.0] — 2026-06-14
+
+### Changed
+
+- **`status` reports a frontier, not a single cursor (ADR-039 § DAG-006) —
+  BREAKING wire change.** The `status --format json` object replaces the
+  single `current` string with a `frontier` array: the name-sorted ready set
+  of stages that are not `done` but whose every parent is `done` (the standard
+  antichain). A chain reports one stage; a diamond or disconnected components
+  report a set, side by side. The text ladder's `current:` line becomes a
+  `frontier:` line. `next_action` is unchanged in shape — still a single
+  string — now derived from the first (name-sorted) frontier stage. This is a
+  deliberate MAJOR break taken at pre-1.0: the only wire consumers are in-repo
+  (`tests/status.rs`, SPEC-002), all updated in this change.
+
+### Removed
+
+- **Runtime DAG inference (`source: inferred`) is gone (ADR-039 § DAG-007).**
+  At runtime the pipeline DAG now comes from exactly two sources: the
+  **declared** config (`core.dep-shape` params and/or `[pipeline].stages`) or
+  the built-in **default** ladder. The descriptive `inferred` mode — guessing
+  the DAG from live `depends_on` edges — is removed, so a config-less repo
+  reports `source: default`, never `inferred`. The `infer_namespace_dag`
+  algorithm is retained for relocation into `ctxgrd init` as a one-time
+  scaffolding step (TODO in `init_cmd`, tracked by DAG-007); until that lands,
+  `init` does not yet seed `core.dep-shape` params from existing documents.
+
+## [0.24.0] — 2026-06-14
+
+### Added
+
+- **`core.min-docs` — the node-existence seed (ADR-048).** A cross-corpus rule
+  that fires on a declared namespace which lists `core.min-docs` but holds zero
+  documents. Unlike every other rule it fires on *absence*, so it iterates
+  namespace declarations rather than documents and anchors its diagnostic on
+  `ctxgrd.toml`. Presence-only for v1 (a reserved `count` param is accepted by
+  config validation but does not yet change behaviour); severity follows the
+  `severity` param (`error` default, exit 1; `warning` keeps exit 0). Presence
+  is the union of id-keyed documents and file-level path-claimed singletons
+  (CLAUDE.md / TODO.md). Opt-in and seed-scoped: place it only on isolated
+  charter or goal namespaces — interior-node existence propagates for free via
+  `core.dep-shape` + `core.dep-resolved`. No previously-clean repo begins to
+  fail; the rule fires only on namespaces that explicitly enable it.
+
+## [0.23.1] — 2026-06-14
+
+### Fixed
+
+- **`soul.sections` recognises the high-signal trio at any heading level
+  (BUG-009).** A `SOUL.md` that authored Worldview / Opinions / Boundaries as
+  `#` (H1) — natural when the file has no separate title — was falsely reported
+  missing all three sections. The rule now matches the trio regardless of
+  heading level, since it is a presence-only check (order/empty deferred,
+  ADR-035 § SOUL-003). The H2-only unit fixture that let this ship latent is
+  replaced with a level-parameterized one.
+
+## [0.23.0] — 2026-06-14
+
+### Added
+
+- **`soul.referenced` / `style.referenced` — persona-side reference rules
+  (ADR-047).** Two warning-level rules on the `persona` pack that fire on
+  `SOUL.md` / `STYLE.md` and warn when an agent guide (`CLAUDE.md` / `AGENTS.md`
+  / `GEMINI.md`) exists but does not reference the persona file — a persona the
+  guide never loads is a dead file. Silent when no guide exists (a persona may
+  be loaded directly by a runtime). Auto-wired into the pack, so
+  `ctxgrd pack add persona` activates them. They fire from the persona side
+  because a file is claimed by exactly one namespace — captured as a project
+  principle, "Cross-file reference rules claim one side and look outward".
+
+## [0.22.0] — 2026-06-14
+
+### Added
+
+- **`core.requires-link` — generic "must reference an existing target" rule
+  (ADR-046).** A parameterized, namespace-agnostic rule requiring the linted
+  file to reference each existing path in its `targets` parameter by a markdown
+  link or an `@import`; `severity` parameter defaults to `error`. The reusable,
+  configurable form of the hard-coded `TODO.md` lost-reference check in
+  `agents.context-headings`, and the completeness counterpart to
+  `core.cross-ref` (which only checks that links present resolve).
+
+## [0.21.0] — 2026-06-13
+
+### Added
+
+- **`security` pack — a framework-neutral security-document lifecycle (ADR-041).**
+  A new built-in pack defining seven path-claim namespaces under
+  `docs/security/**`: five lifecycle namespaces — `THREAT` (threat models, STRIDE
+  coverage + a commit `pin`), `VULN` (findings, with a fixed severity/status
+  vocabulary), `RISK` (signed, time-boxed risk acceptances), `SECREV` (release
+  sign-offs and pentests on a calendar cadence), and `DEPAUDIT` (dependency audits
+  on a commit `pin`) — plus two neutral governance namespaces, `POLICY` and
+  `ASSET`, pushed down here so the planned compliance packs (ISO 27001, NIST
+  800-53, SOC 2) stay thin. Adopt with `ctxgrd pack add security`. The pack carries
+  zero certification intent: it enforces that security records exist, are
+  well-formed, are linked, and stay fresh against the calendar and the code.
+- **Three builtin-compiled `security.*` rules the generic core rules cannot
+  express (ADR-041 § SEC-004/005/006).** `security.vuln-sla` flags an `open`
+  critical/high finding whose `discovered_date` is past its per-severity SLA window
+  (`windows`, default `critical = 7`, `high = 30`), at a configurable diagnostic
+  level (`severity`, default `error`) — a severity absent from `windows` ages
+  silently. `security.risk-expiry` requires a risk acceptance to carry an
+  `approver`, a `rationale`, and a future-dated `expires`; the `require-when-status`
+  param scopes it (e.g. `accepted` on VULN, unconditional on RISK) and
+  `exempt-when-links` exempts a finding that links a canonical `RISK`.
+  `security.remediation-link` requires a `mitigated` finding to cross-ref its
+  remediation (a `depends_on` entry or a body cross-ref) so the fix is falsifiable.
+- **`ctxgrd new` seeds a `pin:` block for pin-required namespaces (ADR-041
+  § SEC-008).** When a scaffolded namespace sets
+  `[NS."core.commit-freshness"] require-pin = true` (as `THREAT` and `DEPAUDIT`
+  do), the generated document carries a `pin` block seeded with the current `HEAD`
+  commit and a placeholder `scope`, so a freshly-scaffolded threat model lints clean
+  against `require-pin` on a clean tree.
+
+## [0.20.0] — 2026-06-13
+
+### Added
+
+- **Commit-pinned document validity: `core.commit-freshness` and a `pin`
+  frontmatter block (ADR-040).** A document MAY now declare a `pin` mapping — a
+  green `commit` (a git revision) plus a non-empty `scope` of path globs it covers
+  — and the new builtin `core.commit-freshness` rule flags the document stale when
+  the working tree differs from that commit at any scoped path. The rule errors when
+  the pinned commit is not an ancestor of HEAD (a rewritten history or wrong SHA,
+  PIN-002), reports staleness against the **working tree** so locally edited-but-
+  uncommitted scoped code is caught (PIN-003), and degrades gracefully — skip with a
+  warning, never a hard fail — outside a usable git history (not a repo, no `git`,
+  or a shallow clone), naming `fetch-depth: 0` as the CI remedy (PIN-004). The
+  `pin` data is parsed once at ingest alongside `id`/`depends_on` (PIN-001,
+  preserving ADR-029's single-pass invariant); the only git access lives in the
+  rule's check, the imperative shell (PIN-006). Opt-in per namespace via the
+  `[NS."core.commit-freshness"]` param table — `require-pin` (flag pin-less
+  documents) and `severity` (warning vs error) — so no previously-clean config newly
+  fails, keeping the change MINOR (PIN-007).
+- **`ctxgrd pin --bless <ID>` re-pins to HEAD (ADR-040 § PIN-005).** The
+  snapshot-test `--update` pattern for commit pins: a human who has re-validated a
+  stale document records the new green commit with one command, which rewrites only
+  the `pin.commit` line in place and leaves the rest of the frontmatter untouched.
+  Refuses when scoped paths have uncommitted changes unless `--force`, since blessing
+  HEAD would otherwise record a state that excludes those edits.
+- **`core.calendar-freshness`, the time-axis sibling (ADR-040 § PIN-008).** A
+  namespace-agnostic generalization of `todo.freshness`: warns when a configured date
+  field (`field`, default `reviewed_date`) plus an interval (`stale_days`, default
+  30) is older than today. `core.commit-freshness` answers "still true of the current
+  code?"; `core.calendar-freshness` answers "still true as of today?". Pure date
+  arithmetic, no git. `todo.freshness` keeps its existing `Last updated:` behaviour
+  unchanged. Two new builtin rules in the registry — a MINOR bump (0.19.0 → 0.20.0).
+
+## [0.19.0] — 2026-06-13
+
+### Added
+
+- **A "fix the documents, not the config" hint on lint output (ADR-038).** When
+  `ctxgrd lint` reports diagnostics, it now prints a one-line advisory — _"fix the
+  documents the rules flag — their content, headings, IDs, or paths — not
+  `ctxgrd.toml`. Relaxing or removing a rule hides the problem instead of fixing
+  it."_ — to nudge an agent (or human) toward the root-cause fix rather than
+  silencing the rule. The hint is single-sourced (`reporter::LINT_HINT`) and shown
+  on every format: on **stderr** for the Rich and Simple text formats (keeping
+  stdout a pure diagnostic stream, so Simple's REP-001 grep contract is untouched),
+  and as an additive top-level `hint` field on the `--format json` wire. It fires
+  only when rule diagnostics are present — never on a clean `ok:` run, and never for
+  a config/kernel error (exit 2), where the fault is the configuration and the nudge
+  would contradict itself. The JSON field is additive, so a MINOR bump (0.18.0 →
+  0.19.0).
+
 ## [0.18.0] — 2026-06-13
 
 ### Added
@@ -390,7 +872,9 @@ OQ-2 (LSP behavior on file rename) and OQ-6 (CLI override for
 - `cargo clippy --lib --no-deps -- -D warnings` reports clean.
 - `make check` reports clean (6 documents · 9 rules · 0 diagnostics).
 
-[Unreleased]: https://github.com/aktagon/ctxgrd/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/aktagon/ctxgrd/compare/v0.48.0...HEAD
+[0.48.0]: https://github.com/aktagon/ctxgrd/compare/v0.35.0...v0.48.0
+[0.35.0]: https://github.com/aktagon/ctxgrd/compare/v0.23.1...v0.35.0
 [0.16.0]: https://github.com/aktagon/ctxgrd/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/aktagon/ctxgrd/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/aktagon/ctxgrd/compare/v0.13.0...v0.14.0

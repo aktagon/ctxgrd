@@ -1,0 +1,11 @@
+# summary: GEMINI — the GEMINI.md instruction file Gemini CLI reads.
+# Gemini's custom commands are TOML (.gemini/commands), outside ctxgrd's markdown
+# scope, so this pack carries only the instruction file. Per-harness pack
+# established by ADR-051.
+
+# GEMINI.md — Gemini CLI's always-loaded instruction file. Same context-* rules
+# as the shared AGENTS.md (harness-agnostic), claimed here because the file is
+# Gemini-specific.
+[GEMINI]
+paths = ["GEMINI.md"]
+rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]

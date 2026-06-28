@@ -79,6 +79,17 @@ pub(crate) fn parse_diagnostic_to_diagnostic(p: &ParseDiagnostic) -> Diagnostic 
             "wrap the id in a namespace prefix, e.g. `<NS>-{raw_id}`."
         ))
         .with_note(ID_REGEX_NOTE),
+        ParseDiagnosticKind::Undecodable { offset } => Diagnostic::error(
+            "src.markdown-decode",
+            p.location.clone(),
+            0,
+            0,
+            format!("file is not valid UTF-8 (first invalid byte at offset {offset})"),
+        )
+        .with_help(
+            "re-save the file as UTF-8 — it is likely Latin-1 / Windows-1252; \
+             ctxgrd reads documents as UTF-8.",
+        ),
     }
 }
 
@@ -115,11 +126,90 @@ pub(crate) fn id_unique(docs: &[Document]) -> Vec<Diagnostic> {
     out
 }
 
+/// `core.min-docs` (ADR-048 § SEED-001) — the node-existence seed.
+///
+/// Every other rule iterates artifacts that already exist; this one fires
+/// on **absence**. A declared namespace that opted into `core.min-docs` but
+/// holds zero documents has no document to anchor against, so the diagnostic
+/// points at `ctxgrd.toml` — the declaration that promised one.
+///
+/// It iterates declared namespaces (not documents), the structural reason
+/// existence cannot live inside a per-document rule. Presence is the union of
+/// two corpora: id-keyed [`Document`]s in the namespace, and file-level
+/// path-claimed singletons (CLAUDE.md / TODO.md) that never become id-keyed
+/// documents — `file_level_present` carries the namespaces that had ≥1 such
+/// file linted.
+///
+/// Presence-only for v1 (SEED-002): "at least one document". A reserved
+/// `count` param is accepted by config validation but does not yet change
+/// behaviour — the effective threshold is pinned to 1. Severity follows the
+/// `severity` param (`error` default, SEED-004); a `warning` floor still
+/// emits the diagnostic but keeps the run at exit 0.
+pub(crate) fn min_docs(
+    namespaces: &std::collections::BTreeMap<String, crate::config::NamespaceConfig>,
+    documents: &[Document],
+    file_level_present: &BTreeSet<String>,
+) -> Vec<Diagnostic> {
+    const CODE: &str = "core.min-docs";
+    let mut out = Vec::new();
+    for (namespace, cfg) in namespaces {
+        if !cfg.enables(CODE) {
+            continue;
+        }
+        let id_keyed = documents
+            .iter()
+            .filter(|d| d.id.namespace == *namespace)
+            .count();
+        if id_keyed > 0 || file_level_present.contains(namespace) {
+            continue;
+        }
+        // SEED-004: severity follows the declared `severity` param; default
+        // is `error`. An unrecognised value falls back to `error` rather
+        // than guessing the author meant a softer floor.
+        let warn = cfg
+            .params
+            .get(CODE)
+            .and_then(|p| p.get("severity"))
+            .and_then(Value::as_str)
+            == Some("warning");
+        // The fix hint names the namespace's own claim mechanism: a `paths`
+        // glob to drop a file under, or an `id:` field for an id-claim NS.
+        let add_hint = if cfg.path_patterns.is_empty() {
+            format!("add a document with an `id: {namespace}-1` frontmatter field")
+        } else {
+            format!(
+                "add a document under {}",
+                cfg.path_patterns
+                    .iter()
+                    .map(|g| format!("`{g}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )
+        };
+        let message =
+            format!("namespace `{namespace}` requires at least one document but the run found none");
+        let diag = if warn {
+            Diagnostic::warning(CODE, "ctxgrd.toml".to_string(), 0, 0, message)
+        } else {
+            Diagnostic::error(CODE, "ctxgrd.toml".to_string(), 0, 0, message)
+        }
+        .with_help(format!(
+            "{add_hint}, or remove `core.min-docs` from [{namespace}].rules. \
+             A matching file may exist but be skipped — a symlink, or an \
+             [ignore] pattern in ctxgrd.toml."
+        ));
+        out.push(diag);
+    }
+    out
+}
+
 /// `core.dep-resolved` — `depends_on` entries that don't match any
 /// document in the run.
-pub(crate) fn dep_resolved(docs: &[Document]) -> Vec<Diagnostic> {
-    dag::unresolved_refs(docs)
-        .into_iter()
+pub(crate) fn dep_resolved(graph: &dag::DepGraph<'_>) -> Vec<Diagnostic> {
+    let docs = graph.docs();
+    graph
+        .unresolved()
+        .iter()
         .map(|r| {
             let doc = &docs[r.from_doc_idx];
             let line = doc
@@ -151,10 +241,141 @@ pub(crate) fn dep_resolved(docs: &[Document]) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// `core.successor-link` (ADR-073 § SUCC-001) — a document whose status
+/// field equals the trigger value (default `superseded`) must carry a
+/// successor field (default `superseded_by`) naming a present document,
+/// resolved the same way `depends_on` is by [`dep_resolved`].
+///
+/// Two diagnostics, both on the status field's recorded line:
+/// - the successor field is missing or empty;
+/// - the field names an id that does not resolve to a document in the run
+///   (or, when `target` is set, resolves but lands outside that namespace).
+///
+/// Params (all optional, SUCC-003):
+/// - `trigger` (string, default `superseded`): the status value that arms
+///   the rule, matched case-insensitively.
+/// - `field` (string, default `superseded_by`): the frontmatter key that
+///   must name the successor.
+/// - `target` (string, default unset): when set, the successor must be in
+///   this namespace; unset means any present document satisfies the link.
+///
+/// Resolution reuses the shared [`dag::DepGraph`] index — the same path
+/// `core.dep-resolved` resolves `depends_on` against — so no document is
+/// re-parsed (ADR-029).
+pub(crate) fn successor_link(
+    doc: &Document,
+    params: &Value,
+    graph: &dag::DepGraph<'_>,
+) -> Vec<Diagnostic> {
+    const CODE: &str = "core.successor-link";
+
+    let param_str = |key: &str| -> Option<&str> {
+        params.get(key).and_then(Value::as_str).map(str::trim)
+    };
+    let trigger = param_str("trigger").filter(|s| !s.is_empty()).unwrap_or("superseded");
+    let field = param_str("field")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("superseded_by");
+    let target = param_str("target").filter(|s| !s.is_empty());
+
+    // Arm only when the document's status equals the trigger value.
+    let status = doc
+        .metadata
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !status.eq_ignore_ascii_case(trigger) {
+        return Vec::new();
+    }
+
+    // Anchor every diagnostic on the status line (SUCC-001).
+    let line = doc
+        .frontmatter_lines
+        .get("status")
+        .or_else(|| doc.frontmatter_lines.get("id"))
+        .copied()
+        .unwrap_or(0);
+
+    let successor = doc
+        .metadata
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let target_hint = target.unwrap_or("the replacing document");
+
+    let Some(successor) = successor else {
+        return vec![
+            Diagnostic::error(
+                CODE,
+                doc.location.clone(),
+                line,
+                0,
+                format!(
+                    "{}: a `{trigger}` document must record its successor in `{field}`",
+                    doc.raw_id
+                ),
+            )
+            .with_help(format!(
+                "add a `{field}: <ID>` field naming {target_hint} that replaced this one"
+            )),
+        ];
+    };
+
+    // Resolve the successor against the ingested document set, exactly as
+    // `core.dep-resolved` resolves a `depends_on` entry.
+    let resolved = successor
+        .parse::<DocumentId>()
+        .ok()
+        .and_then(|id| graph.index_of(&id));
+
+    match resolved {
+        Some(idx) if target.is_none_or(|t| graph.docs()[idx].id.namespace == t) => Vec::new(),
+        Some(_) => {
+            // Resolved, but outside the required target namespace.
+            let want = target.unwrap_or_default();
+            vec![
+                Diagnostic::error(
+                    CODE,
+                    doc.location.clone(),
+                    line,
+                    0,
+                    format!(
+                        "{}: `{field}` entry '{successor}' resolves but is not in the `{want}` namespace",
+                        doc.raw_id
+                    ),
+                )
+                .with_help(format!(
+                    "point `{field}` at a `{want}` document — a `{trigger}` {} must be replaced within `{want}`",
+                    doc.id.namespace
+                )),
+            ]
+        }
+        None => vec![
+            Diagnostic::error(
+                CODE,
+                doc.location.clone(),
+                line,
+                0,
+                format!(
+                    "{}: `{field}` entry '{successor}' does not resolve to a document in the run",
+                    doc.raw_id
+                ),
+            )
+            .with_help(format!(
+                "create the successor document or fix `{field}` to name {target_hint} that replaced this one"
+            )),
+        ],
+    }
+}
+
 /// `core.dep-cycle` — self-edges (one diagnostic per doc) and
 /// non-trivial SCCs (one diagnostic per SCC, naming all members).
-pub(crate) fn dep_cycle(docs: &[Document]) -> Vec<Diagnostic> {
-    dag::cycles(docs)
+pub(crate) fn dep_cycle(graph: &dag::DepGraph<'_>) -> Vec<Diagnostic> {
+    let docs = graph.docs();
+    graph
+        .cycles()
         .into_iter()
         .map(|cycle| match cycle {
             Cycle::SelfEdge { doc_idx } => {
@@ -597,6 +818,7 @@ mod tests {
             depends_on: depends_on.into_iter().map(String::from).collect(),
             frontmatter_lines: [("depends_on".to_string(), 5u32)].into(),
             metadata: Default::default(),
+            pin: None,
             ast: Some(Ast {
                 cross_ref_tokens: tokens,
                 ..Ast::default()
@@ -624,7 +846,7 @@ mod tests {
             make_doc("ADR-099", vec!["PRD-999"], vec![]),
             make_doc("ADR-001", vec![], vec![]),
         ];
-        let diags = dep_resolved(&docs);
+        let diags = dep_resolved(&dag::DepGraph::new(&docs));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.dep-resolved");
         assert_eq!(diags[0].location, "ADR-099.md");
@@ -641,7 +863,155 @@ mod tests {
             make_doc("ADR-001", vec!["PRD-001"], vec![]),
             make_doc("PRD-001", vec![], vec![]),
         ];
-        assert!(dep_resolved(&docs).is_empty());
+        assert!(dep_resolved(&dag::DepGraph::new(&docs)).is_empty());
+    }
+
+    // -- core.successor-link (ADR-073 § SUCC-001) ------------------------
+
+    /// Build a doc carrying a `status` and an optional successor field, with
+    /// the `status` key recorded at line 4 (the frontmatter shape this repo
+    /// uses). Real ADR-shaped values, never placeholders.
+    fn superseded_doc(raw_id: &str, successor_field: Option<(&str, &str)>) -> Document {
+        status_doc(raw_id, "superseded", successor_field)
+    }
+
+    fn status_doc(
+        raw_id: &str,
+        status: &str,
+        successor_field: Option<(&str, &str)>,
+    ) -> Document {
+        let mut metadata: std::collections::BTreeMap<String, Value> =
+            [("status".to_string(), Value::String(status.to_string()))].into();
+        let mut frontmatter_lines: std::collections::BTreeMap<String, u32> =
+            [("status".to_string(), 4u32)].into();
+        if let Some((field, value)) = successor_field {
+            metadata.insert(field.to_string(), Value::String(value.to_string()));
+            frontmatter_lines.insert(field.to_string(), 5u32);
+        }
+        Document {
+            id: raw_id.parse().expect("valid id"),
+            raw_id: raw_id.to_owned(),
+            location: format!("{raw_id}.md"),
+            depends_on: Vec::new(),
+            frontmatter_lines,
+            metadata,
+            pin: None,
+            ast: Some(Ast::default()),
+            body: String::new(),
+        }
+    }
+
+    fn empty_params() -> Value {
+        Value::Object(Default::default())
+    }
+
+    #[test]
+    fn successor_link_silent_with_valid_present_successor() {
+        let docs = vec![
+            superseded_doc("ADR-044", Some(("superseded_by", "ADR-069"))),
+            make_doc("ADR-069", vec![], vec![]),
+        ];
+        let graph = dag::DepGraph::new(&docs);
+        assert!(successor_link(&docs[0], &empty_params(), &graph).is_empty());
+    }
+
+    #[test]
+    fn successor_link_fires_when_field_missing() {
+        let docs = vec![superseded_doc("ADR-044", None)];
+        let graph = dag::DepGraph::new(&docs);
+        let diags = successor_link(&docs[0], &empty_params(), &graph);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.successor-link");
+        assert_eq!(diags[0].line, 4);
+        assert_eq!(
+            diags[0].message,
+            "ADR-044: a `superseded` document must record its successor in `superseded_by`"
+        );
+    }
+
+    #[test]
+    fn successor_link_fires_on_dangling_target() {
+        let docs = vec![superseded_doc("ADR-044", Some(("superseded_by", "ADR-999")))];
+        let graph = dag::DepGraph::new(&docs);
+        let diags = successor_link(&docs[0], &empty_params(), &graph);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.successor-link");
+        assert_eq!(diags[0].line, 4);
+        assert_eq!(
+            diags[0].message,
+            "ADR-044: `superseded_by` entry 'ADR-999' does not resolve to a document in the run"
+        );
+    }
+
+    #[test]
+    fn successor_link_silent_when_status_not_trigger() {
+        let docs = vec![status_doc("ADR-069", "accepted", None)];
+        let graph = dag::DepGraph::new(&docs);
+        assert!(successor_link(&docs[0], &empty_params(), &graph).is_empty());
+    }
+
+    #[test]
+    fn successor_link_honours_trigger_override() {
+        // Trigger remapped to `replaced`; a doc whose status is `replaced`
+        // must carry the field, while a `superseded` doc is now out of scope.
+        let params = serde_json::json!({ "trigger": "replaced" });
+        let docs = vec![status_doc("ADR-042", "replaced", None)];
+        let graph = dag::DepGraph::new(&docs);
+        let diags = successor_link(&docs[0], &params, &graph);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "ADR-042: a `replaced` document must record its successor in `superseded_by`"
+        );
+
+        // A `superseded` doc no longer arms the rule under this trigger.
+        let other = vec![superseded_doc("ADR-016", None)];
+        let other_graph = dag::DepGraph::new(&other);
+        assert!(successor_link(&other[0], &params, &other_graph).is_empty());
+    }
+
+    #[test]
+    fn successor_link_target_constrains_namespace() {
+        // target = ADR: a successor in PRD resolves but is rejected; an ADR
+        // successor is accepted. (SUCC-003 verification.)
+        let params = serde_json::json!({ "target": "ADR" });
+        let docs = vec![
+            superseded_doc("ADR-042", Some(("superseded_by", "PRD-070"))),
+            make_doc("PRD-070", vec![], vec![]),
+            superseded_doc("ADR-043", Some(("superseded_by", "ADR-071"))),
+            make_doc("ADR-071", vec![], vec![]),
+        ];
+        let graph = dag::DepGraph::new(&docs);
+
+        let cross = successor_link(&docs[0], &params, &graph);
+        assert_eq!(cross.len(), 1);
+        assert_eq!(
+            cross[0].message,
+            "ADR-042: `superseded_by` entry 'PRD-070' resolves but is not in the `ADR` namespace"
+        );
+
+        assert!(successor_link(&docs[2], &params, &graph).is_empty());
+    }
+
+    #[test]
+    fn successor_link_honours_field_override() {
+        let params = serde_json::json!({ "field": "replaced_by" });
+        let docs = vec![
+            superseded_doc("ADR-044", Some(("replaced_by", "ADR-069"))),
+            make_doc("ADR-069", vec![], vec![]),
+        ];
+        let graph = dag::DepGraph::new(&docs);
+        assert!(successor_link(&docs[0], &params, &graph).is_empty());
+
+        // The default `superseded_by` field is absent → fires under the override.
+        let missing = vec![superseded_doc("ADR-044", Some(("superseded_by", "ADR-069")))];
+        let mg = dag::DepGraph::new(&missing);
+        let diags = successor_link(&missing[0], &params, &mg);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "ADR-044: a `superseded` document must record its successor in `replaced_by`"
+        );
     }
 
     #[test]
@@ -824,10 +1194,110 @@ mod tests {
         assert!(locs.contains(&"b.md"));
     }
 
+    // -- core.min-docs (ADR-048) ---------------------------------------
+
+    use crate::config::NamespaceConfig;
+    use crate::diagnostic::Severity;
+    use std::collections::BTreeMap;
+
+    fn min_docs_ns(rules: &[&str], params: BTreeMap<String, Value>) -> NamespaceConfig {
+        NamespaceConfig {
+            rules: rules.iter().map(|s| s.to_string()).collect(),
+            params,
+            ..NamespaceConfig::default()
+        }
+    }
+
+    #[test]
+    fn min_docs_empty_seeded_namespace_emits_one_anchored_error() {
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert(
+            "THREAT".to_string(),
+            min_docs_ns(&["core.min-docs"], BTreeMap::new()),
+        );
+        let diags = min_docs(&namespaces, &[], &BTreeSet::new());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.min-docs");
+        assert_eq!(diags[0].location, "ctxgrd.toml");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert!(diags[0].message.contains("THREAT"));
+    }
+
+    #[test]
+    fn min_docs_help_names_the_invisible_skip_reasons() {
+        // "found none" reads as a lie when a file is right there on disk but
+        // skipped (symlink, or an [ignore] pattern). The help must name both,
+        // so the user is not sent debugging a phantom-missing file.
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert(
+            "THREAT".to_string(),
+            min_docs_ns(&["core.min-docs"], BTreeMap::new()),
+        );
+        let diags = min_docs(&namespaces, &[], &BTreeSet::new());
+        let help = diags[0].help.as_deref().expect("min-docs carries help");
+        assert!(help.contains("symlink"), "help should name symlinks: {help}");
+        assert!(
+            help.contains("[ignore]"),
+            "help should name [ignore] patterns: {help}"
+        );
+    }
+
+    #[test]
+    fn min_docs_populated_namespace_emits_none() {
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert(
+            "ADR".to_string(),
+            min_docs_ns(&["core.min-docs"], BTreeMap::new()),
+        );
+        let docs = vec![make_doc("ADR-001", vec![], vec![])];
+        let diags = min_docs(&namespaces, &docs, &BTreeSet::new());
+        assert_eq!(diags, vec![]);
+    }
+
+    #[test]
+    fn min_docs_warning_severity_keeps_diagnostic_at_warning() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "core.min-docs".to_string(),
+            serde_json::json!({ "severity": "warning" }),
+        );
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert("POLICY".to_string(), min_docs_ns(&["core.min-docs"], params));
+        let diags = min_docs(&namespaces, &[], &BTreeSet::new());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn min_docs_file_level_presence_suppresses() {
+        // AGENTS / TODO never become id-keyed documents; their presence
+        // arrives via the file-level scan set, not the documents slice.
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert(
+            "AGENTS".to_string(),
+            min_docs_ns(&["core.min-docs"], BTreeMap::new()),
+        );
+        let mut present = BTreeSet::new();
+        present.insert("AGENTS".to_string());
+        let diags = min_docs(&namespaces, &[], &present);
+        assert_eq!(diags, vec![]);
+    }
+
+    #[test]
+    fn min_docs_skips_namespace_that_did_not_opt_in() {
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert(
+            "BUG".to_string(),
+            min_docs_ns(&["core.frontmatter", "core.id"], BTreeMap::new()),
+        );
+        let diags = min_docs(&namespaces, &[], &BTreeSet::new());
+        assert_eq!(diags, vec![]);
+    }
+
     #[test]
     fn dep_cycle_self_edge_reported() {
         let docs = vec![make_doc("ADR-001", vec!["ADR-001"], vec![])];
-        let diags = dep_cycle(&docs);
+        let diags = dep_cycle(&dag::DepGraph::new(&docs));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.dep-cycle");
         assert!(diags[0].message.contains("ADR-1 references itself"));
@@ -1042,6 +1512,7 @@ mod tests {
             depends_on: vec![],
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
+            pin: None,
             ast: Some(Ast {
                 headings: headings
                     .into_iter()

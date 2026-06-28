@@ -43,6 +43,7 @@ rules = [
   "core.required-headings",
   "core.required-metadata",
   "core.allowed-values",
+  "core.successor-link",
 ]
 
 [PMR."core.required-headings"]

@@ -382,6 +382,7 @@ mod tests {
             depends_on: vec![],
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
+            pin: None,
             ast: Some(Ast::default()),
             body,
         }
@@ -410,6 +411,7 @@ mod tests {
             depends_on: vec![],
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
+            pin: None,
             ast: None,
             body: "synthetic body".to_string(),
         };

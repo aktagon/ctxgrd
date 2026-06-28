@@ -1,0 +1,108 @@
+{
+  "_note": "Catalog cross-checked against 45 CFR 164.308-312 (Security Rule, 2013 baseline as in force 2026): 42 implementation specifications, 20 Required / 22 Addressable, citations verified. The Jan 2025 NPRM that would make all specifications Required is not finalized as of 2026, so the R/A split stands. Paperwork existence/metadata/freshness only, never legal adequacy — counsel owns substantive compliance.",
+  "edition": "45 CFR Part 164 Subpart C (Security Rule), as in force 2026",
+  "summary": "HIPAA Security Rule safeguard register (SAFEGUARD) and Business Associate Agreement register (BAA) over the security base — 45 CFR 164.308/310/312, Security Rule as in force 2026. Paperwork existence/metadata/freshness only, never legal adequacy.",
+  "depends": ["security"],
+  "vocabularies": {
+    "safeguard": {
+      "cite": "45 CFR 164.308 / 164.310 / 164.312",
+      "values": [
+        { "id": "164.308.risk_analysis", "requirement": "required", "citation": "164.308(a)(1)(ii)(A)" },
+        { "id": "164.308.risk_management", "requirement": "required", "citation": "164.308(a)(1)(ii)(B)" },
+        { "id": "164.308.sanction_policy", "requirement": "required", "citation": "164.308(a)(1)(ii)(C)" },
+        { "id": "164.308.activity_review", "requirement": "required", "citation": "164.308(a)(1)(ii)(D)" },
+        { "id": "164.308.assigned_responsibility", "requirement": "required", "citation": "164.308(a)(2)" },
+        { "id": "164.308.authorization_supervision", "requirement": "addressable", "citation": "164.308(a)(3)(ii)(A)" },
+        { "id": "164.308.workforce_clearance", "requirement": "addressable", "citation": "164.308(a)(3)(ii)(B)" },
+        { "id": "164.308.termination_procedures", "requirement": "addressable", "citation": "164.308(a)(3)(ii)(C)" },
+        { "id": "164.308.isolating_clearinghouse", "requirement": "required", "citation": "164.308(a)(4)(ii)(A)" },
+        { "id": "164.308.access_authorization", "requirement": "addressable", "citation": "164.308(a)(4)(ii)(B)" },
+        { "id": "164.308.access_establishment", "requirement": "addressable", "citation": "164.308(a)(4)(ii)(C)" },
+        { "id": "164.308.security_reminders", "requirement": "addressable", "citation": "164.308(a)(5)(ii)(A)" },
+        { "id": "164.308.malicious_software", "requirement": "addressable", "citation": "164.308(a)(5)(ii)(B)" },
+        { "id": "164.308.login_monitoring", "requirement": "addressable", "citation": "164.308(a)(5)(ii)(C)" },
+        { "id": "164.308.password_management", "requirement": "addressable", "citation": "164.308(a)(5)(ii)(D)" },
+        { "id": "164.308.incident_response", "requirement": "required", "citation": "164.308(a)(6)(ii)" },
+        { "id": "164.308.data_backup_plan", "requirement": "required", "citation": "164.308(a)(7)(ii)(A)" },
+        { "id": "164.308.disaster_recovery", "requirement": "required", "citation": "164.308(a)(7)(ii)(B)" },
+        { "id": "164.308.emergency_mode", "requirement": "required", "citation": "164.308(a)(7)(ii)(C)" },
+        { "id": "164.308.contingency_testing", "requirement": "addressable", "citation": "164.308(a)(7)(ii)(D)" },
+        { "id": "164.308.criticality_analysis", "requirement": "addressable", "citation": "164.308(a)(7)(ii)(E)" },
+        { "id": "164.308.evaluation", "requirement": "required", "citation": "164.308(a)(8)" },
+        { "id": "164.308.business_associate_contracts", "requirement": "required", "citation": "164.308(b)(1)" },
+        { "id": "164.310.contingency_operations", "requirement": "addressable", "citation": "164.310(a)(2)(i)" },
+        { "id": "164.310.facility_security_plan", "requirement": "addressable", "citation": "164.310(a)(2)(ii)" },
+        { "id": "164.310.access_control_validation", "requirement": "addressable", "citation": "164.310(a)(2)(iii)" },
+        { "id": "164.310.maintenance_records", "requirement": "addressable", "citation": "164.310(a)(2)(iv)" },
+        { "id": "164.310.workstation_use", "requirement": "required", "citation": "164.310(b)" },
+        { "id": "164.310.workstation_security", "requirement": "required", "citation": "164.310(c)" },
+        { "id": "164.310.device_disposal", "requirement": "required", "citation": "164.310(d)(2)(i)" },
+        { "id": "164.310.media_reuse", "requirement": "required", "citation": "164.310(d)(2)(ii)" },
+        { "id": "164.310.accountability", "requirement": "addressable", "citation": "164.310(d)(2)(iii)" },
+        { "id": "164.310.data_backup_storage", "requirement": "addressable", "citation": "164.310(d)(2)(iv)" },
+        { "id": "164.312.unique_user_id", "requirement": "required", "citation": "164.312(a)(2)(i)" },
+        { "id": "164.312.emergency_access", "requirement": "required", "citation": "164.312(a)(2)(ii)" },
+        { "id": "164.312.automatic_logoff", "requirement": "addressable", "citation": "164.312(a)(2)(iii)" },
+        { "id": "164.312.encryption_decryption", "requirement": "addressable", "citation": "164.312(a)(2)(iv)" },
+        { "id": "164.312.audit_controls", "requirement": "required", "citation": "164.312(b)" },
+        { "id": "164.312.integrity_authentication", "requirement": "addressable", "citation": "164.312(c)(2)" },
+        { "id": "164.312.person_authentication", "requirement": "required", "citation": "164.312(d)" },
+        { "id": "164.312.transmission_integrity", "requirement": "addressable", "citation": "164.312(e)(2)(i)" },
+        { "id": "164.312.transmission_encryption", "requirement": "addressable", "citation": "164.312(e)(2)(ii)" }
+      ]
+    }
+  },
+  "namespaces": [
+    {
+      "name": "SAFEGUARD",
+      "comment": "Security Rule safeguard-to-evidence register (45 CFR 164.308/310/312, HIPAA-001/002). Each entry maps one Security Rule safeguard (from the closed catalog, projected into core.allowed-values) to its implementing evidence — a reused POLICY, an ADR, or a control decision — resolved by core.cross-ref. Path-claim with an `id` so a BAA or an audit can cross-ref a safeguard mapping. hipaa.safeguard-evidence (HIPAA-002) enforces the addressable/required distinction: every in-scope safeguard needs an implementing POLICY/ADR cross-ref, and an addressable one may substitute a `justification` field where a required one may not. The generator emits the Addressable id subset (the `requirement` flag from this extract) as that rule's `addressable` param.",
+      "paths": ["docs/compliance/hipaa/safeguards/**"],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "hipaa.safeguard-evidence"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "safeguard"
+      ],
+      "allowed_values": [
+        "safeguard"
+      ],
+      "safeguard_evidence": {
+        "vocabulary": "safeguard"
+      }
+    },
+    {
+      "name": "BAA",
+      "comment": "Business Associate Agreement register (45 CFR 164.308(b)(1) / 164.314, HIPAA-003). Each business associate handling ePHI carries an entry recording the contracting party and the execution date, kept fresh on a yearly review cadence (core.calendar-freshness over reviewed_date) — the same registry shape as GDPR's DPA. Path-claim with an `id` so a SAFEGUARD business-associate-contracts safeguard can cross-ref its governing agreement.",
+      "paths": ["docs/compliance/hipaa/baa/**"],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.calendar-freshness"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "party",
+        "executed_date",
+        "reviewed_date"
+      ],
+      "calendar_freshness": {
+        "field": "reviewed_date",
+        "stale_days": 365
+      }
+    }
+  ]
+}

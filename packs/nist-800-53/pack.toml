@@ -1,0 +1,30 @@
+# summary: NIST 800-53 control-to-evidence register (NIST80053) over the security base — NIST SP 800-53 Rev 5: the 20 control families (AC-SR), family-level grain. Paperwork existence/metadata/freshness only, never implementation adequacy.
+# depends: security
+
+# NIST 800-53 control-to-evidence register (NIST SP 800-53 Rev 5, NIST-001/002/003). Each entry maps one control family (from the closed family catalog, projected into core.allowed-values; grain is family-level by choice, NIST-001) to its implementing evidence — a reused POLICY, an ADR, or an `evidence_link` (an SSP narrative, assessment record, or config export). NIST 800-53 introduces no statutory document namespace of its own; the control-to-evidence mapping is its sole artifact, reusing POLICY/RISK/VULN from the security base. Path-claim with an `id` so an audit or a cross-ref can resolve a control. core.calendar-freshness over `review_date` surfaces a stale control. A `not-applicable` control is out of scope. nist.control-evidence (NIST-002) reuses the shared conditional-evidence machinery: an in-scope control asserting a family with neither a POLICY/ADR cross-ref nor a non-empty `evidence_link` fails.
+[NIST80053]
+paths = ["docs/compliance/nist-800-53/controls/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.calendar-freshness",
+  "nist.control-evidence",
+]
+
+[NIST80053."core.required-metadata"]
+keys = ["id", "title", "status", "control", "owner", "review_date"]
+
+[NIST80053."core.allowed-values"]
+control = ["AC", "AT", "AU", "CA", "CM", "CP", "IA", "IR", "MA", "MP", "PE", "PL", "PM", "PS", "PT", "RA", "SA", "SC", "SI", "SR"]
+
+[NIST80053."core.calendar-freshness"]
+field = "review_date"
+stale_days = 365
+
+[NIST80053."nist.control-evidence"]
+evidence-fields = ["evidence_link"]
+out-of-scope-status = ["not-applicable"]

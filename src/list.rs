@@ -225,6 +225,7 @@ mod tests {
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             frontmatter_lines: BTreeMap::new(),
             metadata,
+            pin: None,
             ast: None,
             body: String::new(),
         }

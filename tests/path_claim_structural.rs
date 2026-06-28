@@ -41,6 +41,30 @@ paths = ["SOUL.md", "soul/SOUL.md"]
 rules = ["core.frontmatter", "soul.sections"]
 "#;
 
+// The persona pack's auto-wired persona-side reference rules (ADR-047): they
+// fire on the persona file and look outward to the agent guide.
+const REFERENCED_CONFIG: &str = r#"
+[SOUL]
+paths = ["SOUL.md"]
+rules = ["soul.referenced"]
+
+[STYLE]
+paths = ["STYLE.md"]
+rules = ["style.referenced"]
+"#;
+
+// core.requires-link on the path-claimed agent guide: the persona recipe
+// from ADR-046 § RRF-005 — the guide must reference its persona docs.
+const REQUIRES_LINK_CONFIG: &str = r#"
+[AGENTS]
+paths = ["CLAUDE.md"]
+rules = ["core.requires-link"]
+
+[AGENTS."core.requires-link"]
+targets = ["SOUL.md", "STYLE.md"]
+severity = "warning"
+"#;
+
 #[test]
 fn design_section_order_and_token_ref_fire_on_real_design_md() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -149,10 +173,10 @@ fn style_md_with_malformed_frontmatter_does_not_panic() {
 fn soul_sections_fire_on_real_soul_md() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join("ctxgrd.toml"), SOUL_CONFIG).unwrap();
-    // Worldview and Boundaries present, Opinions missing → one warning.
+    // Title + Worldview + Boundaries present, Opinions missing → one warning.
     fs::write(
         tmp.path().join("SOUL.md"),
-        "---\nname: Acme\n---\n\n## Worldview\n\nx\n\n## Boundaries\n\nx\n",
+        "---\nname: Acme\n---\n\n# Acme\n\n## Worldview\n\nx\n\n## Boundaries\n\nx\n",
     )
     .unwrap();
 
@@ -181,7 +205,7 @@ fn well_formed_soul_md_is_clean() {
     fs::write(tmp.path().join("ctxgrd.toml"), SOUL_CONFIG).unwrap();
     fs::write(
         tmp.path().join("SOUL.md"),
-        "---\nname: Acme\n---\n\n## Worldview\n\nx\n\n## Opinions\n\nx\n\n## Boundaries\n\nx\n",
+        "---\nname: Acme\n---\n\n# Acme\n\n## Worldview\n\nx\n\n## Opinions\n\nx\n\n## Boundaries\n\nx\n",
     )
     .unwrap();
 
@@ -191,6 +215,38 @@ fn well_formed_soul_md_is_clean() {
     assert!(
         !stdout.contains("soul."),
         "no soul diagnostics expected:\n{stdout}"
+    );
+}
+
+#[test]
+fn soul_sections_h1_section_fires_wrong_level() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), SOUL_CONFIG).unwrap();
+    // The BUG-009 shape: the trio authored as `#` with no title. Per the
+    // soul.md template this is the wrong level, not a missing section — the
+    // diagnostic must point at the level, not send the author hunting for
+    // sections that are plainly present.
+    fs::write(
+        tmp.path().join("SOUL.md"),
+        "---\nname: Acme\n---\n\n# Worldview\n\nx\n\n# Opinions\n\nx\n\n# Boundaries\n\nx\n",
+    )
+    .unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "soul.sections is a warning\n{stdout}");
+    assert!(
+        stdout.contains("soul.sections"),
+        "soul.sections must fire on the H1-section SOUL.md:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("H1") && stdout.contains("`##`"),
+        "the diagnostic must point at the wrong heading level:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("missing the high-signal"),
+        "a present-but-wrong-level section must not be reported as missing:\n{stdout}"
     );
 }
 
@@ -211,5 +267,83 @@ fn style_md_with_soul_sibling_and_template_order_is_clean() {
     assert!(
         !stdout.contains("style."),
         "no style diagnostics expected:\n{stdout}"
+    );
+}
+
+#[test]
+fn requires_link_fires_on_guide_missing_persona_reference() {
+    // The BUG-007 regression guard for core.requires-link: it is Level::File,
+    // so it must fire through the real binary on a path-claimed CLAUDE.md.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), REQUIRES_LINK_CONFIG).unwrap();
+    // SOUL.md exists but CLAUDE.md does not reference it; STYLE.md is absent
+    // (must be skipped silently).
+    fs::write(tmp.path().join("SOUL.md"), "# Soul\n").unwrap();
+    fs::write(tmp.path().join("CLAUDE.md"), "# Project\n\nNo persona link here.\n").unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "severity = warning must not fail the run\n{stdout}");
+    assert!(
+        stdout.contains("core.requires-link") && stdout.contains("SOUL.md"),
+        "expected a core.requires-link diagnostic naming SOUL.md:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("STYLE.md"),
+        "absent STYLE.md target must be skipped, not reported:\n{stdout}"
+    );
+}
+
+#[test]
+fn soul_referenced_fires_on_persona_when_guide_does_not_link() {
+    // BUG-007 regression guard for the persona-side rules: Level::File, so
+    // they must fire through the real binary on a path-claimed SOUL.md.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), REFERENCED_CONFIG).unwrap();
+    fs::write(tmp.path().join("SOUL.md"), "# Soul\n").unwrap();
+    fs::write(tmp.path().join("CLAUDE.md"), "# Project\n\nNo persona link.\n").unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "soul.referenced is a warning\n{stdout}");
+    assert!(
+        stdout.contains("soul.referenced") && stdout.contains("SOUL.md"),
+        "expected a soul.referenced warning naming SOUL.md:\n{stdout}"
+    );
+}
+
+#[test]
+fn soul_referenced_silent_with_no_guide() {
+    // No CLAUDE.md/AGENTS.md/GEMINI.md — the standalone persona case.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), REFERENCED_CONFIG).unwrap();
+    fs::write(tmp.path().join("SOUL.md"), "# Soul\n").unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "no guide → clean\n{stdout}");
+    assert!(
+        !stdout.contains("soul.referenced"),
+        "no diagnostic expected when no guide exists:\n{stdout}"
+    );
+}
+
+#[test]
+fn requires_link_clean_when_guide_references_persona() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ctxgrd.toml"), REQUIRES_LINK_CONFIG).unwrap();
+    fs::write(tmp.path().join("SOUL.md"), "# Soul\n").unwrap();
+    fs::write(
+        tmp.path().join("CLAUDE.md"),
+        "# Project\n\nPersona: [SOUL.md](SOUL.md)\n",
+    )
+    .unwrap();
+
+    let out = run(tmp.path());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "referenced persona must be clean\n{stdout}");
+    assert!(
+        !stdout.contains("core.requires-link"),
+        "no requires-link diagnostic expected when referenced:\n{stdout}"
     );
 }

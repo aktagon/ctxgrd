@@ -1,4 +1,4 @@
-# summary: ADR, PRD, RFC, BUG doc types plus the TODO state file — engineering doc lifecycle with status vocabularies and required headings.
+# summary: ADR, PRD, RFC, BUG doc types plus the TODO state file and the README front door — engineering doc lifecycle with status vocabularies, required headings, and a README that links the entry guide.
 
 [ADR]
 paths = ["docs/adrs/**"]
@@ -12,6 +12,7 @@ rules = [
   "core.required-headings",
   "core.required-metadata",
   "core.allowed-values",
+  "core.successor-link",
 ]
 
 [ADR."core.required-headings"]
@@ -35,6 +36,7 @@ rules = [
   "core.required-headings",
   "core.required-metadata",
   "core.allowed-values",
+  "core.successor-link",
   "ears.clause-syntax",
 ]
 
@@ -105,3 +107,19 @@ rules = ["todo.freshness", "todo.structure"]
 
 [TODO."todo.freshness"]
 stale_days = 30
+
+# README — the repo's front door. Path-claimed on the root README.md, id-less and
+# frontmatter-free (READMEs open with an H1, not YAML). core.min-docs nudges a
+# project that has none to write one. core.requires-link keeps the front door
+# pointing at the entry guide: when docs/guides/getting-started.md exists (the GUIDE
+# pack convention, ADR-055), the README must link it — a markdown link or an @import
+# satisfies it. The target is skip-if-missing and warning-severity, so a project that
+# adopts project-docs without the guide pack is untouched; retarget or drop the line
+# if your entry guide lives elsewhere.
+[README]
+paths = ["README.md"]
+rules = ["core.min-docs", "core.requires-link"]
+
+[README."core.requires-link"]
+targets = ["docs/guides/getting-started.md"]
+severity = "warning"

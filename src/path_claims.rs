@@ -175,6 +175,10 @@ impl PathConflict {
              namespaces, or narrow one of the `[<NS>].paths` globs so it no longer covers \
              this file.",
         )
+        .with_note(
+            "if a pack upgrade renamed a namespace, an old block may still claim these \
+             files — run `ctxgrd pack migrate` to update it.",
+        )
     }
 }
 

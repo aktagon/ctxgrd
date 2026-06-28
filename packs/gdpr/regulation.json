@@ -1,0 +1,96 @@
+{
+  "summary": "GDPR documentary artifacts (ROPA/DPIA/DPA) over the security base — Regulation (EU) 2016/679 Arts. 28/30/35. Paperwork existence/metadata/freshness only, never legal adequacy.",
+  "depends": ["security"],
+  "vocabularies": {
+    "lawful_basis": {
+      "cite": "GDPR Art. 6(1)(a)-(f)",
+      "values": [
+        "consent",
+        "contract",
+        "legal_obligation",
+        "vital_interests",
+        "public_task",
+        "legitimate_interests"
+      ]
+    },
+    "controller_or_processor": {
+      "cite": "GDPR Art. 4(7)-(8), Art. 26",
+      "values": [
+        "controller",
+        "processor",
+        "joint-controller"
+      ]
+    }
+  },
+  "namespaces": [
+    {
+      "name": "ROPA",
+      "comment": "Records of processing activities (GDPR Art. 30). Each record declares the controller/processor role, an Art. 6(1) lawful basis from the closed vocabulary, the data categories processed, and a retention period — the highest-value defects a ROPA can catch are an undeclared role or an absent/mistyped lawful basis. Path-claim, but carries an `id` (core.id) so DPIAs and DPAs resolve as cross-ref targets. gdpr.processor-dpa (GDPR-002) adds the conditional cross-ref: a processor-role record must link its governing DPA (the Art. 28 agreement).",
+      "paths": ["docs/compliance/gdpr/ropa/**"],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "gdpr.processor-dpa"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "controller_or_processor",
+        "lawful_basis",
+        "data_categories",
+        "retention"
+      ],
+      "allowed_values": [
+        "controller_or_processor",
+        "lawful_basis"
+      ]
+    },
+    {
+      "name": "DPIA",
+      "comment": "Data protection impact assessments (GDPR Art. 35). A DPIA assesses high-risk processing and must be re-reviewed when that processing changes; `reviewed_date` under core.calendar-freshness flags one stale past a year. Cross-refs the ROPA activity it assesses.",
+      "paths": ["docs/compliance/gdpr/dpia/**"],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.calendar-freshness"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "reviewed_date"
+      ],
+      "calendar_freshness": {
+        "field": "reviewed_date",
+        "stale_days": 365
+      }
+    },
+    {
+      "name": "DPA",
+      "comment": "Processor / subprocessor agreement register (GDPR Art. 28). Each entry records the contracting party and the execution date, making the processing relationship auditable. Path-claim with an `id` so a processor-role ROPA can cross-ref its governing DPA.",
+      "paths": ["docs/compliance/gdpr/dpa/**"],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.cross-ref",
+        "core.required-metadata"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "party",
+        "executed_date"
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 [package]
 name = "ctxgrd"
-version = "0.18.0"
+version = "0.48.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Document linter with pluggable sources and rules"
@@ -27,7 +27,7 @@ include = [
     "CHANGELOG.md",
     "LICENSE-MIT",
     "rust-toolchain.toml",
-    # User-facing reference docs. src/bin/ctxgrd.rs embeds these via
+    # User-facing reference docs. src/bin/ctxgrd/main.rs embeds these via
     # include_str! into the `ctxgrd docs <topic>` subcommand, so they
     # are bin compile-time dependencies.
     "docs/namespaces.md",
@@ -43,7 +43,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "ctxgrd"
-path = "src/bin/ctxgrd.rs"
+path = "src/bin/ctxgrd/main.rs"
 
 [dependencies]
 # Library errors — derive-macro-only, no runtime surface.

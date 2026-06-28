@@ -1,0 +1,11 @@
+# summary: CODEXSKILLS — OpenAI Codex SKILL.md definitions (.codex/skills).
+# Codex's instruction file is AGENTS.md (the `agents` pack); Codex has no
+# proprietary agent-definition format, so this pack carries only its skill files.
+# Per-harness pack established by ADR-051.
+
+# CODEXSKILLS — Codex SKILL.md definitions (agentskills.io convention).
+# Path-claimed, id-less: lints via the compiled `skills.frontmatter` rule
+# (SKILL.md has name/description but no id: — core.* would error with IdMissing).
+[CODEXSKILLS]
+paths = [".codex/skills/**/SKILL.md"]
+rules = ["skills.frontmatter"]

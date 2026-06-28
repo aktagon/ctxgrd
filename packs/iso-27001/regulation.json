@@ -1,0 +1,441 @@
+{
+  "_note": "Catalog cross-checked against ISO/IEC 27001:2022 Annex A (control titles per ISO/IEC 27002:2022): 93 controls across four themes \u2014 Organizational (A.5, 37), People (A.6, 8), Physical (A.7, 14), Technological (A.8, 34). The 2022 edition numbers controls sequentially within each theme (A.5.1-A.5.37, A.6.1-A.6.8, A.7.1-A.7.14, A.8.1-A.8.34) \u2014 no gaps, no sub-letters \u2014 unlike the gapped 2013 numbering (114 controls, A.5-A.18). Each control carries its theme; the emitter projects only the id into core.allowed-values. Paperwork existence/metadata/freshness only; ctxgrd never attests that a control is technically in force \u2014 implementation adequacy is the auditor's judgment (ADR-070 Context).",
+  "edition": "ISO/IEC 27001:2022 Annex A (control titles per ISO/IEC 27002:2022)",
+  "summary": "ISO 27001 control-to-evidence register (ISO27001) over the security base \u2014 ISO/IEC 27001:2022 Annex A: 93 controls across the Organizational/People/Physical/Technological themes. Paperwork existence/metadata/freshness only, never implementation adequacy.",
+  "depends": [
+    "security"
+  ],
+  "vocabularies": {
+    "control": {
+      "cite": "ISO/IEC 27001:2022 Annex A",
+      "values": [
+        {
+          "id": "A.5.1",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.2",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.3",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.4",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.5",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.6",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.7",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.8",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.9",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.10",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.11",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.12",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.13",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.14",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.15",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.16",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.17",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.18",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.19",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.20",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.21",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.22",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.23",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.24",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.25",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.26",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.27",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.28",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.29",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.30",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.31",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.32",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.33",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.34",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.35",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.36",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.5.37",
+          "theme": "Organizational"
+        },
+        {
+          "id": "A.6.1",
+          "theme": "People"
+        },
+        {
+          "id": "A.6.2",
+          "theme": "People"
+        },
+        {
+          "id": "A.6.3",
+          "theme": "People"
+        },
+        {
+          "id": "A.6.4",
+          "theme": "People"
+        },
+        {
+          "id": "A.6.5",
+          "theme": "People"
+        },
+        {
+          "id": "A.6.6",
+          "theme": "People"
+        },
+        {
+          "id": "A.6.7",
+          "theme": "People"
+        },
+        {
+          "id": "A.6.8",
+          "theme": "People"
+        },
+        {
+          "id": "A.7.1",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.2",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.3",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.4",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.5",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.6",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.7",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.8",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.9",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.10",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.11",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.12",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.13",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.7.14",
+          "theme": "Physical"
+        },
+        {
+          "id": "A.8.1",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.2",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.3",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.4",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.5",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.6",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.7",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.8",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.9",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.10",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.11",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.12",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.13",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.14",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.15",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.16",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.17",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.18",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.19",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.20",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.21",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.22",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.23",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.24",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.25",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.26",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.27",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.28",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.29",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.30",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.31",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.32",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.33",
+          "theme": "Technological"
+        },
+        {
+          "id": "A.8.34",
+          "theme": "Technological"
+        }
+      ]
+    },
+    "theme": {
+      "cite": "ISO/IEC 27001:2022 Annex A themes (clauses A.5-A.8)",
+      "values": [
+        "Organizational",
+        "People",
+        "Physical",
+        "Technological"
+      ]
+    }
+  },
+  "namespaces": [
+    {
+      "name": "ISO27001",
+      "comment": "ISO 27001 control-to-evidence register (ISO/IEC 27001:2022 Annex A, ISO-001/002/003). Each entry maps one Annex A control (from the closed catalog, projected into core.allowed-values) to its implementing evidence \u2014 a reused POLICY, an ADR, or an `evidence_link`. ISO 27001 introduces no statutory document namespace of its own; the control-to-evidence mapping is its sole artifact, reusing POLICY/RISK/VULN from the security base. Path-claim with an `id` so an audit or a cross-ref can resolve a control. core.calendar-freshness over `review_date` surfaces a stale control. The Statement of Applicability's applicable/not-applicable decision rides the control `status`: a `not-applicable` control is out of scope. iso27001.control-evidence (ISO-002) reuses the shared conditional-evidence machinery: an in-scope control asserting an Annex A control with neither a POLICY/ADR cross-ref nor a non-empty `evidence_link` fails.",
+      "paths": [
+        "docs/compliance/iso-27001/controls/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "core.calendar-freshness",
+        "iso27001.control-evidence"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "control",
+        "owner",
+        "theme",
+        "review_date"
+      ],
+      "allowed_values": [
+        "control",
+        "theme"
+      ],
+      "calendar_freshness": {
+        "field": "review_date",
+        "stale_days": 365
+      },
+      "control_evidence": {
+        "rule": "iso27001.control-evidence",
+        "evidence_fields": [
+          "evidence_link"
+        ],
+        "out_of_scope_status": [
+          "not-applicable"
+        ]
+      }
+    }
+  ]
+}

@@ -11,7 +11,7 @@
 //! they turn out to be missing then, the `cfg.rule-unknown` check
 //! tightens at that layer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,10 +21,11 @@ use toml::Value as TomlValue;
 
 use crate::diagnostic::KernelMessage;
 
-pub const CORE_RULES: [&str; 10] = [
+pub const CORE_RULES: [&str; 12] = [
     "core.frontmatter",
     "core.id",
     "core.id-unique",
+    "core.min-docs",
     "core.dep-resolved",
     "core.dep-cycle",
     "core.cross-ref",
@@ -32,6 +33,7 @@ pub const CORE_RULES: [&str; 10] = [
     "core.required-metadata",
     "core.allowed-values",
     "core.requirement-ref",
+    "core.successor-link",
 ];
 
 /// Core rules whose zero-config default includes them — every
@@ -140,7 +142,8 @@ pub struct Config {
     pub todo_listed_global: bool,
     /// Declared `[pipeline]` table (SPEC-002 § Data model). `None`
     /// means no pipeline is declared — `ctxgrd status` falls back to
-    /// inference / the default ladder (EARS-01.2, EARS-01.3).
+    /// the built-in default ladder (EARS-01.3). Runtime resolution is
+    /// declared-or-default only; it does not infer (ADR-039 § DAG-007).
     pub pipeline: Option<PipelineConfig>,
     /// Kernel-level advisories raised during config loading — e.g.,
     /// `[sources.markdown-file]` was in the file but ignored
@@ -260,6 +263,69 @@ impl Config {
             .cloned()
             .unwrap_or_else(NamespaceConfig::zero_config)
     }
+
+    /// The set of namespaces a given namespace's `core.dep-shape` admits
+    /// as `depends_on` targets — the union of its `requires` and `allows`
+    /// params (ADR-039 § DAG-002/DAG-003). Empty when the namespace does
+    /// not declare `core.dep-shape` (or declares it with no targets).
+    pub fn dep_shape_targets(&self, namespace: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let Some(ns_cfg) = self.namespaces.get(namespace) else {
+            return out;
+        };
+        let Some(params) = ns_cfg.params.get("core.dep-shape") else {
+            return out;
+        };
+        for key in ["requires", "allows"] {
+            if let Some(arr) = params.get(key).and_then(Value::as_array) {
+                out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
+            }
+        }
+        out
+    }
+
+    /// The "managed" namespace set (ADR-039 § DAG-003): every namespace
+    /// that appears in SOME namespace's `core.dep-shape` `requires`/`allows`
+    /// anywhere in the config. Used by the admissibility check to exempt
+    /// edges that point at an entirely unmanaged endpoint (EARS-06.3's
+    /// successor).
+    pub fn dep_shape_managed(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for name in self.namespaces.keys() {
+            out.extend(self.dep_shape_targets(name));
+        }
+        out
+    }
+
+    /// Assemble the declared type-DAG ordering edges (ADR-039 §
+    /// DAG-002/DAG-005): the union of every namespace's `core.dep-shape`
+    /// `requires`+`allows` lifts and any `[pipeline].stages` adjacency.
+    ///
+    /// Edge direction follows the document lift convention: a
+    /// `[NS."core.dep-shape"] requires = ["T"]` declares a doc-edge
+    /// `NS → T` (`depends_on`), which lifts to the ordering edge
+    /// `T → NS` (T first). `[pipeline].stages = [A, B, C]` contributes
+    /// adjacency edges `A → B`, `B → C` directly (already in ordering
+    /// direction). A self-edge (a namespace listing itself) is dropped —
+    /// it carries no ordering and would falsely trip the cycle check.
+    pub fn dep_shape_edges(&self) -> BTreeSet<(String, String)> {
+        let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+        for name in self.namespaces.keys() {
+            for target in self.dep_shape_targets(name) {
+                if &target != name {
+                    edges.insert((target, name.clone()));
+                }
+            }
+        }
+        if let Some(pipeline) = &self.pipeline {
+            for pair in pipeline.stages.windows(2) {
+                if pair[0] != pair[1] {
+                    edges.insert((pair[0].clone(), pair[1].clone()));
+                }
+            }
+        }
+        edges
+    }
 }
 
 /// Anything that can go wrong loading or validating the config.
@@ -300,6 +366,12 @@ pub enum ConfigError {
     },
     #[error("[{namespace}] `rules` must be an array of strings")]
     RulesListInvalid { namespace: String },
+    #[error(
+        "[cfg.namespace-name-invalid] namespace '{namespace}' lists `core.id` but its name is \
+         not a legal id prefix — an id `{namespace}-<number>` cannot be parsed (the name must be \
+         uppercase ASCII starting with a letter, with no hyphen: regex `^[A-Z][A-Z0-9]*$`)"
+    )]
+    NamespaceNameNotIdLegal { namespace: String },
     #[error("[ext.namespace-reserved] external rule directory '{path}' uses the reserved 'core' namespace")]
     NamespaceReserved { path: PathBuf },
     #[error(
@@ -340,6 +412,7 @@ impl ConfigError {
             Self::NamespaceReserved { .. } => Some("ext.namespace-reserved"),
             Self::IgnorePatternInvalid { .. } => Some("cfg.ignore-invalid"),
             Self::ReferencesInvalid { .. } => Some("cfg.references-invalid"),
+            Self::NamespaceNameNotIdLegal { .. } => Some("cfg.namespace-name-invalid"),
             Self::PathsInvalid { .. } => Some("cfg.paths-invalid"),
             Self::PipelineInvalid { .. } => Some("cfg.pipeline-invalid"),
             Self::PipelineStageUnknown { .. } => Some("cfg.pipeline-stage-unknown"),
@@ -855,6 +928,17 @@ fn is_namespace_key(key: &str) -> bool {
     key.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
+/// Whether `name` is a legal id-prefix — i.e. an id `<name>-1` parses back
+/// to a [`DocumentId`] whose namespace is exactly `name`. Reuses the id
+/// grammar itself (no second regex to drift) so the guard tracks
+/// [`crate::id`] precisely. The round-trip equality rejects a hyphenated
+/// name like `SR-MAP`, which would otherwise parse as namespace `SR`.
+fn is_id_legal_namespace(name: &str) -> bool {
+    format!("{name}-1")
+        .parse::<crate::id::DocumentId>()
+        .is_ok_and(|id| id.namespace == name)
+}
+
 fn parse_sources(val: TomlValue, config: &mut Config) -> Result<(), ConfigError> {
     let TomlValue::Table(sources) = val else {
         return Ok(());
@@ -901,6 +985,17 @@ fn parse_namespace(
         }
     };
 
+    // A namespace that lists `core.id` expects its documents to carry an
+    // `<NS>-<number>` id, so its name must itself be a legal id prefix. A
+    // hyphenated name (e.g. `SR-MAP`) makes every such id unparseable —
+    // documents are rejected as malformed with no hint that the *namespace
+    // name* is the cause (BUG-013). Catch it once, at config load, instead.
+    if rules.iter().any(|c| c == "core.id") && !is_id_legal_namespace(namespace) {
+        return Err(ConfigError::NamespaceNameNotIdLegal {
+            namespace: namespace.to_string(),
+        });
+    }
+
     let (paths, path_patterns) = match table.remove("paths") {
         Some(v) => parse_namespace_paths(namespace, v)?,
         None => (None, Vec::new()),
@@ -919,6 +1014,29 @@ fn parse_namespace(
         match validate_rule(namespace, &code, &params, external_rules, root)? {
             None => valid_rules.push(code),
             Some(km) => warnings.push(km),
+        }
+    }
+
+    // ADR-048 § SEED-002: `core.min-docs`'s `count` is reserved for a future
+    // cardinality floor but pinned to 1 in this release. A non-1 value must not
+    // be silently inert — warn — while leaving the seed rule active. Emitted
+    // here, not in `validate_rule`, so the seed stays in `valid_rules` (a `Some`
+    // return there means "warn and skip the rule").
+    if valid_rules.iter().any(|c| c == "core.min-docs") {
+        if let Some(count) = params
+            .get("core.min-docs")
+            .and_then(|p| p.get("count"))
+            .and_then(Value::as_i64)
+        {
+            if count != 1 {
+                warnings.push(KernelMessage::warning(
+                    "cfg.reserved-param",
+                    format!(
+                        "[{namespace}.\"core.min-docs\"] `count` = {count} is reserved \
+                         (pinned to 1 in this release) and was ignored; the seed stays active"
+                    ),
+                ));
+            }
         }
     }
 
@@ -988,7 +1106,16 @@ fn validate_rule(
     root: &Path,
 ) -> Result<Option<KernelMessage>, ConfigError> {
     if code.starts_with("core.") {
+        // Some `core.*` rules ship compiled in BUILTIN_RULES rather than
+        // in the pure `rules.rs` set (ADR-040: `core.commit-freshness`,
+        // `core.calendar-freshness`). They are real core rules, just
+        // dispatched via `document_check`; accept them here and let their
+        // params validate as builtin params (free-form, validated by the
+        // rule itself).
         if !CORE_RULES.contains(&code) {
+            if is_builtin_compiled(code) {
+                return Ok(None);
+            }
             return Ok(Some(unknown_rule_warning(
                 namespace,
                 code,
@@ -1004,6 +1131,13 @@ fn validate_rule(
                     code: code.to_string(),
                 })?;
             validate_core_rule_params(namespace, code, p)?;
+        } else if code == "core.successor-link" {
+            // `core.successor-link` params are optional (SUCC-003): absent
+            // values fall back to documented defaults. Validate the shape
+            // only when a table is present.
+            if let Some(p) = params.get(code) {
+                validate_core_rule_params(namespace, code, p)?;
+            }
         }
         return Ok(None);
     }
@@ -1110,6 +1244,26 @@ fn validate_core_rule_params(
                             code: code.to_string(),
                             detail: format!(
                                 "`{key}` expected array of strings, got array of mixed types"
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+        "core.successor-link" => {
+            // Three optional string params: `trigger`, `field`, `target`
+            // (SUCC-003). Reject any other key shape; a non-string value is
+            // a configuration mistake, not a silent fallback.
+            for key in ["trigger", "field", "target"] {
+                if let Some(value) = map.get(key) {
+                    if !value.is_string() {
+                        return Err(ConfigError::RuleParamsInvalid {
+                            namespace: namespace.to_string(),
+                            code: code.to_string(),
+                            detail: format!(
+                                "`{key}` expected string, got {}",
+                                value_kind(value)
                             ),
                         });
                     }
@@ -1261,6 +1415,48 @@ mod tests {
         let config = parse("").unwrap();
         assert!(config.namespaces.is_empty());
         assert!(config.sources.is_empty());
+    }
+
+    // -- BUG-013 guard: an id-claiming namespace name must be id-legal -----
+
+    #[test]
+    fn hyphenated_namespace_with_core_id_is_rejected() {
+        // The SR-MAP class: a hyphen in the name makes `SR-MAP-001`
+        // unparseable, so every document would be flagged malformed.
+        let text = "[SR-MAP]\npaths = [\"docs/x/**\"]\nrules = [\"core.id\"]\n";
+        let err = parse(text).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::NamespaceNameNotIdLegal { namespace } if namespace == "SR-MAP"),
+            "expected NamespaceNameNotIdLegal for SR-MAP, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn id_legal_namespace_with_core_id_is_accepted() {
+        let text = "[SAFEGUARD]\npaths = [\"docs/x/**\"]\nrules = [\"core.id\"]\n";
+        assert!(parse(text).is_ok());
+    }
+
+    #[test]
+    fn namespace_with_trailing_digit_and_core_id_is_accepted() {
+        // A digit inside the namespace is id-legal (only an internal hyphen
+        // is not — that is the SR-MAP class above). `SOC2-001` parses back to
+        // namespace `SOC2`, so the soc2 compliance pack (ADR-069) may claim
+        // ids under `[SOC2]`. The prose report name is "SOC 2"; the ctxgrd
+        // namespace is the hyphen-free `SOC2`.
+        let text = "[SOC2]\npaths = [\"docs/compliance/soc2/**\"]\nrules = [\"core.id\"]\n";
+        assert!(
+            parse(text).is_ok(),
+            "[SOC2] with core.id must load: SOC2-001 parses to namespace SOC2"
+        );
+    }
+
+    #[test]
+    fn hyphenated_namespace_without_core_id_is_allowed() {
+        // The guard is scoped to namespaces that claim ids: an id-less
+        // path-claimed namespace is unaffected by the name grammar.
+        let text = "[MY-DOCS]\npaths = [\"docs/x/**\"]\nrules = [\"core.frontmatter\"]\n";
+        assert!(parse(text).is_ok());
     }
 
     #[test]
@@ -1462,6 +1658,34 @@ rules = ["todo.freshness", "todo.structure"]
     }
 
     #[test]
+    fn dep_shape_params_validate_and_round_trip() {
+        // ADR-039 § DAG-002: `core.dep-shape` is builtin-compiled under the
+        // `core.` prefix, so its params are stored loosely (no key schema)
+        // and must not raise cfg.rule-unknown or a param error — even with
+        // the reserved `allows` param present.
+        let text = r#"
+[SPEC]
+rules = ["core.dep-shape"]
+[SPEC."core.dep-shape"]
+requires = ["PRD"]
+allows = ["ADR", "PRD"]
+"#;
+        let config = parse(text).expect("core.dep-shape config must validate");
+        assert!(
+            !config
+                .kernel_messages
+                .iter()
+                .any(|m| m.code == "cfg.rule-unknown"),
+            "core.dep-shape must not warn as unknown: {:?}",
+            config.kernel_messages
+        );
+        let spec = config.namespaces.get("SPEC").unwrap();
+        let params = spec.params.get("core.dep-shape").unwrap();
+        assert_eq!(params["requires"], json!(["PRD"]));
+        assert_eq!(params["allows"], json!(["ADR", "PRD"]));
+    }
+
+    #[test]
     fn allowed_values_table_round_trips() {
         let text = r#"
 [ADR]
@@ -1506,6 +1730,71 @@ some_param = "value"
         assert_eq!(config.kernel_messages.len(), 1);
         assert_eq!(config.kernel_messages[0].code, "cfg.reserved-source");
         assert!(config.kernel_messages[0].message.contains("markdown-file"));
+    }
+
+    #[test]
+    fn min_docs_reserved_count_warns_but_keeps_rule_active() {
+        // ADR-048 § SEED-002: `count` is reserved for a future cardinality
+        // floor but pinned to 1 in this release. A non-1 value must not be
+        // silently inert (the whole point of the warning) and must not
+        // disable the seed it was attached to.
+        let text = r#"
+[POLICY]
+paths = ["docs/policies/**"]
+rules = ["core.min-docs"]
+
+[POLICY."core.min-docs"]
+count = 2
+"#;
+        let config = parse(text).unwrap();
+        assert_eq!(
+            config.namespaces["POLICY"].rules,
+            vec!["core.min-docs".to_string()],
+            "a reserved param must not drop the rule from the namespace"
+        );
+        let warn = config
+            .kernel_messages
+            .iter()
+            .find(|m| m.code == "cfg.reserved-param")
+            .expect("count = 2 should emit a cfg.reserved-param warning");
+        assert!(warn.message.contains("count"));
+    }
+
+    #[test]
+    fn min_docs_count_one_is_silent() {
+        let text = r#"
+[POLICY]
+paths = ["docs/policies/**"]
+rules = ["core.min-docs"]
+
+[POLICY."core.min-docs"]
+count = 1
+"#;
+        let config = parse(text).unwrap();
+        assert!(
+            !config
+                .kernel_messages
+                .iter()
+                .any(|m| m.code == "cfg.reserved-param"),
+            "count = 1 matches the effective floor and must not warn"
+        );
+    }
+
+    #[test]
+    fn min_docs_without_count_is_silent() {
+        let text = r#"
+[POLICY]
+paths = ["docs/policies/**"]
+rules = ["core.min-docs"]
+"#;
+        let config = parse(text).unwrap();
+        assert!(
+            !config
+                .kernel_messages
+                .iter()
+                .any(|m| m.code == "cfg.reserved-param"),
+            "an absent count must not warn"
+        );
     }
 
     #[test]

@@ -41,56 +41,193 @@ pub(crate) enum Cycle {
     Scc { members: Vec<usize> },
 }
 
-/// Every unresolved reference across all documents, in document-then-
-/// entry order. Self-edges (a doc depending on its own id) are
-/// resolved (they find themselves) — they only surface through
-/// [`cycles`] below.
-pub(crate) fn unresolved_refs(docs: &[Document]) -> Vec<UnresolvedRef> {
-    let index = build_index(docs);
-    let mut out = Vec::new();
-    for (idx, doc) in docs.iter().enumerate() {
-        for entry in &doc.depends_on {
-            let parsed: Result<DocumentId, _> = entry.parse();
-            let resolved = parsed.is_ok_and(|id| index.contains_key(&id));
-            if !resolved {
-                out.push(UnresolvedRef {
+/// A node handle inside a [`DepGraph`] (ADR-064 § DAG-004). A newtype
+/// over the document-slice position, so a graph node and a bare document
+/// index can't be mixed by accident. One node per document:
+/// `NodeIdx(i)` is `docs[i]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeIdx(usize);
+
+/// The document-level dependency graph, built once per run
+/// (ADR-064 § DAG-001).
+///
+/// Stores **only** the canonical pair — the node index (`id → NodeIdx`)
+/// and the resolved edge adjacency — plus the unresolved entries
+/// captured while resolving (DAG-003). Every other property (cycles,
+/// topological order, degree) is derived on demand by a method and never
+/// persisted (DAG-002). This mirrors the `NamespaceDag` precedent one
+/// level up and extends ADR-029's "parse once, rules read" invariant to
+/// the graph built over the documents.
+pub(crate) struct DepGraph<'d> {
+    /// The node table: node `NodeIdx(i)` is `docs[i]`.
+    docs: &'d [Document],
+    /// `id → node handle`, first occurrence winning on duplicate ids
+    /// (callers care about presence, not which instance). Part of the
+    /// canonical model (DAG-002). Read by [`DepGraph::index_of`] to resolve
+    /// a `--lineage <ID>` selector to a node (ADR-059 § LIN-001, the first
+    /// reader the field was waiting for).
+    index: BTreeMap<DocumentId, NodeIdx>,
+    /// Resolved dependency edges: `adjacency[i]` lists the nodes that
+    /// `docs[i]` depends on. Malformed or unresolved entries are not
+    /// here — they are in `unresolved`.
+    adjacency: Vec<Vec<NodeIdx>>,
+    /// `depends_on` entries that didn't resolve to a document in the run,
+    /// in document-then-entry order (DAG-003).
+    unresolved: Vec<UnresolvedRef>,
+}
+
+impl<'d> DepGraph<'d> {
+    /// Build the graph in one pass over `docs`, parsing each
+    /// `depends_on` entry exactly once (DAG-003): an entry that parses to
+    /// an id present in the index becomes an adjacency edge, otherwise
+    /// (malformed or absent) it is captured as an [`UnresolvedRef`]. An
+    /// entry is therefore an edge or an unresolved reference, never both
+    /// and never neither — a dangling edge stays unrepresentable.
+    pub(crate) fn new(docs: &'d [Document]) -> Self {
+        // Pass 1: index every id. First occurrence wins on collision —
+        // presence is what matters here, not which instance.
+        let mut index: BTreeMap<DocumentId, NodeIdx> = BTreeMap::new();
+        for (idx, doc) in docs.iter().enumerate() {
+            index.entry(doc.id.clone()).or_insert(NodeIdx(idx));
+        }
+
+        // Pass 2: partition each entry into a resolved edge or an
+        // unresolved reference. The index must be complete first — a
+        // document may depend on one that appears later in the slice.
+        let mut adjacency: Vec<Vec<NodeIdx>> = vec![Vec::new(); docs.len()];
+        let mut unresolved = Vec::new();
+        for (idx, doc) in docs.iter().enumerate() {
+            for entry in &doc.depends_on {
+                if let Ok(id) = entry.parse::<DocumentId>() {
+                    if let Some(&to) = index.get(&id) {
+                        adjacency[idx].push(to);
+                        continue;
+                    }
+                }
+                unresolved.push(UnresolvedRef {
                     from_doc_idx: idx,
                     raw_entry: entry.clone(),
                 });
             }
         }
-    }
-    out
-}
 
-/// Every cycle in the `depends_on` graph: every self-edge + every
-/// non-trivial SCC. Unresolved entries are silently ignored because
-/// they're reported by [`unresolved_refs`] already.
-pub(crate) fn cycles(docs: &[Document]) -> Vec<Cycle> {
-    let index = build_index(docs);
-    let adj = adjacency_list(docs, &index);
-    let mut out = Vec::new();
-
-    // Self-edges first — one per doc where id ∈ depends_on.
-    for (idx, neighbours) in adj.iter().enumerate() {
-        if neighbours.contains(&idx) {
-            out.push(Cycle::SelfEdge { doc_idx: idx });
+        Self {
+            docs,
+            index,
+            adjacency,
+            unresolved,
         }
     }
 
-    // Tarjan's SCC for the rest.
-    let sccs = tarjan_scc(&adj);
-    for mut scc in sccs {
-        if scc.len() < 2 {
-            // Singletons are only cycles if they have a self-edge, and
-            // those were already emitted above.
-            continue;
-        }
-        scc.sort_by(|a, b| docs[*a].id.cmp(&docs[*b].id));
-        out.push(Cycle::Scc { members: scc });
+    /// Every unresolved reference across all documents, in document-then-
+    /// entry order. Self-edges (a doc depending on its own id) resolve —
+    /// they surface through [`DepGraph::cycles`], not here.
+    pub(crate) fn unresolved(&self) -> &[UnresolvedRef] {
+        &self.unresolved
     }
 
-    out
+    /// Every cycle in the graph: every self-edge plus every non-trivial
+    /// SCC. Derived on demand from the adjacency, never stored (DAG-002).
+    /// Unresolved entries can't appear in a cycle — they were excluded
+    /// from the adjacency at construction.
+    pub(crate) fn cycles(&self) -> Vec<Cycle> {
+        let mut out = Vec::new();
+
+        // Self-edges first — one per doc where id ∈ depends_on.
+        for (idx, neighbours) in self.adjacency.iter().enumerate() {
+            if neighbours.contains(&NodeIdx(idx)) {
+                out.push(Cycle::SelfEdge { doc_idx: idx });
+            }
+        }
+
+        // Tarjan's SCC over a plain-index view of the adjacency — the
+        // hand-rolled algorithm is reused unchanged (DAG-005).
+        let adj: Vec<Vec<usize>> = self
+            .adjacency
+            .iter()
+            .map(|neighbours| neighbours.iter().map(|n| n.0).collect())
+            .collect();
+        for mut scc in tarjan_scc(&adj) {
+            if scc.len() < 2 {
+                // Singletons are only cycles via a self-edge, already
+                // emitted above.
+                continue;
+            }
+            scc.sort_by(|a, b| self.docs[*a].id.cmp(&self.docs[*b].id));
+            out.push(Cycle::Scc { members: scc });
+        }
+
+        out
+    }
+
+    /// The documents this graph is built over — the node table. Lets the
+    /// rule layer resolve a [`Cycle`]/[`UnresolvedRef`] document index
+    /// back to its [`Document`] for diagnostic formatting.
+    pub(crate) fn docs(&self) -> &'d [Document] {
+        self.docs
+    }
+
+    /// The node index for `id`, or `None` when no document in the run has
+    /// that id (EARS-04.5). The first reader of the `index` field
+    /// (ADR-059 § LIN-001) — resolves a `--lineage <ID>` selector to a node.
+    pub(crate) fn index_of(&self, id: &DocumentId) -> Option<usize> {
+        self.index.get(id).map(|n| n.0)
+    }
+
+    /// The transitive **dependents** of the document at `root` over the
+    /// **transpose** of the `depends_on` graph: every document that
+    /// transitively depends on `root`, plus `root` itself (ADR-059 §
+    /// LIN-001). Because adjacency stores edges child→parent, a forward
+    /// walk would yield prerequisites; a feature's members are reached only
+    /// over the reverse edges, computed here by a BFS that never persists a
+    /// reverse adjacency (DAG-002 — derived on demand, stdlib-only per
+    /// ADR-064 § DAG-005, no `petgraph`).
+    pub(crate) fn dependents(&self, root: usize) -> BTreeSet<usize> {
+        // Reverse adjacency on the fly: parent → the children depending on it.
+        let mut reverse: Vec<Vec<usize>> = vec![Vec::new(); self.docs.len()];
+        for (child, parents) in self.adjacency.iter().enumerate() {
+            for p in parents {
+                reverse[p.0].push(child);
+            }
+        }
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        seen.insert(root);
+        let mut stack = vec![root];
+        while let Some(u) = stack.pop() {
+            for &child in &reverse[u] {
+                if seen.insert(child) {
+                    stack.push(child);
+                }
+            }
+        }
+        seen
+    }
+
+    /// The lineage **roots** the document at `idx` belongs to: the
+    /// documents reachable by walking `idx`'s prerequisites forward (over
+    /// `depends_on`) that themselves have no outgoing edge — the tops of
+    /// the dependency forest (ADR-059 § LIN-005). A document reachable from
+    /// more than one such root is a shared node, and those roots are
+    /// disclosed beside its stage so a lineage's "done" never silently
+    /// hides a document still driven by another feature. `idx` is itself a
+    /// root when it has no resolved prerequisites.
+    pub(crate) fn owning_roots(&self, idx: usize) -> BTreeSet<usize> {
+        let mut roots: BTreeSet<usize> = BTreeSet::new();
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        seen.insert(idx);
+        let mut stack = vec![idx];
+        while let Some(u) = stack.pop() {
+            if self.adjacency[u].is_empty() {
+                roots.insert(u);
+            }
+            for p in &self.adjacency[u] {
+                if seen.insert(p.0) {
+                    stack.push(p.0);
+                }
+            }
+        }
+        roots
+    }
 }
 
 // -- Namespace-level DAG (SPEC-002 § DAG resolution) --------------------
@@ -133,26 +270,47 @@ pub(crate) struct NamespaceCycle {
 /// resolve. No documents/edges at all yields an empty DAG — the caller
 /// falls back to the default ladder (EARS-01.3).
 pub(crate) fn infer_namespace_dag(docs: &[Document]) -> Result<NamespaceDag, NamespaceCycle> {
-    let index = build_index(docs);
-
+    // Share the document graph's single resolution pass (DAG-001/DAG-003)
+    // rather than re-indexing and re-parsing here. The adjacency already
+    // holds only resolved edges, so unresolved/malformed entries are
+    // filtered out for free; intra-namespace edges are dropped here
+    // because they carry no pipeline-order information.
+    let graph = DepGraph::new(docs);
     let mut lifted: BTreeSet<(String, String)> = BTreeSet::new();
-    for doc in docs {
-        for entry in &doc.depends_on {
-            let Ok(id) = entry.parse::<DocumentId>() else {
-                continue;
-            };
-            if !index.contains_key(&id) || id.namespace == doc.id.namespace {
-                continue;
+    for (from, neighbours) in graph.adjacency.iter().enumerate() {
+        let from_ns = &docs[from].id.namespace;
+        for to in neighbours {
+            let to_ns = &docs[to.0].id.namespace;
+            if to_ns != from_ns {
+                lifted.insert((to_ns.clone(), from_ns.clone()));
             }
-            lifted.insert((id.namespace.clone(), doc.id.namespace.clone()));
         }
     }
 
+    build_dag_from_edges(lifted, BTreeSet::new())
+}
+
+/// Assemble the declared type-DAG from a set of namespace ordering edges
+/// (ADR-039 § DAG-001/DAG-002): run the same cycle check, transitive
+/// reduction, and Kahn topo sort `infer_namespace_dag` uses. The edge
+/// set is the union of every namespace's `core.dep-shape`
+/// `requires`/`allows` lifts and any `[pipeline].stages` adjacency
+/// (DAG-005). `extra_nodes` carries namespaces that must appear in the
+/// resolved order even when no edge touches them — e.g. an isolated
+/// single-stage `[pipeline]` (DAG-005). Empty edges *and* empty
+/// `extra_nodes` yields an empty DAG, so the caller falls back to the
+/// default ladder.
+pub(crate) fn build_dag_from_edges(
+    lifted: BTreeSet<(String, String)>,
+    extra_nodes: BTreeSet<String>,
+) -> Result<NamespaceDag, NamespaceCycle> {
     // Index the namespaces. `nodes` is name-sorted, so node-index
-    // order IS the EARS-01.6 tie-break order.
+    // order IS the EARS-01.6 tie-break order. Isolated stage nodes
+    // (`extra_nodes`) join the set so they appear in `order`.
     let nodes: Vec<String> = lifted
         .iter()
         .flat_map(|(from, to)| [from.clone(), to.clone()])
+        .chain(extra_nodes)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -256,28 +414,6 @@ fn reachable_avoiding(adj: &[Vec<usize>], from: usize, to: usize) -> bool {
     false
 }
 
-fn build_index(docs: &[Document]) -> BTreeMap<DocumentId, usize> {
-    // When duplicate ids collide we keep the first — callers care
-    // about presence here, not which instance.
-    let mut map = BTreeMap::new();
-    for (idx, doc) in docs.iter().enumerate() {
-        map.entry(doc.id.clone()).or_insert(idx);
-    }
-    map
-}
-
-fn adjacency_list(docs: &[Document], index: &BTreeMap<DocumentId, usize>) -> Vec<Vec<usize>> {
-    docs.iter()
-        .map(|doc| {
-            doc.depends_on
-                .iter()
-                .filter_map(|entry| entry.parse::<DocumentId>().ok())
-                .filter_map(|id| index.get(&id).copied())
-                .collect()
-        })
-        .collect()
-}
-
 // -- Tarjan's SCC ------------------------------------------------------
 //
 // Straightforward iterative Tarjan over the adjacency list. Output:
@@ -354,6 +490,7 @@ mod tests {
             depends_on: depends_on.into_iter().map(String::from).collect(),
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
+            pin: None,
             ast: Some(Ast::default()),
             body: String::new(),
         }
@@ -365,7 +502,7 @@ mod tests {
             doc("ADR-001", "a.md", vec!["PRD-001"]),
             doc("PRD-001", "b.md", vec![]),
         ];
-        assert!(unresolved_refs(&docs).is_empty());
+        assert!(DepGraph::new(&docs).unresolved().is_empty());
     }
 
     #[test]
@@ -374,7 +511,8 @@ mod tests {
             doc("ADR-099", "c.md", vec!["PRD-999"]),
             doc("PRD-001", "p.md", vec![]),
         ];
-        let refs = unresolved_refs(&docs);
+        let graph = DepGraph::new(&docs);
+        let refs = graph.unresolved();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].from_doc_idx, 0);
         assert_eq!(refs[0].raw_entry, "PRD-999");
@@ -383,7 +521,8 @@ mod tests {
     #[test]
     fn malformed_entry_reported_as_unresolved() {
         let docs = vec![doc("ADR-001", "a.md", vec!["not-an-id"])];
-        let refs = unresolved_refs(&docs);
+        let graph = DepGraph::new(&docs);
+        let refs = graph.unresolved();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].raw_entry, "not-an-id");
     }
@@ -391,7 +530,7 @@ mod tests {
     #[test]
     fn self_edge_reported_as_cycle() {
         let docs = vec![doc("ADR-001", "a.md", vec!["ADR-001"])];
-        let c = cycles(&docs);
+        let c = DepGraph::new(&docs).cycles();
         assert_eq!(c, vec![Cycle::SelfEdge { doc_idx: 0 }]);
     }
 
@@ -401,7 +540,7 @@ mod tests {
             doc("ADR-001", "a.md", vec!["ADR-002"]),
             doc("ADR-002", "b.md", vec!["ADR-001"]),
         ];
-        let c = cycles(&docs);
+        let c = DepGraph::new(&docs).cycles();
         assert_eq!(c.len(), 1);
         match &c[0] {
             Cycle::Scc { members } => assert_eq!(members, &vec![0, 1]),
@@ -417,7 +556,7 @@ mod tests {
             doc("ADR-001", "a.md", vec!["ADR-002"]),
             doc("ADR-002", "b.md", vec!["ADR-003"]),
         ];
-        let c = cycles(&docs);
+        let c = DepGraph::new(&docs).cycles();
         assert_eq!(c.len(), 1);
         match &c[0] {
             Cycle::Scc { members } => {
@@ -442,7 +581,7 @@ mod tests {
             doc("PRD-001", "p.md", vec!["SPR-001"]),
             doc("SPR-001", "s.md", vec![]),
         ];
-        assert!(cycles(&docs).is_empty());
+        assert!(DepGraph::new(&docs).cycles().is_empty());
     }
 
     #[test]
@@ -453,8 +592,69 @@ mod tests {
             doc("ADR-002", "b.md", vec!["ADR-001"]),
             doc("PRD-001", "p.md", vec![]),
         ];
-        let c = cycles(&docs);
+        let c = DepGraph::new(&docs).cycles();
         assert_eq!(c.len(), 1);
+    }
+
+    // -- ADR-059 § LIN-001/LIN-005: lineage closure over the transpose ----
+
+    #[test]
+    fn dependents_walks_the_transpose_not_the_forward_edges() {
+        // PRD-3 ← SPEC-9 ← TASK-4 (edges stored child→parent: SPEC-9 deps
+        // PRD-3, TASK-4 deps SPEC-9). A feature's members are the transitive
+        // DEPENDENTS of its root, reachable only over the transpose.
+        let docs = vec![
+            doc("PRD-003", "p.md", vec![]),
+            doc("SPEC-009", "s.md", vec!["PRD-003"]),
+            doc("TASK-004", "t.md", vec!["SPEC-009"]),
+        ];
+        let graph = DepGraph::new(&docs);
+        let prd = graph.index_of(&"PRD-003".parse().unwrap()).unwrap();
+        // Dependents of PRD-3 = the whole feature.
+        assert_eq!(graph.dependents(prd), BTreeSet::from([0, 1, 2]));
+    }
+
+    #[test]
+    fn dependents_of_a_leaf_returns_only_itself() {
+        // Fixture 3: the lineage of a leaf TASK is just that TASK — no
+        // forward walk into its prerequisites (EARS-04.1).
+        let docs = vec![
+            doc("PRD-003", "p.md", vec![]),
+            doc("SPEC-009", "s.md", vec!["PRD-003"]),
+            doc("TASK-004", "t.md", vec!["SPEC-009"]),
+        ];
+        let graph = DepGraph::new(&docs);
+        let task = graph.index_of(&"TASK-004".parse().unwrap()).unwrap();
+        assert_eq!(graph.dependents(task), BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn owning_roots_discloses_a_shared_nodes_two_roots() {
+        // SPEC-9 depended on by PRD-3 and PRD-7 → it belongs to both
+        // lineage roots (LIN-005). owning_roots walks prerequisites forward.
+        let docs = vec![
+            doc("PRD-003", "p3.md", vec![]),
+            doc("PRD-007", "p7.md", vec![]),
+            doc("SPEC-009", "s.md", vec!["PRD-003", "PRD-007"]),
+        ];
+        let graph = DepGraph::new(&docs);
+        let spec = graph.index_of(&"SPEC-009".parse().unwrap()).unwrap();
+        assert_eq!(graph.owning_roots(spec), BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn owning_roots_of_a_root_is_itself() {
+        let docs = vec![doc("PRD-003", "p.md", vec![])];
+        let graph = DepGraph::new(&docs);
+        assert_eq!(graph.owning_roots(0), BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn index_of_resolves_present_and_misses_absent() {
+        let docs = vec![doc("PRD-003", "p.md", vec![])];
+        let graph = DepGraph::new(&docs);
+        assert_eq!(graph.index_of(&"PRD-003".parse().unwrap()), Some(0));
+        assert_eq!(graph.index_of(&"PRD-999".parse().unwrap()), None);
     }
 
     // -- SPEC-002 T1.2: namespace DAG inference (EARS-01.2/01.5/01.6) ----

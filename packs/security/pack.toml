@@ -1,0 +1,181 @@
+# summary: Security-document lifecycle (THREAT/VULN/RISK/SECREV/DEPAUDIT) plus neutral governance (POLICY/ASSET) — framework-neutral evidence discipline, no certification intent.
+
+# Threat models (ADR-041 SEC-003). STRIDE coverage is enforced as
+# required headings — a missing category is an unanalyzed threat class,
+# not a formatting lapse. The commit pin (require-pin) makes the model
+# re-runnable: when the trust boundary's code moves past the pinned
+# commit, core.commit-freshness flags the model stale. Path-claim, but
+# carries an `id` (core.id) so it resolves as a cross-ref target.
+[THREAT]
+paths = ["docs/security/threat-models/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.commit-freshness",
+]
+
+[THREAT."core.required-headings"]
+headings = ["Spoofing", "Tampering", "Repudiation", "Information Disclosure", "Denial of Service", "Elevation of Privilege"]
+
+[THREAT."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[THREAT."core.commit-freshness"]
+require-pin = true
+
+# Vulnerability findings (ADR-041 SEC-004, SEC-005, SEC-006). The fixed
+# severity/status vocabularies make findings sortable across the program.
+# security.vuln-sla flags an open critical/high finding past its
+# per-severity SLA window; security.risk-expiry forces an accepted
+# finding to be signed and time-boxed (or to link a RISK);
+# security.remediation-link forces a mitigated finding to cross-ref its
+# fix. Path-claim with an `id` so PMR action items and RISK docs can
+# cross-ref a finding.
+[VULN]
+paths = ["docs/security/findings/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "security.vuln-sla",
+  "security.risk-expiry",
+  "security.remediation-link",
+]
+
+[VULN."core.required-metadata"]
+keys = ["id", "title", "status", "severity", "discovered_date"]
+
+[VULN."core.allowed-values"]
+severity = ["critical", "high", "medium", "low", "info"]
+status = ["open", "mitigated", "accepted", "false-positive"]
+
+# Per-severity SLA windows in days; a severity omitted here is never
+# SLA-flagged (medium/low/info age silently). `severity` sets the
+# diagnostic level (error gates all of `make check`; downgrade to
+# "warning" for the main gate and run "error" in a dedicated security job).
+[VULN."security.vuln-sla"]
+windows = { critical = 7, high = 30 }
+severity = "error"
+
+# An accepted finding must be signed + time-boxed inline, unless it
+# links a RISK document (which then carries those fields canonically).
+[VULN."security.risk-expiry"]
+require-when-status = "accepted"
+exempt-when-links = "RISK"
+
+# A mitigated finding must cross-ref (or depend_on) its remediation —
+# an ADR or tracker id — so the fix is falsifiable, not "trust me".
+[VULN."security.remediation-link"]
+require-when-status = "mitigated"
+
+# Risk acceptances (ADR-041 SEC-005): signed and time-boxed. Every
+# acceptance carries an approver, a rationale, and a future-dated
+# `expires`, forcing the risk back up for re-decision on a date.
+# security.risk-expiry with no params applies unconditionally here.
+[RISK]
+paths = ["docs/security/risk-acceptances/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "security.risk-expiry",
+]
+
+[RISK."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+# Security reviews (ADR-041 SEC-006): release sign-offs and pentests,
+# kept fresh on a calendar cadence. Dependency audits are the separate
+# DEPAUDIT namespace (commit-pin, not calendar — a different freshness
+# axis). A pentest past its review interval is flagged stale.
+[SECREV]
+paths = ["docs/security/reviews/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.calendar-freshness",
+]
+
+[SECREV."core.required-metadata"]
+keys = ["id", "title", "status", "kind", "reviewed_date"]
+
+[SECREV."core.allowed-values"]
+kind = ["release-signoff", "pentest"]
+
+[SECREV."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 90
+
+# Dependency audits (ADR-041 SEC-006): split from SECREV because their
+# freshness is a code fact, not a time fact. The author sets pin.scope
+# to their lockfiles; when those move past the pinned commit,
+# core.commit-freshness flags the audit stale.
+[DEPAUDIT]
+paths = ["docs/security/dependency-audits/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.commit-freshness",
+]
+
+[DEPAUDIT."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+[DEPAUDIT."core.commit-freshness"]
+require-pin = true
+
+# Policies (ADR-041 SEC-002): framework-neutral governance, reused by
+# the compliance packs. Requires an owner and an approver, and is kept
+# fresh on a yearly review cadence.
+[POLICY]
+paths = ["docs/security/policies/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.calendar-freshness",
+]
+
+[POLICY."core.required-metadata"]
+keys = ["id", "title", "status", "owner", "approved_by"]
+
+[POLICY."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 365
+
+# Asset inventory (ADR-041 SEC-002): framework-neutral governance. Every
+# asset carries a data classification from a fixed vocabulary.
+[ASSET]
+paths = ["docs/security/assets/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[ASSET."core.required-metadata"]
+keys = ["id", "title", "data_classification"]
+
+[ASSET."core.allowed-values"]
+data_classification = ["public", "internal", "confidential", "restricted"]

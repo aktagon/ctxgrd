@@ -7,12 +7,29 @@
 # prediction test — are semantic and are NOT linted; validate them by running
 # prompts through a model (the spec's own method). See ADR-034 § STY-005 and
 # ADR-035 § SOUL-005.
+#
+# A persona doc the agent guide never loads is a dead file. The soul.referenced
+# / style.referenced rules (below) lint this automatically: each fires on the
+# persona file and warns when an agent guide (CLAUDE.md / AGENTS.md / GEMINI.md)
+# exists but does not reference it — silent when no guide exists, since a persona
+# may be loaded directly by a runtime (ADR-047). A markdown link or an @import
+# satisfies the reference.
+#
+# These fire from the persona side on purpose: a file is claimed by exactly one
+# namespace, so a rule running *on* CLAUDE.md must live under [AGENTS]. The
+# guide-side equivalent is the generic core.requires-link (ADR-046), opt-in on
+# your [AGENTS] namespace for arbitrary targets:
+#
+#   [AGENTS."core.requires-link"]
+#   targets  = ["SOUL.md", "STYLE.md"]
+#   severity = "warning"
 
 [SOUL]
 paths = ["SOUL.md", "soul/SOUL.md"]
 rules = [
     "core.frontmatter",
     "soul.sections",
+    "soul.referenced",
 ]
 
 [STYLE]
@@ -21,4 +38,5 @@ rules = [
     "core.frontmatter",
     "style.section-order",
     "style.soul-pair",
+    "style.referenced",
 ]
