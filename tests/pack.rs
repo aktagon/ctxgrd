@@ -74,6 +74,27 @@ fn pack_show_is_read_only() {
 }
 
 #[test]
+fn pack_show_intake_lists_cr_and_feedback() {
+    // ADR-079 § INT-001: the intake pack exposes exactly the CR and FEEDBACK
+    // namespaces; project-docs is unchanged (still no CR).
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(tmp.path(), &["pack", "show", "intake"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for ns in ["[CR]", "[FEEDBACK]"] {
+        assert!(stdout.contains(ns), "intake shows {ns}:\n{stdout}");
+    }
+    // INT-001: intake is a dedicated pack, not a re-add of CR to project-docs.
+    let docs = run(tmp.path(), &["pack", "show", "project-docs"]);
+    assert_eq!(docs.status.code(), Some(0));
+    let docs_out = String::from_utf8(docs.stdout).unwrap();
+    assert!(
+        !docs_out.contains("[CR]"),
+        "project-docs must still list no CR:\n{docs_out}"
+    );
+}
+
+#[test]
 fn pack_add_never_clobbers_existing_namespace() {
     let tmp = tempfile::tempdir().unwrap();
     let original = "[ADR]\nrules = [\"core.id\"]\n";
@@ -1091,4 +1112,209 @@ fn ears_clause_syntax_default_in_both_packs() {
             "ears.clause-syntax is a {pack} pack default:\n{stdout}"
         );
     }
+}
+
+// -- ddd pack (ADR-082) -----------------------------------------------
+
+/// A complete, clean BOUNDEDCONTEXT doc body with all eight required
+/// headings and the five required metadata keys. Callers mutate a copy to
+/// inject a single defect.
+fn clean_bc_doc(id: &str, subdomain_type: &str) -> String {
+    format!(
+        "---\nid: {id}\ntitle: Billing\nstatus: active\nowner: platform-team\n\
+         subdomain_type: {subdomain_type}\n---\n\n\
+         ## Purpose\nWhat this context owns.\n\n\
+         ## Ubiquitous Language\nInvoice, Charge, Dunning.\n\n\
+         ## Aggregates\nInvoice.\n\n\
+         ## Domain Events\nInvoiceIssued.\n\n\
+         ## Boundaries\nOwns billing, not the ledger.\n\n\
+         ## Team / Ownership\nPlatform team.\n\n\
+         ## Open Questions\nNone.\n\n\
+         ## References\nADR 082.\n"
+    )
+}
+
+#[test]
+fn pack_list_includes_ddd() {
+    // DDD-001: the ddd pack is a distinct builtin pack.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(tmp.path(), &["pack", "list"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("ddd"), "lists ddd:\n{stdout}");
+}
+
+#[test]
+fn pack_show_ddd_lists_exactly_two_namespaces() {
+    // DDD-001 / DDD-005: exactly BOUNDEDCONTEXT and CONTEXTMAP — no tactical
+    // AGGREGATE/DOMAINEVENT/GLOSSARY namespaces.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(tmp.path(), &["pack", "show", "ddd"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("[BOUNDEDCONTEXT]"),
+        "shows [BOUNDEDCONTEXT]:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[CONTEXTMAP]"),
+        "shows [CONTEXTMAP]:\n{stdout}"
+    );
+    for absent in ["[AGGREGATE]", "[DOMAINEVENT]", "[GLOSSARY]"] {
+        assert!(
+            !stdout.contains(absent),
+            "{absent} must not appear (DDD-005):\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn pack_add_ddd_writes_both_blocks() {
+    // DDD-001 verification: `pack add ddd` writes [BOUNDEDCONTEXT] and
+    // [CONTEXTMAP] into ctxgrd.toml. ddd declares no `depends`, so no base
+    // pack is pulled.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(tmp.path(), &["pack", "add", "ddd"]);
+    assert_eq!(out.status.code(), Some(0));
+    let result = fs::read_to_string(tmp.path().join("ctxgrd.toml")).unwrap();
+    assert!(
+        result.contains("[BOUNDEDCONTEXT]"),
+        "[BOUNDEDCONTEXT] written:\n{result}"
+    );
+    assert!(
+        result.contains("[CONTEXTMAP]"),
+        "[CONTEXTMAP] written:\n{result}"
+    );
+    assert!(
+        result.contains("ddd.context-map-shape"),
+        "binds ddd.context-map-shape:\n{result}"
+    );
+}
+
+#[test]
+fn ddd_bounded_context_clean_doc_lints_green() {
+    // DDD-002 verification: a complete BOUNDEDCONTEXT doc lints clean.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    assert_eq!(run(root, &["pack", "add", "ddd"]).status.code(), Some(0));
+    fs::create_dir_all(root.join("docs/ddd/bounded-contexts")).unwrap();
+    fs::write(
+        root.join("docs/ddd/bounded-contexts/billing.md"),
+        clean_bc_doc("BOUNDEDCONTEXT-1", "core"),
+    )
+    .unwrap();
+
+    let out = run(root, &["lint"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean BOUNDEDCONTEXT lints green:\n{stdout}"
+    );
+}
+
+#[test]
+fn ddd_bounded_context_flags_missing_heading_metadata_and_value() {
+    // DDD-002 verification: a BC missing a required heading, one missing
+    // subdomain_type, and one with an out-of-allowlist subdomain_type each
+    // assert their diagnostic.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    assert_eq!(run(root, &["pack", "add", "ddd"]).status.code(), Some(0));
+    let dir = root.join("docs/ddd/bounded-contexts");
+    fs::create_dir_all(&dir).unwrap();
+
+    // Missing the `## Domain Events` heading.
+    fs::write(
+        dir.join("no-heading.md"),
+        clean_bc_doc("BOUNDEDCONTEXT-1", "core").replace("## Domain Events\nInvoiceIssued.\n\n", ""),
+    )
+    .unwrap();
+    // Missing the subdomain_type metadata key.
+    fs::write(
+        dir.join("no-subdomain.md"),
+        clean_bc_doc("BOUNDEDCONTEXT-2", "core").replace("subdomain_type: core\n", ""),
+    )
+    .unwrap();
+    // subdomain_type outside the allowlist.
+    fs::write(
+        dir.join("bad-value.md"),
+        clean_bc_doc("BOUNDEDCONTEXT-3", "peripheral"),
+    )
+    .unwrap();
+
+    let out = run(root, &["lint"]);
+    assert_eq!(out.status.code(), Some(1), "diagnostics present");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("core.required-headings"),
+        "missing heading fires core.required-headings:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("core.required-metadata"),
+        "missing subdomain_type fires core.required-metadata:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("core.allowed-values"),
+        "out-of-allowlist subdomain_type fires core.allowed-values:\n{stdout}"
+    );
+}
+
+#[test]
+fn ddd_context_map_valid_edge_lints_green_and_bad_edge_fires() {
+    // DDD-003 verification: a valid two-endpoint map lints clean; a one-BC
+    // map fires ddd.context-map-shape.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    assert_eq!(run(root, &["pack", "add", "ddd"]).status.code(), Some(0));
+    let bc_dir = root.join("docs/ddd/bounded-contexts");
+    let map_dir = root.join("docs/ddd/context-maps");
+    fs::create_dir_all(&bc_dir).unwrap();
+    fs::create_dir_all(&map_dir).unwrap();
+    fs::write(
+        bc_dir.join("billing.md"),
+        clean_bc_doc("BOUNDEDCONTEXT-1", "core"),
+    )
+    .unwrap();
+    fs::write(
+        bc_dir.join("ledger.md"),
+        clean_bc_doc("BOUNDEDCONTEXT-2", "supporting"),
+    )
+    .unwrap();
+
+    // A valid symmetric Partnership edge between the two contexts.
+    fs::write(
+        map_dir.join("billing-ledger.md"),
+        "---\nid: CONTEXTMAP-1\ntitle: Billing <-> Ledger\npattern: Partnership\n\
+         depends_on:\n  - BOUNDEDCONTEXT-1\n  - BOUNDEDCONTEXT-2\n---\n\n\
+         Two teams evolve billing and ledger together.\n",
+    )
+    .unwrap();
+    let out = run(root, &["lint"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "valid two-endpoint map lints green:\n{stdout}"
+    );
+
+    // Now break it: only one endpoint.
+    fs::write(
+        map_dir.join("billing-ledger.md"),
+        "---\nid: CONTEXTMAP-1\ntitle: Billing edge\npattern: Partnership\n\
+         depends_on:\n  - BOUNDEDCONTEXT-1\n---\n\n\
+         A dangling half-edge.\n",
+    )
+    .unwrap();
+    let out = run(root, &["lint"]);
+    assert_eq!(out.status.code(), Some(1), "one-endpoint map fails");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("ddd.context-map-shape"),
+        "one-endpoint map fires ddd.context-map-shape:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("exactly 2 BOUNDEDCONTEXT contexts, found 1"),
+        "names the cardinality gap:\n{stdout}"
+    );
 }

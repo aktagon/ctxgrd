@@ -1,0 +1,54 @@
+# summary: Inbound requests from downstream repos — CR (a JSM-Change-shaped, id'd, linted change request) and FEEDBACK (a light id-keyed note record: id/source/date, free-form body, on the HubSpot/Jira fields-over-headings model). ADR-079.
+# Two namespaces, opposite ceremony verdicts (the load-bearing asymmetry of
+# ADR-079). CR is a structured intake record modelled on a Jira Service
+# Management Change: id-claimed (CR-NNN), a status vocabulary, a `source`
+# (the JSM "reporter" — the filing repo, free text), and a minimal Summary /
+# References spine. FEEDBACK is the frictionless shoebox — path-claimed on
+# docs/feedback/**, id-less and frontmatter-free, with a single presence nudge
+# (core.min-docs) and nothing else, so a downstream repo can drop a dated note
+# and move on. Only Jira's type + field vocabulary is borrowed, never its
+# workflow engine: `status` is set-membership validation (core.allowed-values),
+# not an enforced state machine (ADR-079 § INT-005).
+
+[CR]
+paths = ["docs/cr/**"]
+rules = [
+    "core.frontmatter",
+    "core.id",
+    "core.id-unique",
+    "core.cross-ref",
+    "core.required-headings",
+    "core.required-metadata",
+    "core.allowed-values",
+]
+
+[CR."core.required-metadata"]
+keys = ["id", "title", "status", "date", "source"]
+
+[CR."core.allowed-values"]
+status = ["proposed", "accepted", "declined", "implemented", "superseded"]
+
+[CR."core.required-headings"]
+headings = ["Summary", "References"]
+
+# FEEDBACK — the intake note channel (ADR-079 § INT-003), modelled on how real
+# intake tools (Jira Service Management, HubSpot tickets, Canny) actually shape a
+# request: a small set of structured FIELDS plus a free-form body, and a ticket
+# id on every item. So FEEDBACK is a light id-keyed record — `id` (FEEDBACK-NNN,
+# the "ticket number"), `source` (the reporting repo — Jira "reporter" / HubSpot
+# "source"), and `date` — with NO required headings: the body stays free-form,
+# the way every one of those tools leaves its Description. Path-claimed on
+# docs/feedback/**; id-keyed exactly like [BUG]. (An id-less multi-file namespace
+# is not expressible in ctxgrd — enforcing any field routes a file through the
+# id-keyed pipeline — and no real intake system is id-less anyway.)
+[FEEDBACK]
+paths = ["docs/feedback/**"]
+rules = [
+    "core.frontmatter",
+    "core.id",
+    "core.id-unique",
+    "core.required-metadata",
+]
+
+[FEEDBACK."core.required-metadata"]
+keys = ["id", "source", "date"]

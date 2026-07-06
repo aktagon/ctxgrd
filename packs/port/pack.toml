@@ -1,0 +1,83 @@
+# summary: PORT — a per-subsystem porting-parity tracker. One markdown doc per
+# subsystem of the ORIGINAL software, citing its source (original_source) and the
+# revision it was ported against (original_ref), carrying a parity status, and
+# declaring how equivalence is proven (## Verification). Reusable across any
+# port/reimplementation effort — a language migration, an engine rewrite, a
+# proprietary→open reimplementation — not tied to any one project.
+#
+# The path glob claims only the numbered id-keyed docs (docs/ports/NNN-*.md), so a
+# human index at docs/ports/README.md co-exists without being linted as a PORT doc.
+# ([ignore] cannot exclude it — an explicit namespace path-claim overrides [ignore].)
+#
+# id-keyed series: docs/ports/NNN-*.md is a glob (a directory of documents), so
+# ctxgrd treats it like BUG/ARC42 — each doc carries `id: PORT-<n>`. `depends_on` edges
+# between docs encode the porting build order and are enforced acyclic by
+# core.dep-cycle; core.dep-resolved/core.cross-ref key off the same ids. The id
+# is what makes the port surface a referable dependency graph rather than loose
+# files — do not drop core.id.
+#
+# ── Convention keys core rules cannot enforce ────────────────────────────────
+# core.required-metadata only supports required-and-present keys (no optional
+# key, no conditional-by-status), so two useful fields are CONVENTIONS, not
+# lint-enforced — add them to a doc's frontmatter when known:
+#   target_source:  where the port landed (symmetric to original_source), e.g.
+#                   `target_source: app/scripts/simulation.gd`
+#   owner:          who owns this subsystem's port (team ports)
+# `derivation` (below) IS enforced, but only validate-if-present: a doc without
+# it lints clean; a doc with a value outside the enum is flagged. This models an
+# optional-but-vocabulary-checked provenance field.
+#
+# ── Future enhancement (NOT built here) ──────────────────────────────────────
+# A conditional rule — e.g. require a `## Divergence Rationale` section only when
+# `status: diverged`, or require an evidence link only when `parity-verified` —
+# is not expressible in core.* params (they are unconditional). It would be a
+# bundled external rule script in this pack (a `scripts/` entry). Left as future
+# work; the unconditional `## Verification` heading covers the common case today.
+
+[PORT]
+paths = ["docs/ports/[0-9]*.md"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+# Original: the source subsystem and its behavior. Target: the new design.
+# Parity Criteria: what "equivalent" means. Verification: how that equivalence is
+# actually checked (test / replay diff / golden fixture path) — a not-started doc
+# writes "pending", so the section is never empty of intent.
+[PORT."core.required-headings"]
+headings = ["Original", "Target", "Parity Criteria", "Verification"]
+
+# original_source: the origin file(s)/module(s). original_ref: the revision
+# (commit sha / tag / version) the port was made against — without it, a
+# parity claim is unfalsifiable once upstream moves.
+[PORT."core.required-metadata"]
+keys = ["id", "title", "status", "original_source", "original_ref"]
+
+# Parity lifecycle: nothing done → work underway → equivalence proven against the
+# original → an intentional, documented departure from the original.
+[PORT."core.allowed-values"]
+status = ["not-started", "in-progress", "parity-verified", "diverged"]
+# Provenance of the ported code — a legal question distinct from technical
+# parity. Optional (validate-if-present): omit it, or set one of these.
+derivation = ["clean-room", "reference-only", "transliterated"]
+# Per-subsystem porting strategy — the load-bearing choice (a port is one
+# decision per subsystem, chosen by API-surface size and determinism risk):
+#   translate — keep the legacy API surface, swap the implementation underneath
+#               (bit-faithful; e.g. D3D8 kept, run by DXVK)
+#   shim      — reimplement a thin API on the new platform's primitives
+#               (scattered OS calls; e.g. Win32 → POSIX compat headers)
+#   swap      — add a new backend behind an interface the original already had
+#               (a Device/Manager/Driver seam; e.g. OpenAL beside Miles)
+#   stub      — non-gameplay-critical, stubbed now / implemented later
+#   rewrite   — no translator and no thin shim is possible; new implementation
+#               (last resort; e.g. a clean-room reimplementation on a new engine)
+# Optional (validate-if-present).
+strategy = ["translate", "shim", "swap", "stub", "rewrite"]

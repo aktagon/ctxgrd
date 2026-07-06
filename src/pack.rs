@@ -38,11 +38,16 @@ const GEMINI_TOML: &str = include_str!("../packs/gemini/pack.toml");
 const OPENCODE_TOML: &str = include_str!("../packs/opencode/pack.toml");
 const GUIDE_TOML: &str = include_str!("../packs/guide/pack.toml");
 const C4_TOML: &str = include_str!("../packs/c4/pack.toml");
+const CHECKLIST_TOML: &str = include_str!("../packs/checklist/pack.toml");
+const INTAKE_TOML: &str = include_str!("../packs/intake/pack.toml");
 const GDPR_TOML: &str = include_str!("../packs/gdpr/pack.toml");
 const HIPAA_TOML: &str = include_str!("../packs/hipaa/pack.toml");
 const SOC2_TOML: &str = include_str!("../packs/soc2/pack.toml");
 const ISO27001_TOML: &str = include_str!("../packs/iso-27001/pack.toml");
 const NIST80053_TOML: &str = include_str!("../packs/nist-800-53/pack.toml");
+const GITHUB_TOML: &str = include_str!("../packs/github/pack.toml");
+const GITLAB_TOML: &str = include_str!("../packs/gitlab/pack.toml");
+const DDD_TOML: &str = include_str!("../packs/ddd/pack.toml");
 
 /// A discovered pack, normalised across the three discovery sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +165,9 @@ pub struct AddPlan {
 /// 27001:2022 Annex A catalog) and ADR-071 added `nist-800-53` (the NIST80053
 /// register over the SP 800-53 Rev 5 family catalog) as further register-only
 /// family members, each with its own conditional-evidence rule delegating to
-/// the shared evidence_gap core.
+/// the shared evidence_gap core. ADR-082 added `ddd` (strategic Domain-Driven
+/// Design: the id-claimed BOUNDEDCONTEXT and CONTEXTMAP namespaces typed on the
+/// dependency graph, with one new builtin `ddd.context-map-shape` rule).
 /// ADR-052's `machine-learning` pack was reverted in 0.31.0 (see its
 /// Change log).
 pub fn builtin_packs() -> Vec<Pack> {
@@ -327,6 +334,43 @@ pub fn builtin_packs() -> Vec<Pack> {
             rules: Vec::new(),
         },
         Pack {
+            // CHECKLIST namespace — path-claimed on docs/checklists/**. Turns a
+            // markdown checklist into an auditable, commit-pinned sign-off:
+            // `checklist.structure` (title + living|sealed status + a pin when
+            // sealed + ≥1 box), `checklist.complete` (sealed ⇒ 0 unchecked), and
+            // `checklist.pinned` (sealed ⇒ pinned_commit resolves + ancestor of
+            // HEAD). It also binds the generic, config-driven
+            // `core.required-headings` (shipped with no section set — a project
+            // supplies its own, e.g. the seven-phase Stripe shape). id-less: the
+            // filename is the slug. No external scripts. ADR-078.
+            name: "checklist".to_string(),
+            summary: summary_of(CHECKLIST_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: CHECKLIST_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // CR/FEEDBACK — the inbound-request intake pack (ADR-079). CR is a
+            // JSM-Change-shaped, id-claimed namespace (CR-NNN) under docs/cr/**:
+            // core.frontmatter/id/id-unique/cross-ref/required-headings
+            // (Summary + References) plus core.required-metadata (id, title,
+            // status, date, and the new `source` reporter key) and
+            // core.allowed-values gating the status vocabulary. FEEDBACK is the
+            // deliberately ceremony-light channel (INT-003), path-claimed on
+            // docs/feedback/** with a single core.min-docs presence nudge and no
+            // id / metadata / heading schema, so the existing frontmatter-less
+            // feedback notes stay clean. Every guardrail is a core.* rule, so
+            // `rules` (external scripts) is empty. Supersedes the fold-CR-into-
+            // project-docs proposal; amends ADR-023 § PKC-002 for external intake.
+            name: "intake".to_string(),
+            summary: summary_of(INTAKE_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: INTAKE_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
             // ROPA/DPIA/DPA — the GDPR documentary spine (Regulation (EU)
             // 2016/679 Arts. 30/35/28), path-claimed under
             // docs/compliance/gdpr/. A thin pack on `security` (POLICY/RISK/VULN
@@ -413,6 +457,59 @@ pub fn builtin_packs() -> Vec<Pack> {
             source_label: "built-in".to_string(),
             rank: 0,
             toml_text: NIST80053_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // CONTRIBUTING/CODEOFCONDUCT/SECURITYDOC/SUPPORT — the markdown
+            // community-health files GitHub recognizes (root, .github/, or
+            // docs/), path-claimed and id-less with a single warning-severity
+            // core.min-docs existence nudge. README stays in project-docs;
+            // LICENSE is excluded (host detection needs verbatim SPDX text).
+            // Shares the [CONTRIBUTING] namespace name with the gitlab pack, so
+            // the two compose via never-clobber `pack add` rather than conflict
+            // (ADR-077 § CHF-005).
+            name: "github".to_string(),
+            summary: summary_of(GITHUB_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: GITHUB_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // CONTRIBUTING/CHANGELOG — the markdown files GitLab's repository UI
+            // surfaces beyond README/LICENSE (CHANGELOG is first-class on GitLab,
+            // generated from git trailers). Path-claimed, id-less, warning-severity
+            // core.min-docs existence nudge. CODE_OF_CONDUCT/SECURITY/SUPPORT are
+            // GitHub-only, so they live in the github pack, not here. Shares the
+            // [CONTRIBUTING] namespace name with the github pack, so the two compose
+            // via never-clobber `pack add` rather than conflict (ADR-077 § CHF-005).
+            name: "gitlab".to_string(),
+            summary: summary_of(GITLAB_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: GITLAB_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // BOUNDEDCONTEXT/CONTEXTMAP — strategic Domain-Driven Design docs
+            // typed on the dependency graph (ADR-082). Both namespaces are
+            // id-claimed: a BOUNDEDCONTEXT is the anchor context artifact
+            // (Ubiquitous Language, aggregates, and domain events folded in as
+            // headings for the MVP, DDD-005), and a CONTEXTMAP models one Evans
+            // strategic-pattern relationship edge per file via
+            // depends_on: [BOUNDEDCONTEXT-x, BOUNDEDCONTEXT-y]. Every guardrail
+            // is a core.*/ddd.* rule, so `rules` (external scripts) is empty.
+            // The one new builtin, ddd.context-map-shape, adds the "exactly two
+            // endpoints" cardinality and the pattern-conditional upstream/
+            // downstream direction check core.dep-shape cannot express — the
+            // soc2.control-evidence if/then precedent. DDD is deliberately NOT
+            // path-claimed like c4/guide (DDD-004) and stays a sibling of the c4
+            // pack (a Bounded Context is not a C4 Container, DDD-006).
+            name: "ddd".to_string(),
+            summary: summary_of(DDD_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: DDD_TOML.to_string(),
             rules: Vec::new(),
         },
     ]

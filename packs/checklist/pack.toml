@@ -1,0 +1,44 @@
+# summary: CHECKLIST — turns a markdown checklist into an auditable, commit-pinned sign-off: every box checked and the sealed state pinned to a real, in-history commit.
+# Checklists are path-claimed at docs/checklists/**, id-less (the filename is the
+# slug) and frontmatter-light: a `title` and a two-state `status` (living | sealed).
+# A `living` checklist — the reusable template or an in-flight instance — is never
+# gated on completeness; a `sealed` one is a signed-off record and is hard-gated:
+# zero unchecked boxes (checklist.complete) and a `pinned_commit` that resolves and
+# is an ancestor of HEAD (checklist.pinned). So a green sealed checklist is an
+# auditable sign-off tied to a named integration commit, not an aspirational list.
+#
+# checklist.pinned shells out to git, so CI must fetch enough history for the
+# ancestor check (`fetch-depth: 0`); it degrades to a warning in a shallow clone
+# rather than a false error.
+#
+# core.required-headings is generic and config-driven: bound here but shipped with
+# no `headings` (a bare checklist requires no particular sections). Supply the
+# section set per project — e.g. the seven-phase Stripe integration shape below,
+# uncommented. The state lives under `status`, never a top-level `type:` (an
+# SSG-reserved layout key, BUG-015). ADR-078.
+
+[CHECKLIST]
+paths = ["docs/checklists/**"]
+rules = [
+    "checklist.structure",
+    "checklist.complete",
+    "checklist.pinned",
+    "core.required-headings",
+]
+
+# Required H2 sections. Config-driven, not baked into the binary: matching strips a
+# leading enumerator (`1.`, `A.`) and is case-insensitive, so a heading may be
+# numbered (`## 1. Plan / account structure`) while the config is not. Left empty
+# by default — a bare checklist asserts no particular sections. Uncomment and adapt
+# to require a shape, e.g. the Stripe web-integration checklist (ADR-078 § CHK-006):
+#
+# [CHECKLIST."core.required-headings"]
+# headings = [
+#     "Plan / account structure",
+#     "API key provisioning",
+#     "Secret storage",
+#     "Implement",
+#     "Test",
+#     "Go-live",
+#     "Post-go-live",
+# ]

@@ -23,6 +23,7 @@
 pub(crate) mod agent_guide;
 pub(crate) mod ast;
 pub(crate) mod builtin_rules;
+pub mod changelog;
 pub mod config;
 pub(crate) mod dag;
 pub mod diagnostic;

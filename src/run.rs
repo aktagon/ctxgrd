@@ -398,6 +398,17 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
         .with_help(format!(
             "use a status from [{namespace}.\"core.allowed-values\"].status, or add '{status}' to it"
         )),
+        C::ChangelogInvalid { detail } => Diagnostic::error(
+            "cfg.changelog-invalid",
+            "ctxgrd.toml",
+            0,
+            0,
+            format!("[changelog] {detail}"),
+        )
+        .with_help(
+            "expected `[changelog]\\nnamespaces = [\"BUG\"]` with a `[changelog.BUG]` \
+             table declaring `when` (terminal status) and `section` (Keep-a-Changelog category)",
+        ),
     }
 }
 

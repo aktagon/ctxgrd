@@ -79,7 +79,7 @@ test:
 # scenarios in tests/status.rs). Point CI at this single target.
 ci: check test
 
-check: adr-lint
+check: adr-lint changelog-check
 	$(CARGO) check --all-targets
 	$(CARGO) clippy --lib --no-deps -- -D warnings
 
@@ -92,6 +92,17 @@ adr-lint:
 	else \
 	  echo "ctxgrd not on PATH — using local debug build"; \
 	  $(CARGO) run --quiet -- ; \
+	fi
+
+# Gate CHANGELOG.md freshness (ADR-084 § CHG-001/CHG-005): the committed
+# changelog must match what `ctxgrd changelog --write` would regenerate.
+# Same install-or-local-debug fallback as adr-lint.
+changelog-check:
+	@if command -v ctxgrd > /dev/null 2>&1; then \
+	  ctxgrd changelog --check; \
+	else \
+	  echo "ctxgrd not on PATH — using local debug build"; \
+	  $(CARGO) run --quiet -- changelog --check; \
 	fi
 
 lint: check

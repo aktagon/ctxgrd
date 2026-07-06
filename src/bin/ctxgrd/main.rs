@@ -25,6 +25,7 @@ use ctxgrd::diagnostic::Diagnostic;
 use ctxgrd::reporter;
 use ctxgrd::run;
 
+mod changelog;
 mod hooks;
 mod introspect;
 mod lint;
@@ -308,6 +309,25 @@ enum Cmd {
         #[command(subcommand)]
         action: PackAction,
     },
+    /// Generate CHANGELOG.md from the document graph (ADR-084).
+    ///
+    /// Reads the whitelisted namespace documents at each release tag and
+    /// attributes each to the first release whose frozen tree marks it
+    /// terminal; released sections are immutable because they are read from
+    /// tags. With no flag, prints the generated markdown to stdout.
+    Changelog {
+        /// Regenerate CHANGELOG.md in place.
+        #[arg(long)]
+        write: bool,
+        /// Regenerate to memory and diff against the file on disk; exit 1
+        /// if they differ (the `cargo fmt --check` contract). Writes nothing.
+        #[arg(long)]
+        check: bool,
+        /// Output format. `json` emits the structured changelog (versions →
+        /// sections → entries) on a clean stdout for agent drivers.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
+    },
     /// Manage commit pins on documents (ADR-040).
     Pin {
         /// Re-pin the named document's `pin.commit` to the current HEAD,
@@ -512,6 +532,11 @@ fn dispatch() -> Result<ExitCode> {
                 pack::pack_migrate_cmd(&cli.root, dry_run, format)
             }
         },
+        Cmd::Changelog {
+            write,
+            check,
+            format,
+        } => changelog::changelog_cmd(&cli.root, write, check, format),
         Cmd::Pin { bless, force } => pin::pin_bless_cmd(&cli.root, &bless, force),
     }
 }

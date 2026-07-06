@@ -1,0 +1,31 @@
+# summary: GitLab community-health files — CONTRIBUTING and CHANGELOG — path-claimed as id-less docs with a warning-severity existence nudge. README/LICENSE excluded; CHANGELOG is first-class on GitLab. ADR-077.
+# The markdown files GitLab's repository UI surfaces beyond README/LICENSE:
+# CONTRIBUTING (linked from new issues/MRs) and CHANGELOG (first-class — GitLab
+# generates CHANGELOG.md from `Changelog:` git trailers via the /changelog API).
+# Each is id-less and frontmatter-free, path-claimed on its filename, with a single
+# existence nudge (core.min-docs at warning severity); a repo that never installs
+# the pack stays silent (ADR-007 § DOC-001).
+#
+# README is owned by the project-docs [README] namespace, not re-claimed here.
+# LICENSE is excluded — GitLab detects it only as verbatim SPDX text, which markdown
+# defeats (ADR-077 § CHF-004). CODE_OF_CONDUCT / SECURITY / SUPPORT live in the
+# github pack, not here: GitLab gives them no special handling.
+#
+# The github and gitlab packs share the [CONTRIBUTING] namespace name, so they
+# compose rather than conflict: `pack add` is never-clobber (PACK-001), so a repo
+# mirrored to both hosts can install both — the first-added CONTRIBUTING globs win
+# and this pack still contributes [CHANGELOG] (ADR-077 § CHF-005).
+
+[CONTRIBUTING]
+paths = ["CONTRIBUTING.md", ".gitlab/CONTRIBUTING.md"]
+rules = ["core.min-docs"]
+
+[CONTRIBUTING."core.min-docs"]
+severity = "warning"
+
+[CHANGELOG]
+paths = ["CHANGELOG.md"]
+rules = ["core.min-docs"]
+
+[CHANGELOG."core.min-docs"]
+severity = "warning"

@@ -131,6 +131,49 @@ config error. So CI or an agent can branch on the outcome without parsing text.
   lints; ctxgrd checks the markdown envelope, never the embedded graph. There is
   no `.mmd` source support: raw Mermaid is a non-markdown format, out of scope for
   the core walker (use an external source script if you need it).
+- `checklist` — auditable, commit-pinned checklists (ADR-078). One path-claimed
+  namespace, `CHECKLIST` (`docs/checklists/**`), for a checklist whose "done"
+  state is a signed-off record, not an aspirational list. Checklists are id-less —
+  the filename is the slug — with a two-state `status` (`living` | `sealed`). A
+  `living` checklist (the template or an in-flight instance) is never gated; a
+  `sealed` one is hard-gated by `checklist.complete` (zero unchecked boxes) and
+  `checklist.pinned` (its `pinned_commit` must be a 40-hex SHA that resolves and is
+  an ancestor of `HEAD`), so a green sealed checklist is tied to a named
+  integration commit that landed. `checklist.pinned` shells out to git, so CI must
+  fetch full history (`fetch-depth: 0`); it degrades to a warning in a shallow
+  clone rather than a false error. The pack also binds the generic, config-driven
+  `core.required-headings` — shipped with no section set (a bare checklist requires
+  no particular sections); supply your own to require a shape, e.g. the seven-phase
+  Stripe web-integration checklist shown commented in the pack's `pack.toml`.
+  Matching strips a leading enumerator and is case-insensitive, so a heading may be
+  numbered (`## 1. Plan`) while the config is not.
+- `ddd` — strategic Domain-Driven Design docs on the dependency graph (ADR-082).
+  Two id-claimed namespaces. `BOUNDEDCONTEXT` (`docs/ddd/bounded-contexts/**`,
+  ids `BOUNDEDCONTEXT-<n>`) is the anchor artifact — an Evans model/language
+  boundary with its Ubiquitous Language, aggregates, and domain events folded in
+  as required headings (Purpose, Ubiquitous Language, Aggregates, Domain Events,
+  Boundaries, Team / Ownership, Open Questions, References) alongside `status`
+  (`draft`/`active`/`deprecated`) and `subdomain_type` (`core`/`supporting`/`generic`)
+  required metadata, both config-overridable allowlists. `CONTEXTMAP`
+  (`docs/ddd/context-maps/**`, ids `CONTEXTMAP-<n>`) models one relationship edge
+  per file, carrying `depends_on: [BOUNDEDCONTEXT-x, BOUNDEDCONTEXT-y]` and a
+  `pattern` drawn from Evans' eight strategic patterns (Partnership, Shared
+  Kernel, Customer-Supplier, Conformist, Anticorruption Layer, Open Host Service,
+  Published Language, Separate Ways). Both namespaces are id-claimed rather than
+  path-claimed like `guide`/`c4` — DDD's value is the graph of relationships
+  between contexts, so cross-references ride the existing `depends_on` dependency
+  graph (`core.dep-resolved`, `core.dep-cycle`) instead of a namespace reading a
+  sibling file off disk. The new `ddd.context-map-shape` rule catches what
+  `core.dep-shape` cannot express on its own: a context map must resolve to
+  exactly two `BOUNDEDCONTEXT` ids, and direction fields (`upstream`/`downstream`)
+  are required for asymmetric patterns (Customer-Supplier, Conformist,
+  Anticorruption Layer, Open Host Service, Published Language) and forbidden for
+  symmetric ones (Partnership, Shared Kernel, Separate Ways). Ids use the long
+  namespace form (`BOUNDEDCONTEXT-<n>`, not `BC-<n>`) because a document's
+  namespace is derived from its id prefix, so the `[BOUNDEDCONTEXT]` section name
+  and the id prefix are the same string. Tactical patterns (Value Objects,
+  Entities, Repositories, Domain Services) are cut outright — they are
+  code-shaped and belong in code, not docs.
 
 ## Pack layout
 

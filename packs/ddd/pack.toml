@@ -1,0 +1,95 @@
+# summary: DDD — strategic Domain-Driven Design docs on the dependency graph: BOUNDEDCONTEXT (a model/language boundary with its Ubiquitous Language, aggregates, and domain events) and CONTEXTMAP (one Evans strategic-pattern relationship edge per file, riding depends_on).
+# Strategic Domain-Driven Design (Eric Evans, the Blue Book; Vaughn Vernon, the
+# Red Book), typed as two id-claimed namespaces on the existing dependency graph
+# (ADR-082). A BOUNDEDCONTEXT (BOUNDEDCONTEXT-<n>) is the anchor artifact — what a
+# context owns, in what Ubiquitous Language, its aggregates and domain events, and
+# its boundaries. A CONTEXTMAP (CONTEXTMAP-<n>) models one relationship edge per
+# file — depends_on: [BOUNDEDCONTEXT-x, BOUNDEDCONTEXT-y] plus a `pattern` drawn
+# from Evans' eight strategic patterns — so the directory listing *is* the
+# strategic map and each relationship is an independently dep-resolvable unit.
+#
+# DDD-004 (id-claim, not path-claim): these namespaces are id-claimed on purpose.
+# DDD's whole value is the graph of relationships between contexts, so every
+# cross-reference rides the proven depends_on machinery (core.dep-resolved /
+# core.dep-cycle / core.dep-shape) — the same the SPEC->PRD and TASK->SPEC edges
+# use — rather than a bespoke disk-reading rule or an array-of-objects validator.
+# A future contributor MUST NOT convert them to path-claimed id-less namespaces
+# like the c4/guide packs, nor author a cross-file DDD rule that reads the far
+# file from disk when a depends_on edge already expresses the relationship;
+# path-claim would strand the relationship graph the pack exists to lint.
+#
+# DDD-006 (a Bounded Context is not a C4 Container): the ddd and c4 packs stay
+# siblings and MUST NOT merge into a single boundary concept. A C4 Container is a
+# deployment/runtime boundary; a Bounded Context is a model/language boundary.
+# They routinely diverge (one service hosting two contexts, one context spanning
+# services), so ctxgrd enforces NO 1:1 mapping between [BOUNDEDCONTEXT] and [C4].
+# A BOUNDEDCONTEXT MAY opt into a core.requires-link target at its C4 diagram, but
+# that is off by default — no cross-pack cardinality rule is shipped.
+#
+# Tactical artifacts (aggregates, domain events, the Ubiquitous Language) are
+# folded into BOUNDEDCONTEXT headings for the MVP (DDD-005), not shipped as
+# AGGREGATE/DOMAINEVENT/GLOSSARY namespaces — a per-file aggregate doc is the
+# first thing to rot when code refactors past it, and Evans scopes the Ubiquitous
+# Language to a context, so it belongs as a heading inside the BC rather than a
+# global glossary. Value Objects / Entities / Repositories / Domain Services are
+# cut entirely: they are code-shaped and documented by code and tests. ADR-082.
+
+[BOUNDEDCONTEXT]
+paths = ["docs/ddd/bounded-contexts/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.min-docs",
+]
+
+[BOUNDEDCONTEXT."core.required-headings"]
+headings = ["Purpose", "Ubiquitous Language", "Aggregates", "Domain Events", "Boundaries", "Team / Ownership", "Open Questions", "References"]
+
+[BOUNDEDCONTEXT."core.required-metadata"]
+keys = ["id", "title", "status", "owner", "subdomain_type"]
+
+# A context lives and dies (active/deprecated), it is not "accepted once" — the
+# lifecycle vocabulary reflects that. subdomain_type is Evans' subdomain
+# classification. Both allowlists are config-overridable (retype the arrays).
+[BOUNDEDCONTEXT."core.allowed-values"]
+status = ["draft", "active", "deprecated"]
+subdomain_type = ["core", "supporting", "generic"]
+
+# CONTEXTMAP — one relationship edge per file (DDD-003). depends_on names the two
+# endpoints, so core.dep-resolved catches a dangling context and core.dep-cycle a
+# circular map for free. core.dep-shape's `requires` enforces that at least one
+# BOUNDEDCONTEXT edge is present (presence, not cardinality); ddd.context-map-shape
+# adds the "exactly two endpoints" cardinality and the pattern-conditional
+# upstream/downstream direction check that no single-field core primitive can
+# express (the soc2.control-evidence if/then precedent).
+[CONTEXTMAP]
+paths = ["docs/ddd/context-maps/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.dep-shape",
+  "core.allowed-values",
+  "ddd.context-map-shape",
+]
+
+[CONTEXTMAP."core.dep-shape"]
+requires = ["BOUNDEDCONTEXT"]
+
+# Evans' eight strategic patterns (Blue Book; Red Book). Config-driven, not baked
+# into the binary — retype the allowlist if your team uses a narrower vocabulary.
+[CONTEXTMAP."core.allowed-values"]
+pattern = ["Partnership", "Shared Kernel", "Customer-Supplier", "Conformist", "Anticorruption Layer", "Open Host Service", "Published Language", "Separate Ways"]
+
+# The symmetric patterns (no upstream/downstream direction). Every other pattern
+# is asymmetric and must name both roles. exact_context_count is the number of
+# BOUNDEDCONTEXT endpoints one edge connects.
+[CONTEXTMAP."ddd.context-map-shape"]
+exact_context_count = 2
+symmetric_patterns = ["Partnership", "Shared Kernel", "Separate Ways"]

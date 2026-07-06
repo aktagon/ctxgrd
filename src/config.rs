@@ -145,6 +145,12 @@ pub struct Config {
     /// the built-in default ladder (EARS-01.3). Runtime resolution is
     /// declared-or-default only; it does not infer (ADR-039 § DAG-007).
     pub pipeline: Option<PipelineConfig>,
+    /// Declared `[changelog]` table (ADR-084 § CHG-002). `None` means
+    /// `ctxgrd changelog` has nothing to generate — the whitelist of
+    /// contributing namespaces and their status→section mapping is
+    /// entirely config-driven, never hardcoded. Local-only, like
+    /// `[pipeline]`.
+    pub changelog: Option<ChangelogConfig>,
     /// Kernel-level advisories raised during config loading — e.g.,
     /// `[sources.markdown-file]` was in the file but ignored
     /// (CORE-001). Surfaced through the same channel as runtime
@@ -200,6 +206,38 @@ pub struct GatePredicate {
 pub enum GateQuantifier {
     Any,
     All,
+}
+
+/// Declared `[changelog]` table (ADR-084 § CHG-002).
+///
+/// `namespaces` is the whitelist of namespaces that contribute changelog
+/// entries; a namespace absent from it never appears (CHG-002). Each
+/// whitelisted namespace has a [`ChangelogNamespace`] mapping its terminal
+/// status to a Keep-a-Changelog section. `since` is the optional cutover
+/// tag (CHG-006): released sections are rendered only for tags strictly
+/// after it, and the `since` tag's tree seeds the already-shipped set that
+/// `## [Unreleased]` subtracts. `None` derives the full tag history.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChangelogConfig {
+    /// Ordered whitelist of contributing namespace names.
+    pub namespaces: Vec<String>,
+    /// Cutover tag (CHG-006). `None` = derive the full tag history.
+    pub since: Option<String>,
+    /// Per-namespace terminal-status → section mapping, keyed by
+    /// namespace name. A namespace listed in `namespaces` but missing an
+    /// entry here is a config error (rejected at parse time).
+    pub entries: BTreeMap<String, ChangelogNamespace>,
+}
+
+/// One whitelisted namespace's changelog mapping (ADR-084 § CHG-002):
+/// the terminal `status` value that counts as a shippable change, and
+/// the Keep-a-Changelog `section` its entries render under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelogNamespace {
+    /// Terminal status value (e.g. `fixed` for `BUG`).
+    pub when: String,
+    /// Keep-a-Changelog category (`Added`/`Changed`/`Fixed`/…).
+    pub section: String,
 }
 
 impl GatePredicate {
@@ -398,6 +436,8 @@ pub enum ConfigError {
         "[cfg.pipeline-gate-status] `[pipeline.gate].{namespace}` status '{status}' is not a member of {namespace}'s core.allowed-values status list"
     )]
     PipelineGateStatusUnknown { namespace: String, status: String },
+    #[error("[cfg.changelog-invalid] `[changelog]` invalid: {detail}")]
+    ChangelogInvalid { detail: String },
 }
 
 impl ConfigError {
@@ -418,6 +458,7 @@ impl ConfigError {
             Self::PipelineStageUnknown { .. } => Some("cfg.pipeline-stage-unknown"),
             Self::PipelineGateInvalid { .. } => Some("cfg.pipeline-gate-invalid"),
             Self::PipelineGateStatusUnknown { .. } => Some("cfg.pipeline-gate-status"),
+            Self::ChangelogInvalid { .. } => Some("cfg.changelog-invalid"),
             _ => None,
         }
     }
@@ -587,6 +628,11 @@ fn merge_local_over_global(global: &mut Config, local: Config) {
     if local.pipeline.is_some() {
         global.pipeline = local.pipeline;
     }
+    // [changelog] is local-only, same posture as [pipeline]: a machine-wide
+    // changelog whitelist makes no sense.
+    if local.changelog.is_some() {
+        global.changelog = local.changelog;
+    }
     global.kernel_messages.extend(local.kernel_messages);
 }
 
@@ -744,6 +790,10 @@ fn parse_and_validate(
             config.pipeline = Some(parse_pipeline(val)?);
             continue;
         }
+        if key == "changelog" {
+            config.changelog = Some(parse_changelog(val)?);
+            continue;
+        }
         if key == "todo" {
             if let TomlValue::Table(mut t) = val {
                 if let Some(TomlValue::Table(listed)) = t.remove("listed") {
@@ -878,6 +928,131 @@ fn parse_pipeline(val: TomlValue) -> Result<PipelineConfig, ConfigError> {
     }
 
     Ok(PipelineConfig { stages, gates })
+}
+
+/// Parse the top-level `[changelog]` block (ADR-084 § CHG-002).
+///
+/// Shape:
+/// ```toml
+/// [changelog]
+/// namespaces = ["BUG"]
+/// since = "v0.48.0"      # optional cutover tag (CHG-006)
+///
+/// [changelog.BUG]
+/// when = "fixed"          # terminal status
+/// section = "Fixed"       # Keep-a-Changelog category
+/// ```
+///
+/// Every namespace listed in `namespaces` MUST have a matching
+/// `[changelog.<NS>]` sub-table with both `when` and `section`; a missing
+/// mapping is a hard error, not a silent skip (the whitelist and the
+/// status→section map must stay in lockstep). The binary hardcodes no
+/// namespace set and no default mapping.
+fn parse_changelog(val: TomlValue) -> Result<ChangelogConfig, ConfigError> {
+    let TomlValue::Table(mut table) = val else {
+        return Err(ConfigError::ChangelogInvalid {
+            detail: "`[changelog]` must be a table".into(),
+        });
+    };
+
+    let namespaces = match table.remove("namespaces") {
+        Some(TomlValue::Array(items)) => items
+            .into_iter()
+            .map(|v| match v {
+                TomlValue::String(s) => Ok(s),
+                _ => Err(ConfigError::ChangelogInvalid {
+                    detail: "`namespaces` must be an array of namespace-name strings".into(),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(ConfigError::ChangelogInvalid {
+                detail: "`namespaces` must be an array of namespace-name strings".into(),
+            });
+        }
+        None => {
+            return Err(ConfigError::ChangelogInvalid {
+                detail: "`namespaces` is required — a `[changelog]` with no whitelist \
+                         contributes nothing"
+                    .into(),
+            });
+        }
+    };
+    if namespaces.is_empty() {
+        return Err(ConfigError::ChangelogInvalid {
+            detail: "`namespaces` must list at least one namespace".into(),
+        });
+    }
+
+    let since = match table.remove("since") {
+        Some(TomlValue::String(s)) => Some(s),
+        Some(_) => {
+            return Err(ConfigError::ChangelogInvalid {
+                detail: "`since` must be a tag-name string (e.g. \"v0.48.0\")".into(),
+            });
+        }
+        None => None,
+    };
+
+    // Remaining table-valued keys are per-namespace `[changelog.<NS>]`
+    // mappings. Collect them, then verify every whitelisted namespace has
+    // one (and no orphan mapping names an un-whitelisted namespace).
+    let mut entries: BTreeMap<String, ChangelogNamespace> = BTreeMap::new();
+    for (key, value) in table {
+        let TomlValue::Table(sub) = value else {
+            return Err(ConfigError::ChangelogInvalid {
+                detail: format!("unexpected key `{key}` — expected `[changelog.{key}]` sub-table"),
+            });
+        };
+        let when = match sub.get("when") {
+            Some(TomlValue::String(s)) if !s.is_empty() => s.clone(),
+            _ => {
+                return Err(ConfigError::ChangelogInvalid {
+                    detail: format!(
+                        "`[changelog.{key}]` requires a non-empty `when` (terminal status) string"
+                    ),
+                });
+            }
+        };
+        let section = match sub.get("section") {
+            Some(TomlValue::String(s)) if !s.is_empty() => s.clone(),
+            _ => {
+                return Err(ConfigError::ChangelogInvalid {
+                    detail: format!(
+                        "`[changelog.{key}]` requires a non-empty `section` \
+                         (Keep-a-Changelog category) string"
+                    ),
+                });
+            }
+        };
+        entries.insert(key, ChangelogNamespace { when, section });
+    }
+
+    for ns in &namespaces {
+        if !entries.contains_key(ns) {
+            return Err(ConfigError::ChangelogInvalid {
+                detail: format!(
+                    "namespace `{ns}` is whitelisted but has no `[changelog.{ns}]` \
+                     mapping (needs `when` and `section`)"
+                ),
+            });
+        }
+    }
+    for ns in entries.keys() {
+        if !namespaces.contains(ns) {
+            return Err(ConfigError::ChangelogInvalid {
+                detail: format!(
+                    "`[changelog.{ns}]` maps a namespace not listed in `namespaces`"
+                ),
+            });
+        }
+    }
+
+    Ok(ChangelogConfig {
+        namespaces,
+        since,
+        entries,
+    })
 }
 
 fn parse_ignore(val: TomlValue, config: &mut Config) -> Result<(), ConfigError> {
@@ -2451,5 +2626,94 @@ SPEC = "all:shipped"
     fn todo_listed_global_enabled_false_is_false() {
         let config = parse("[todo.listed]\nenabled = false\n").unwrap();
         assert!(!config.todo_listed_global);
+    }
+
+    // -- ADR-084 § CHG-002: the [changelog] whitelist + status→section map ---
+
+    #[test]
+    fn changelog_absent_is_none() {
+        let config = parse("[ADR]\nrules = []\n").unwrap();
+        assert!(config.changelog.is_none());
+    }
+
+    #[test]
+    fn changelog_parses_whitelist_since_and_per_ns_mapping() {
+        let text = r#"
+[BUG]
+paths = ["docs/bugs/**"]
+rules = ["core.frontmatter"]
+
+[changelog]
+namespaces = ["BUG"]
+since = "v0.48.0"
+
+[changelog.BUG]
+when = "fixed"
+section = "Fixed"
+"#;
+        let cfg = parse(text).unwrap().changelog.expect("changelog present");
+        assert_eq!(cfg.namespaces, vec!["BUG".to_string()]);
+        assert_eq!(cfg.since.as_deref(), Some("v0.48.0"));
+        let bug = &cfg.entries["BUG"];
+        assert_eq!(bug.when, "fixed");
+        assert_eq!(bug.section, "Fixed");
+    }
+
+    #[test]
+    fn changelog_since_is_optional() {
+        let text = "[changelog]\nnamespaces = [\"BUG\"]\n\n[changelog.BUG]\nwhen = \"fixed\"\nsection = \"Fixed\"\n";
+        let cfg = parse(text).unwrap().changelog.unwrap();
+        assert_eq!(cfg.since, None);
+    }
+
+    #[test]
+    fn changelog_missing_namespaces_is_error() {
+        let text = "[changelog]\n[changelog.BUG]\nwhen = \"fixed\"\nsection = \"Fixed\"\n";
+        assert!(matches!(
+            parse(text).unwrap_err(),
+            ConfigError::ChangelogInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn changelog_whitelisted_ns_without_mapping_is_error() {
+        // BUG is whitelisted but has no [changelog.BUG] table.
+        let text = "[changelog]\nnamespaces = [\"BUG\"]\n";
+        let err = parse(text).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::ChangelogInvalid { detail } if detail.contains("BUG")),
+            "expected ChangelogInvalid naming BUG, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn changelog_mapping_without_when_or_section_is_error() {
+        let text = "[changelog]\nnamespaces = [\"BUG\"]\n\n[changelog.BUG]\nwhen = \"fixed\"\n";
+        assert!(matches!(
+            parse(text).unwrap_err(),
+            ConfigError::ChangelogInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn changelog_orphan_mapping_is_error() {
+        // A [changelog.CR] mapping for a namespace not in the whitelist.
+        let text = r#"
+[changelog]
+namespaces = ["BUG"]
+
+[changelog.BUG]
+when = "fixed"
+section = "Fixed"
+
+[changelog.CR]
+when = "implemented"
+section = "Changed"
+"#;
+        let err = parse(text).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::ChangelogInvalid { detail } if detail.contains("CR")),
+            "expected ChangelogInvalid naming CR, got {err:?}"
+        );
     }
 }

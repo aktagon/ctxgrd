@@ -194,6 +194,68 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             embedded Mermaid/DOT graph (ADR-075).",
     },
     BuiltinRule {
+        code: "checklist.structure",
+        level: Level::File,
+        check: crate::agent_guide::check_checklist_structure,
+        summary: "Checklists (docs/checklists/**) carry a title, a living|sealed status, a pin when sealed, and at least one checkbox.",
+        description: "Errors when a `docs/checklists/**` doc is missing a `---` frontmatter \
+            fence; when `title` is absent or not a non-empty string; when `status` is absent or \
+            outside `{living, sealed}`; when `status: sealed` but `pinned_commit` is absent; or \
+            when the body has no checkbox item (`- [ ]` / `- [x]`). File-level: a checklist \
+            carries a title/status, not an `id`, so the filename is its slug. The two-state \
+            lifecycle keeps a `living` template or in-flight instance un-gated while `sealed` is \
+            the signed-off state the completeness and pin rules enforce (ADR-078).",
+    },
+    BuiltinRule {
+        code: "checklist.complete",
+        level: Level::File,
+        check: crate::agent_guide::check_checklist_complete,
+        summary: "A sealed checklist has zero unchecked boxes.",
+        description: "When `status: sealed`, errors once per remaining unchecked box (`- [ ]`). \
+            No-op while `status: living`. Only `[x]`/`[X]` count as done; other bracket content \
+            is not a task item. This is the 'all boxes checked' half of an auditable sign-off — \
+            the gate fires only at seal time, never on a living template or in-flight instance \
+            (ADR-078).",
+    },
+    BuiltinRule {
+        code: "checklist.pinned",
+        level: Level::File,
+        check: crate::agent_guide::check_checklist_pinned,
+        summary: "A sealed checklist's pinned_commit is a real, in-history commit.",
+        description: "When `status: sealed`, errors if `pinned_commit` is not a 40-hex SHA, does \
+            not resolve to a commit in the repo, or is not an ancestor of HEAD. Degrades to a \
+            warning (never a hard error) outside a usable git history — not a repo, no git, or a \
+            shallow clone missing the object (fetch full history / `fetch-depth: 0` to verify). \
+            No-op while `status: living`. This is the 'pinned to a commit' half of the sign-off: \
+            'done' is anchored to a named integration commit that landed on this line of history \
+            (ADR-078).",
+    },
+    BuiltinRule {
+        code: "core.required-headings",
+        level: Level::File,
+        check: crate::agent_guide::check_required_headings,
+        summary: "A document contains every H2 heading named in its `headings` config param.",
+        description: "Errors for each heading in the `headings` param that is absent from the \
+            doc's H2 headings. Matching is normalized: a leading enumerator (`1.`, `1)`, `A.`) is \
+            stripped and comparison is case-insensitive, so config `\"Plan / account structure\"` \
+            matches a `## 1. Plan / account structure` heading. Presence, not order; extra \
+            headings are allowed. No-op when `headings` is unset. Generic and config-driven — the \
+            binary enumerates no section names; a checklist supplies its phases, an ADR its \
+            sections (ADR-078).",
+    },
+    BuiltinRule {
+        code: "core.required-anchors",
+        level: Level::File,
+        check: crate::agent_guide::check_required_anchors,
+        summary: "A document's body contains every marker named in its `anchors` config param.",
+        description: "Errors for each string in the `anchors` param absent from the document body \
+            (substring match on the raw text, convention-agnostic — HTML-comment anchors \
+            `<!-- @pack.rule -->` or any stable token). Presence only; extra anchors are allowed. \
+            No-op when `anchors` is unset or empty. Generic and config-driven — the binary \
+            enumerates no anchors; a stripe checklist supplies its `@stripe.*` markers, enabling \
+            the vendor-specific structure rules ADR-078 deferred (ADR-078).",
+    },
+    BuiltinRule {
         // Document-level (ADR-039 § DAG-002/DAG-003). The configurable
         // per-namespace `depends_on` edge contract that subsumes and replaces
         // both the bespoke `spec.requires-prd` (DAG-004) and
@@ -573,6 +635,28 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             fire. Severity is the `severity` param (`error` | `warning`, default `error`). \
             Off by default, opt-in per namespace; never reads `[pipeline.gate]` (EARS-01.3).",
     },
+    BuiltinRule {
+        // Document-level (ADR-082 § DDD-003). The one check the ddd pack's
+        // CONTEXTMAP namespace needs beyond the core dep-graph rules: core.dep-shape
+        // asserts a BOUNDEDCONTEXT edge is *present* but cannot assert cardinality
+        // ("exactly two"), and whether `upstream`/`downstream` role fields are
+        // required is *conditional on `pattern`* — cross-field logic
+        // core.allowed-values (single flat field) cannot express. The same if/then
+        // shape as soc2.control-evidence / hipaa.safeguard-evidence.
+        code: "ddd.context-map-shape",
+        level: Level::Document,
+        check: crate::agent_guide::check_context_map_shape,
+        summary: "A CONTEXTMAP edge connects exactly two BOUNDEDCONTEXT contexts and carries upstream/downstream roles iff its pattern is asymmetric.",
+        description: "Errors when a CONTEXTMAP's `depends_on` does not resolve to exactly \
+            `exact_context_count` (default 2) `BOUNDEDCONTEXT` ids (`context-namespace`, default \
+            `BOUNDEDCONTEXT`). Also errors when the `pattern` is asymmetric (not in \
+            `symmetric_patterns`, default Partnership / Shared Kernel / Separate Ways) but the doc \
+            omits an `upstream` or `downstream` role field, or when the pattern is symmetric but \
+            declares either — the cardinality and cross-field direction checks core.dep-shape and \
+            core.allowed-values cannot express (DDD-003). A doc with no `pattern` skips the \
+            direction half; the field names are the `pattern-field`/`upstream-field`/\
+            `downstream-field` params.",
+    },
 ];
 
 #[cfg(test)]
@@ -649,13 +733,19 @@ mod tests {
             "opencode.frontmatter",
             "guide.frontmatter",
             "c4.frontmatter",
+            "checklist.structure",
+            "checklist.complete",
+            "checklist.pinned",
+            "core.required-headings",
+            "core.required-anchors",
+            "ddd.context-map-shape",
         ] {
             assert!(
                 codes.contains(&expected),
                 "BUILTIN_RULES missing '{expected}'"
             );
         }
-        assert_eq!(codes.len(), 35, "expected exactly 35 builtin rules");
+        assert_eq!(codes.len(), 41, "expected exactly 41 builtin rules");
     }
 
     #[test]

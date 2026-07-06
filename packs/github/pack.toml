@@ -1,0 +1,48 @@
+# summary: GitHub community-health files — CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, SUPPORT — path-claimed as id-less docs with a warning-severity existence nudge. README stays in project-docs; LICENSE is excluded. ADR-077.
+# The markdown "community health files" GitHub recognizes from the repo root,
+# .github/, or docs/ (https://docs.github.com/communities). Each is id-less and
+# frontmatter-free (they open with an H1, not YAML), path-claimed on its filename,
+# and carries a single existence nudge (core.min-docs at warning severity): a
+# project that installed the pack but is missing the file gets a non-blocking
+# prompt, a project that has it is clean, and a first-touch repo that never
+# installs the pack stays silent (ADR-007 § DOC-001).
+#
+# README is NOT claimed here — it is owned by the project-docs [README] namespace.
+# LICENSE is deliberately absent: GitHub detects LICENSE.md, but only as verbatim
+# SPDX license text; markdown structure defeats detection, so a linter must not
+# touch it (ADR-077 § CHF-004, superseding ADR-023 § PKC-008).
+#
+# The github and gitlab packs share the [CONTRIBUTING] namespace name, so they
+# compose rather than conflict: `pack add` is never-clobber (PACK-001), so
+# installing both keeps the first-added CONTRIBUTING globs and adds only the other
+# pack's host-unique namespaces. A repo normally installs the pack for its host
+# (ADR-077 § CHF-005). SECURITY.md is namespaced SECURITYDOC to stay distinct from
+# the `security` compliance pack (THREAT/VULN/RISK/POLICY), a different concern.
+
+[CONTRIBUTING]
+paths = ["CONTRIBUTING.md", ".github/CONTRIBUTING.md", "docs/CONTRIBUTING.md"]
+rules = ["core.min-docs"]
+
+[CONTRIBUTING."core.min-docs"]
+severity = "warning"
+
+[CODEOFCONDUCT]
+paths = ["CODE_OF_CONDUCT.md", ".github/CODE_OF_CONDUCT.md", "docs/CODE_OF_CONDUCT.md"]
+rules = ["core.min-docs"]
+
+[CODEOFCONDUCT."core.min-docs"]
+severity = "warning"
+
+[SECURITYDOC]
+paths = ["SECURITY.md", ".github/SECURITY.md", "docs/SECURITY.md"]
+rules = ["core.min-docs"]
+
+[SECURITYDOC."core.min-docs"]
+severity = "warning"
+
+[SUPPORT]
+paths = ["SUPPORT.md", ".github/SUPPORT.md", "docs/SUPPORT.md"]
+rules = ["core.min-docs"]
+
+[SUPPORT."core.min-docs"]
+severity = "warning"

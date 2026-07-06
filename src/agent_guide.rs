@@ -63,6 +63,11 @@ const AGENT_ASSIGNED: &str = "agent.assigned";
 const OPENCODE_FM: &str = "opencode.frontmatter";
 const GUIDE_FM: &str = "guide.frontmatter";
 const C4_FM: &str = "c4.frontmatter";
+const CHECKLIST_STRUCTURE: &str = "checklist.structure";
+const CHECKLIST_COMPLETE: &str = "checklist.complete";
+const CHECKLIST_PINNED: &str = "checklist.pinned";
+const REQUIRED_HEADINGS: &str = "core.required-headings";
+const REQUIRED_ANCHORS: &str = "core.required-anchors";
 /// Below this many characters, an agent `description` is unlikely to carry
 /// enough signal for reliable auto-delegation (warning). Shared default for
 /// `agent.frontmatter` and `opencode.frontmatter`.
@@ -89,6 +94,7 @@ const CONTROL_EVIDENCE: &str = "soc2.control-evidence";
 const ISO_CONTROL_EVIDENCE: &str = "iso27001.control-evidence";
 const NIST_CONTROL_EVIDENCE: &str = "nist.control-evidence";
 const ACCEPTANCE_COMPLETE: &str = "core.acceptance-complete";
+const CONTEXT_MAP_SHAPE: &str = "ddd.context-map-shape";
 
 /// Default acceptance heading names the `core.acceptance-complete` scan
 /// covers when the `headings` param is absent (ADR-056 § EARS-02). Matched
@@ -1859,6 +1865,387 @@ pub(crate) fn check_c4_frontmatter(
     out
 }
 
+// -- CHECKLIST namespace (docs/checklists/**) + core.required-headings -----
+//
+// A checklist is an id-less, path-claimed doc with a two-state lifecycle
+// (`status: living` → `sealed`). `checklist.structure` is the always-on shape
+// check; `checklist.complete` and `checklist.pinned` fire only once sealed, so
+// a template or an in-flight instance is never gated. `core.required-headings`
+// is the generic, config-driven "these H2 sections must exist" rule the
+// checklist pack binds (it is not checklist-specific). ADR-078.
+
+/// A checkbox list item — checked or unchecked — anchored to line start. The
+/// three CommonMark task-list markers (`-`, `*`, `+`) are accepted so the rule
+/// does not silently miss a `+ [ ]` box.
+fn checklist_box_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?m)^\s*[-*+]\s+\[[ xX]\]").expect("valid regex"))
+}
+
+/// An *unchecked* checkbox list item (`- [ ]`). Only `[ ]` blocks a seal;
+/// `[x]`/`[X]` are done and any other bracket content is not a task item.
+fn checklist_unchecked_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*[-*+]\s+\[ \]").expect("valid regex"))
+}
+
+/// `checklist.structure`: a `docs/checklists/**` doc MUST have a `---`
+/// frontmatter fence carrying a non-empty `title`, a `status` of exactly
+/// `living` or `sealed`, a `pinned_commit` when `sealed`, and at least one
+/// checkbox in the body. File-level: a checklist carries a title/status, not an
+/// `id`, so the filename is its slug (ADR-078 § CHK-002).
+pub(crate) fn check_checklist_structure(
+    doc: &Document,
+    _params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    use crate::frontmatter::{Frontmatter, FrontmatterError};
+    let fm = match Frontmatter::parse(&doc.body) {
+        Ok(fm) => fm,
+        Err(FrontmatterError::MissingFence) => {
+            return vec![Diagnostic::error(
+                CHECKLIST_STRUCTURE,
+                doc.location.clone(),
+                0,
+                0,
+                "checklist must have a `---` frontmatter fence with `title:` and `status:`",
+            )
+            .with_help(
+                "add a `---` frontmatter block with `title: <checklist title>` and \
+                 `status: living` (or `sealed` with a `pinned_commit:`)",
+            )];
+        }
+        Err(_) => {
+            return vec![Diagnostic::error(
+                CHECKLIST_STRUCTURE,
+                doc.location.clone(),
+                0,
+                0,
+                "checklist frontmatter must set a non-empty `title` and a `status`",
+            )
+            .with_help("set `title:` and `status: living` | `sealed`")];
+        }
+    };
+
+    let mut out = Vec::new();
+
+    let title_ok = fm
+        .metadata
+        .get("title")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty());
+    if !title_ok {
+        out.push(
+            Diagnostic::error(
+                CHECKLIST_STRUCTURE,
+                doc.location.clone(),
+                doc.frontmatter_lines.get("title").copied().unwrap_or(0),
+                0,
+                "checklist frontmatter must set a non-empty `title`",
+            )
+            .with_help("add `title: <checklist title>` to the frontmatter"),
+        );
+    }
+
+    let status = fm.metadata.get("status").and_then(Value::as_str).map(str::trim);
+    let status_line = doc.frontmatter_lines.get("status").copied().unwrap_or(0);
+    match status {
+        Some("living") | Some("sealed") => {}
+        Some(other) => out.push(
+            Diagnostic::error(
+                CHECKLIST_STRUCTURE,
+                doc.location.clone(),
+                status_line,
+                0,
+                format!("checklist `status: {other}` must be `living` or `sealed`"),
+            )
+            .with_help("set `status: living` (in progress) or `status: sealed` (signed off)"),
+        ),
+        None => out.push(
+            Diagnostic::error(
+                CHECKLIST_STRUCTURE,
+                doc.location.clone(),
+                0,
+                0,
+                "checklist frontmatter must set `status: living` or `status: sealed`",
+            )
+            .with_help("add `status: living` while filling it in; `sealed` at sign-off"),
+        ),
+    }
+
+    if status == Some("sealed") {
+        let pin_ok = fm
+            .metadata
+            .get("pinned_commit")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !pin_ok {
+            out.push(
+                Diagnostic::error(
+                    CHECKLIST_STRUCTURE,
+                    doc.location.clone(),
+                    status_line,
+                    0,
+                    "a `sealed` checklist must set `pinned_commit` to the integration commit",
+                )
+                .with_help("add `pinned_commit: <40-hex commit SHA>` or revert to `status: living`"),
+            );
+        }
+    }
+
+    if !checklist_box_regex().is_match(&doc.body) {
+        out.push(
+            Diagnostic::error(
+                CHECKLIST_STRUCTURE,
+                doc.location.clone(),
+                0,
+                0,
+                "checklist body has no checkbox items (`- [ ]` / `- [x]`)",
+            )
+            .with_help("a checklist must list at least one `- [ ]` item"),
+        );
+    }
+
+    out
+}
+
+/// `checklist.complete`: when (and only when) `status: sealed`, every remaining
+/// unchecked box (`- [ ]`) is an error. No-op while `living`. Only `[x]`/`[X]`
+/// count as done (ADR-078 § CHK-003).
+pub(crate) fn check_checklist_complete(
+    doc: &Document,
+    _params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    use crate::frontmatter::Frontmatter;
+    let Ok(fm) = Frontmatter::parse(&doc.body) else {
+        return Vec::new();
+    };
+    if fm.metadata.get("status").and_then(Value::as_str).map(str::trim) != Some("sealed") {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (i, line) in doc.body.lines().enumerate() {
+        if checklist_unchecked_regex().is_match(line) {
+            out.push(
+                Diagnostic::error(
+                    CHECKLIST_COMPLETE,
+                    doc.location.clone(),
+                    (i + 1) as u32,
+                    0,
+                    "unchecked item in a `sealed` checklist",
+                )
+                .with_help("check it (`- [x]`) or set `status: living` until the work lands"),
+            );
+        }
+    }
+    out
+}
+
+/// `checklist.pinned`: when (and only when) `status: sealed`, the
+/// `pinned_commit` frontmatter SHA must be 40-hex, resolve to a commit in the
+/// repo, and be an ancestor of `HEAD`. Degrades to a warning (never a hard
+/// error) outside a usable git history — not a repo, no git, or a shallow clone
+/// missing the object (ADR-078 § CHK-004).
+pub(crate) fn check_checklist_pinned(
+    doc: &Document,
+    _params: Option<&Value>,
+    root: &Path,
+) -> Vec<Diagnostic> {
+    use crate::frontmatter::Frontmatter;
+    let Ok(fm) = Frontmatter::parse(&doc.body) else {
+        return Vec::new();
+    };
+    if fm.metadata.get("status").and_then(Value::as_str).map(str::trim) != Some("sealed") {
+        return Vec::new();
+    }
+    // A missing/empty pin is `checklist.structure`'s concern, not this rule's.
+    let sha = match fm.metadata.get("pinned_commit").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Vec::new(),
+    };
+    let line = doc.frontmatter_lines.get("pinned_commit").copied().unwrap_or(0);
+
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return vec![Diagnostic::error(
+            CHECKLIST_PINNED,
+            doc.location.clone(),
+            line,
+            0,
+            format!("`pinned_commit: {sha}` is not a 40-character hex commit SHA"),
+        )
+        .with_help("pin to the full 40-character SHA of the integration commit")];
+    }
+
+    if !git_repo_available(root) {
+        return vec![Diagnostic::warning(
+            CHECKLIST_PINNED,
+            doc.location.clone(),
+            line,
+            0,
+            "cannot verify `pinned_commit`: not a git repository or git unavailable",
+        )
+        .with_help("run ctxgrd inside the repo so the pin can be checked")];
+    }
+
+    if !git_object_exists(root, sha) {
+        if git_is_shallow(root) {
+            return vec![Diagnostic::warning(
+                CHECKLIST_PINNED,
+                doc.location.clone(),
+                line,
+                0,
+                format!("cannot verify `pinned_commit` {sha} in a shallow clone"),
+            )
+            .with_help("fetch full history (`fetch-depth: 0` in CI) so the pin can be checked")];
+        }
+        return vec![Diagnostic::error(
+            CHECKLIST_PINNED,
+            doc.location.clone(),
+            line,
+            0,
+            format!("`pinned_commit` {sha} does not resolve to a commit in this repository"),
+        )
+        .with_help("pin to a commit that exists in this repo")];
+    }
+
+    match git_is_ancestor(root, sha) {
+        Some(Some(0)) => Vec::new(),
+        Some(Some(1)) => vec![Diagnostic::error(
+            CHECKLIST_PINNED,
+            doc.location.clone(),
+            line,
+            0,
+            format!("`pinned_commit` {sha} is not an ancestor of HEAD — the integration has not landed"),
+        )
+        .with_help("seal to a commit that is merged into this line of history, or re-seal after it lands")],
+        _ => vec![Diagnostic::warning(
+            CHECKLIST_PINNED,
+            doc.location.clone(),
+            line,
+            0,
+            format!("could not determine whether `pinned_commit` {sha} is an ancestor of HEAD"),
+        )
+        .with_help("ensure git history is available so the pin can be checked")],
+    }
+}
+
+/// `core.required-headings`: each heading named in the `headings` config param
+/// must appear as an H2. Matching is normalized — a leading enumerator (`1.`,
+/// `1)`, `A.`) is stripped and comparison is case-insensitive — so config
+/// `"Plan / account structure"` matches a `## 1. Plan / account structure`
+/// heading. Presence, not order; extra headings allowed. No-op when `headings`
+/// is unset (ADR-078 § CHK-005).
+pub(crate) fn check_required_headings(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(required) = params.and_then(|p| p.get("headings")).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+    if required.is_empty() {
+        return Vec::new();
+    }
+    let Some(ast) = doc.ast.as_ref() else {
+        return Vec::new();
+    };
+    let present: Vec<String> = ast
+        .headings
+        .iter()
+        .filter(|h| h.level == 2)
+        .map(|h| normalize_required_heading(&h.text))
+        .collect();
+
+    let mut out = Vec::new();
+    for want in required {
+        let want_norm = normalize_required_heading(want);
+        if want_norm.is_empty() || present.iter().any(|p| p == &want_norm) {
+            continue;
+        }
+        out.push(
+            Diagnostic::error(
+                REQUIRED_HEADINGS,
+                doc.location.clone(),
+                0,
+                0,
+                format!("required H2 heading `{want}` is missing"),
+            )
+            .with_help(format!("add a `## {want}` section")),
+        );
+    }
+    out
+}
+
+/// `core.required-anchors`: a document's body must contain every marker string
+/// named in its `anchors` config param. Generic and config-driven — the binary
+/// enumerates no anchors; a checklist supplies its `@stripe.*` anchors, another
+/// namespace its own markers. Substring match on the raw body, so it is
+/// convention-agnostic (HTML-comment anchors `<!-- @pack.rule -->`, or any
+/// stable token). File-level so it runs on id-less path-claimed docs like
+/// docs/checklists/** (ADR-078: the generic enabler for the deferred
+/// vendor-specific structure rules).
+pub(crate) fn check_required_anchors(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(required) = params.and_then(|p| p.get("anchors")).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+    if required.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for want in required {
+        if want.is_empty() || doc.body.contains(want) {
+            continue;
+        }
+        out.push(
+            Diagnostic::error(
+                REQUIRED_ANCHORS,
+                doc.location.clone(),
+                0,
+                0,
+                format!("required anchor `{want}` is missing"),
+            )
+            .with_help(format!("add the `{want}` anchor to the item it governs")),
+        );
+    }
+    out
+}
+
+/// A leading heading enumerator (`1.`, `1)`, `A.`) to strip before comparing a
+/// config heading against a document heading, so authors can number their
+/// sections without the config mirroring the numbers.
+fn required_enumerator_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*(?:\d+|[A-Za-z])[.)]\s+").expect("valid regex"))
+}
+
+/// Normalize a heading for `core.required-headings`: strip a leading enumerator,
+/// then trim, drop a trailing colon, and case-fold (matching `normalize_heading`
+/// plus the enumerator strip).
+fn normalize_required_heading(text: &str) -> String {
+    let stripped = required_enumerator_regex().replace(text.trim(), "");
+    normalize_heading(&stripped)
+}
+
+/// `git cat-file -e <sha>^{commit}` — the pinned SHA resolves to a commit
+/// object present in this repository.
+fn git_object_exists(root: &Path, commit: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 // -- AGENT namespace (.claude/agents/*.md subagent definitions) --------
 
 /// `agent.frontmatter`: a Claude Code subagent definition file
@@ -3406,6 +3793,158 @@ pub(crate) fn check_nist_control_evidence(
         Diagnostic::error(NIST_CONTROL_EVIDENCE, doc.location.clone(), gap.line, 0, message)
             .with_help(help),
     ]
+}
+
+// -- ddd.context-map-shape (document-level, ADR-082 § DDD-003) --------
+
+/// `ddd.context-map-shape` (ADR-082 § DDD-003): a `CONTEXTMAP` edge doc MUST
+/// connect exactly `exact_context_count` (default 2) `BOUNDEDCONTEXT` contexts
+/// through `depends_on`, and its `pattern` MUST carry `upstream`/`downstream`
+/// role fields when the pattern is asymmetric while omitting them when it is
+/// symmetric. This is the cross-field, cardinality-aware check that
+/// `core.dep-shape` (presence-only, single field) cannot express — whether the
+/// direction fields are required is *conditional on `pattern`* — so it is the
+/// same if/then compiled-rule shape as `soc2.control-evidence` /
+/// `hipaa.safeguard-evidence`, not a new pattern for the codebase.
+///
+/// Params (all optional; defaults encode the Evans vocabulary the pack ships):
+/// - `exact_context_count` (int, default 2): the number of `BOUNDEDCONTEXT`
+///   endpoints one relationship edge connects.
+/// - `context-namespace` (string, default `BOUNDEDCONTEXT`): the namespace a
+///   `depends_on` endpoint must resolve to, to count as a context.
+/// - `symmetric_patterns` (string list, default `Partnership` / `Shared Kernel`
+///   / `Separate Ways`): patterns that forbid the direction fields; every other
+///   pattern is asymmetric and requires them.
+/// - `pattern-field` (default `pattern`), `upstream-field` (default `upstream`),
+///   `downstream-field` (default `downstream`): the metadata keys read.
+///
+/// A doc with no `pattern` field skips the direction half (presence of
+/// `pattern` is `core.allowed-values`/`core.required-metadata`'s concern).
+pub(crate) fn check_context_map_shape(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let str_param = |key: &str, default: &'static str| -> String {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or(default)
+            .to_owned()
+    };
+    let ctx_ns = str_param("context-namespace", "BOUNDEDCONTEXT");
+    let pattern_field = str_param("pattern-field", "pattern");
+    let upstream_field = str_param("upstream-field", "upstream");
+    let downstream_field = str_param("downstream-field", "downstream");
+    let exact = params
+        .and_then(|p| p.get("exact_context_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(2);
+    let symmetric: Vec<String> = params
+        .and_then(|p| p.get("symmetric_patterns"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                "Partnership".to_owned(),
+                "Shared Kernel".to_owned(),
+                "Separate Ways".to_owned(),
+            ]
+        });
+
+    let mut out = Vec::new();
+
+    // Half 1 — cardinality: exactly `exact` BOUNDEDCONTEXT endpoints. This is
+    // what core.dep-shape's presence-only `requires` cannot assert (DDD-003).
+    let count = doc
+        .depends_on
+        .iter()
+        .filter(|dep| dep.split_once('-').is_some_and(|(ns, _)| ns == ctx_ns))
+        .count() as u64;
+    let dep_line = doc
+        .frontmatter_lines
+        .get("depends_on")
+        .or_else(|| doc.frontmatter_lines.get("id"))
+        .copied()
+        .unwrap_or(0);
+    if count != exact {
+        out.push(
+            Diagnostic::error(
+                CONTEXT_MAP_SHAPE,
+                doc.location.clone(),
+                dep_line,
+                0,
+                format!(
+                    "{}: a context map must connect exactly {exact} {ctx_ns} contexts, found {count}",
+                    doc.raw_id
+                ),
+            )
+            .with_help(format!(
+                "list exactly {exact} {ctx_ns}-<n> ids in `depends_on` — one CONTEXTMAP file is a single relationship edge between two contexts"
+            )),
+        );
+    }
+
+    // Half 2 — direction fields conditional on `pattern` symmetry (DDD-003).
+    if let Some(pattern) = doc.metadata.get(&pattern_field).and_then(Value::as_str) {
+        let is_symmetric = symmetric.iter().any(|p| p == pattern);
+        let non_empty = |field: &str| {
+            doc.metadata
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        };
+        let has_up = non_empty(&upstream_field);
+        let has_down = non_empty(&downstream_field);
+        let pattern_line = doc
+            .frontmatter_lines
+            .get(&pattern_field)
+            .or_else(|| doc.frontmatter_lines.get("id"))
+            .copied()
+            .unwrap_or(0);
+        if is_symmetric {
+            if has_up || has_down {
+                out.push(
+                    Diagnostic::error(
+                        CONTEXT_MAP_SHAPE,
+                        doc.location.clone(),
+                        pattern_line,
+                        0,
+                        format!(
+                            "{}: symmetric pattern `{pattern}` must not declare `{upstream_field}`/`{downstream_field}` roles",
+                            doc.raw_id
+                        ),
+                    )
+                    .with_help(format!(
+                        "remove the `{upstream_field}:`/`{downstream_field}:` fields — {pattern} is a symmetric relationship with no upstream/downstream direction"
+                    )),
+                );
+            }
+        } else if !has_up || !has_down {
+            out.push(
+                Diagnostic::error(
+                    CONTEXT_MAP_SHAPE,
+                    doc.location.clone(),
+                    pattern_line,
+                    0,
+                    format!(
+                        "{}: asymmetric pattern `{pattern}` must declare both `{upstream_field}` and `{downstream_field}` roles",
+                        doc.raw_id
+                    ),
+                )
+                .with_help(format!(
+                    "add `{upstream_field}:` and `{downstream_field}:` fields naming which context is upstream and which is downstream"
+                )),
+            );
+        }
+    }
+
+    out
 }
 
 // -- todo.listed (document-level) ------------------------------------
@@ -7303,6 +7842,163 @@ shall is discussed in the EARS paper.
         assert!(check_nist_control_evidence(&d, Some(&iso_nist_params()), Path::new(".")).is_empty());
     }
 
+    // -- ddd.context-map-shape (ADR-082 § DDD-003) ----------------------
+
+    /// A CONTEXTMAP edge doc carrying `depends_on` endpoints, a `pattern`, and
+    /// optional `upstream`/`downstream` role fields — the shape
+    /// `ddd.context-map-shape` reads.
+    fn ctxmap_doc(
+        raw_id: &str,
+        pattern: &str,
+        depends_on: &[&str],
+        upstream: Option<&str>,
+        downstream: Option<&str>,
+    ) -> Document {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "pattern".to_owned(),
+            serde_json::Value::String(pattern.to_owned()),
+        );
+        if let Some(up) = upstream {
+            metadata.insert("upstream".to_owned(), serde_json::Value::String(up.to_owned()));
+        }
+        if let Some(down) = downstream {
+            metadata.insert(
+                "downstream".to_owned(),
+                serde_json::Value::String(down.to_owned()),
+            );
+        }
+        let mut frontmatter_lines = BTreeMap::new();
+        frontmatter_lines.insert("depends_on".to_owned(), 5u32);
+        frontmatter_lines.insert("pattern".to_owned(), 8u32);
+        Document {
+            id: raw_id.parse().unwrap(),
+            raw_id: raw_id.to_owned(),
+            location: format!("docs/ddd/context-maps/{raw_id}.md"),
+            depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
+            frontmatter_lines,
+            metadata,
+            pin: None,
+            ast: Some(markdown::parse_ast("")),
+            body: String::new(),
+        }
+    }
+
+    /// The pack's `ddd.context-map-shape` params (defaults, made explicit).
+    fn context_map_shape_params() -> Value {
+        serde_json::json!({
+            "exact_context_count": 2,
+            "symmetric_patterns": ["Partnership", "Shared Kernel", "Separate Ways"]
+        })
+    }
+
+    #[test]
+    fn context_map_shape_clean_asymmetric_edge() {
+        // A well-formed Customer-Supplier edge: exactly two BOUNDEDCONTEXT
+        // endpoints and both direction roles named.
+        let d = ctxmap_doc(
+            "CONTEXTMAP-001",
+            "Customer-Supplier",
+            &["BOUNDEDCONTEXT-1", "BOUNDEDCONTEXT-2"],
+            Some("BOUNDEDCONTEXT-1"),
+            Some("BOUNDEDCONTEXT-2"),
+        );
+        assert!(check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn context_map_shape_clean_symmetric_edge() {
+        // A Partnership edge: two endpoints, no direction roles.
+        let d = ctxmap_doc(
+            "CONTEXTMAP-002",
+            "Partnership",
+            &["BOUNDEDCONTEXT-3", "BOUNDEDCONTEXT-4"],
+            None,
+            None,
+        );
+        assert!(check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn context_map_shape_flags_one_endpoint() {
+        // DDD-003: a map resolving to fewer than two BOUNDEDCONTEXT ids fails
+        // the cardinality half.
+        let d = ctxmap_doc(
+            "CONTEXTMAP-003",
+            "Partnership",
+            &["BOUNDEDCONTEXT-5"],
+            None,
+            None,
+        );
+        let diags = check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "ddd.context-map-shape");
+        assert_eq!(diags[0].line, 5);
+        assert_eq!(
+            diags[0].message,
+            "CONTEXTMAP-003: a context map must connect exactly 2 BOUNDEDCONTEXT contexts, found 1"
+        );
+    }
+
+    #[test]
+    fn context_map_shape_flags_three_endpoints() {
+        // DDD-003: more than two endpoints is also a cardinality error.
+        let d = ctxmap_doc(
+            "CONTEXTMAP-004",
+            "Shared Kernel",
+            &["BOUNDEDCONTEXT-6", "BOUNDEDCONTEXT-7", "BOUNDEDCONTEXT-8"],
+            None,
+            None,
+        );
+        let diags = check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "ddd.context-map-shape");
+        assert_eq!(
+            diags[0].message,
+            "CONTEXTMAP-004: a context map must connect exactly 2 BOUNDEDCONTEXT contexts, found 3"
+        );
+    }
+
+    #[test]
+    fn context_map_shape_flags_asymmetric_missing_direction() {
+        // DDD-003: an asymmetric Customer-Supplier map missing `upstream`.
+        let d = ctxmap_doc(
+            "CONTEXTMAP-005",
+            "Customer-Supplier",
+            &["BOUNDEDCONTEXT-1", "BOUNDEDCONTEXT-2"],
+            None,
+            Some("BOUNDEDCONTEXT-2"),
+        );
+        let diags = check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "ddd.context-map-shape");
+        assert_eq!(diags[0].line, 8);
+        assert_eq!(
+            diags[0].message,
+            "CONTEXTMAP-005: asymmetric pattern `Customer-Supplier` must declare both `upstream` and `downstream` roles"
+        );
+    }
+
+    #[test]
+    fn context_map_shape_flags_symmetric_declaring_direction() {
+        // DDD-003: a symmetric Partnership map declaring a direction role.
+        let d = ctxmap_doc(
+            "CONTEXTMAP-006",
+            "Partnership",
+            &["BOUNDEDCONTEXT-1", "BOUNDEDCONTEXT-2"],
+            Some("BOUNDEDCONTEXT-1"),
+            None,
+        );
+        let diags = check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "ddd.context-map-shape");
+        assert_eq!(diags[0].line, 8);
+        assert_eq!(
+            diags[0].message,
+            "CONTEXTMAP-006: symmetric pattern `Partnership` must not declare `upstream`/`downstream` roles"
+        );
+    }
+
     // -- core.acceptance-complete (ADR-056 § EARS-01) -------------------
 
     /// A document carrying a `status` and a body parsed for headings and
@@ -7431,5 +8127,99 @@ shall is discussed in the EARS paper.
         let d = acceptance_doc("SPEC-099", "accepted", body);
         let diags = check_acceptance_complete(&d, None, Path::new("."));
         assert_eq!(diags.len(), 1);
+    }
+
+    // -- checklist pack (ADR-078) -----------------------------------------
+
+    #[test]
+    fn checklist_structure_flags_missing_fence() {
+        let d = doc("docs/checklists/x.md", "no frontmatter here\n- [ ] a\n", vec![]);
+        let diags = check_checklist_structure(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "checklist.structure");
+    }
+
+    #[test]
+    fn checklist_structure_empty_title_bad_status_and_no_box() {
+        let body = "---\ntitle: \nstatus: done\n---\njust prose, no boxes\n";
+        let d = doc("docs/checklists/x.md", body, vec![]);
+        let diags = check_checklist_structure(&d, None, Path::new("."));
+        // empty title + invalid status + no checkbox
+        assert_eq!(diags.len(), 3, "{diags:?}");
+    }
+
+    #[test]
+    fn checklist_structure_sealed_without_pin_errors() {
+        let body = "---\ntitle: Ship it\nstatus: sealed\n---\n- [x] done\n";
+        let d = doc("docs/checklists/x.md", body, vec![]);
+        let diags = check_checklist_structure(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("pinned_commit"), "{diags:?}");
+    }
+
+    #[test]
+    fn checklist_structure_valid_living_is_clean() {
+        let body = "---\ntitle: Stripe integration\nstatus: living\n---\n- [ ] provision keys\n";
+        let d = doc("docs/checklists/x.md", body, vec![]);
+        let diags = check_checklist_structure(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 0, "{diags:?}");
+    }
+
+    #[test]
+    fn checklist_complete_fires_one_per_unchecked_only_when_sealed() {
+        let sealed = "---\ntitle: T\nstatus: sealed\npinned_commit: deadbeef\n---\n\
+                      - [ ] a\n- [ ] b\n- [x] c\n";
+        let d = doc("docs/checklists/x.md", sealed, vec![]);
+        assert_eq!(check_checklist_complete(&d, None, Path::new(".")).len(), 2);
+
+        let living = "---\ntitle: T\nstatus: living\n---\n- [ ] a\n- [ ] b\n";
+        let d2 = doc("docs/checklists/x.md", living, vec![]);
+        assert_eq!(check_checklist_complete(&d2, None, Path::new(".")).len(), 0);
+    }
+
+    #[test]
+    fn checklist_pinned_rejects_malformed_and_skips_living() {
+        let sealed = "---\ntitle: T\nstatus: sealed\npinned_commit: abc123\n---\n- [x] a\n";
+        let d = doc("docs/checklists/x.md", sealed, vec![]);
+        let diags = check_checklist_pinned(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("40-character hex"), "{diags:?}");
+
+        let living = "---\ntitle: T\nstatus: living\npinned_commit: abc123\n---\n- [x] a\n";
+        let d2 = doc("docs/checklists/x.md", living, vec![]);
+        assert_eq!(check_checklist_pinned(&d2, None, Path::new(".")).len(), 0);
+    }
+
+    #[test]
+    fn required_headings_normalized_presence_and_noop_when_unset() {
+        // Doc H2s: a numbered "1. Plan" and "Go-live".
+        let d = doc(
+            "docs/checklists/x.md",
+            "body",
+            vec![(2, "1. Plan"), (2, "Go-live")],
+        );
+        let params = serde_json::json!({"headings": ["Plan", "Go-live", "Secret storage"]});
+        let diags = check_required_headings(&d, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("Secret storage"), "{diags:?}");
+
+        // Unset headings param is a silent no-op.
+        assert_eq!(check_required_headings(&d, None, Path::new(".")).len(), 0);
+    }
+
+    #[test]
+    fn required_anchors_presence_and_noop_when_unset() {
+        let d = doc(
+            "docs/checklists/x.md",
+            "item one <!-- @x.one --> and item two with no anchor",
+            vec![],
+        );
+        let params = serde_json::json!({"anchors": ["@x.one", "@x.two"]});
+        let diags = check_required_anchors(&d, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("@x.two"), "{diags:?}");
+
+        // Unset anchors param is a silent no-op.
+        assert_eq!(check_required_anchors(&d, None, Path::new(".")).len(), 0);
     }
 }
