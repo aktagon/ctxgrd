@@ -15,13 +15,20 @@
 //! both `summary` and `description`, for LSP shims, dashboards,
 //! policy audits, and docs generators.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
 
+use crate::builtin_rules::{Param, ParamKind};
 use crate::config::{Config, DiscoveredRule, Origin};
+
+/// `binding` for a namespace the config declares.
+pub const BINDING_CONFIGURED: &str = "configured";
+/// `binding` for a namespace no config declares, resolved through the
+/// zero-config fallback (BUG-049).
+pub const BINDING_ZERO_CONFIG: &str = "zero-config";
 
 /// One row of `ctxgrd rules` output.
 ///
@@ -34,17 +41,102 @@ pub struct RuleEntry {
     pub namespace: String,
     #[serde(rename = "rule")]
     pub code: String,
+    /// Where the rule's *implementation* comes from — `core`, a builtin
+    /// pack, or an external script. Orthogonal to `binding`, which says
+    /// why it applies to this namespace.
     pub source: String,
+    /// Why this rule applies here: `configured` when `ctxgrd.toml`
+    /// declares the namespace, `zero-config` when nothing does and the
+    /// six-rule fallback supplied it (BUG-049).
+    ///
+    /// A caller needs the distinction to tell "six rules because that is
+    /// the floor" from "six rules because that is what this project
+    /// chose" — the first is a prompt to run `ctxgrd init` or
+    /// `pack add`, the second is a deliberate configuration.
+    pub binding: String,
     pub params: Value,
+    /// The rule's declared configurable attributes (ADR-095 § PDOC-003):
+    /// a JSON array of `{name, kind, optional, values, doc}` objects
+    /// derived from `builtin_rules::BUILTIN_RULES`. Distinct from
+    /// `params`, which holds the *configured values* for this binding.
+    /// Empty array for pure-core and external rules.
+    pub attributes: Value,
     pub summary: String,
     pub description: String,
 }
 
-/// Built-in `(code, summary, description)` triples for the twelve
+/// Declared attributes for the parameterized rules that live in
+/// `rules.rs` rather than `BUILTIN_RULES`, which is where every other
+/// rule's `params` slice lives. Same [`Param`] records, so the two
+/// sources render identically (ADR-095 § PDOC-003, ADR-106 § DPS-003).
+const CORE_RULE_ATTRIBUTES: &[(&str, &[Param])] = &[(
+    "core.dep-status",
+    &[
+        Param {
+            name: "terminal",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &[],
+            doc: "Statuses that count as settled on both endpoints (default the shared terminal-status vocabulary).",
+        },
+        Param {
+            name: "severity",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &["error", "warning"],
+            doc: "Diagnostic level per offending edge (default error).",
+        },
+    ],
+)];
+
+/// Serialize a rule's declared attributes into the JSON array the
+/// `attributes` field carries (ADR-095 § PDOC-003). Reads `BUILTIN_RULES`
+/// first, then [`CORE_RULE_ATTRIBUTES`] for the `rules.rs` core rules. A
+/// code in neither (a non-parameterized core rule, an external rule) has
+/// no structured metadata and yields an empty array.
+fn attributes_for(code: &str) -> Value {
+    let params = crate::builtin_rules::BUILTIN_RULES
+        .iter()
+        .find(|r| r.code == code)
+        .map(|r| r.params)
+        .or_else(|| {
+            CORE_RULE_ATTRIBUTES
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, p)| *p)
+        });
+    let Some(params) = params else {
+        return Value::Array(Vec::new());
+    };
+    let items: Vec<Value> = params
+        .iter()
+        .map(|p| {
+            let kind = match p.kind {
+                crate::builtin_rules::ParamKind::ConfigParam => "config-param",
+                crate::builtin_rules::ParamKind::FrontmatterAttribute => "frontmatter-attribute",
+            };
+            let values: Vec<Value> = p
+                .values
+                .iter()
+                .map(|v| Value::String((*v).to_string()))
+                .collect();
+            serde_json::json!({
+                "name": p.name,
+                "kind": kind,
+                "optional": p.optional,
+                "values": values,
+                "doc": p.doc,
+            })
+        })
+        .collect();
+    Value::Array(items)
+}
+
+/// Built-in `(code, summary, description)` triples for the thirteen
 /// `core.*` rules. `summary` is the table cell; `description` is the
 /// wrapped paragraph in the detail box. Source of truth: the brief's
 /// "Built-in rules" table.
-pub const CORE_DESCRIPTIONS: &[(&str, &str, &str)] = &[
+pub(crate) const CORE_DESCRIPTIONS: &[(&str, &str, &str)] = &[
     (
         "core.frontmatter",
         "Documents must contain parseable YAML frontmatter.",
@@ -81,14 +173,27 @@ pub const CORE_DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "`depends_on` graph is acyclic, including self-edges.",
     ),
     (
+        "core.dep-status",
+        "A terminal-status document may not depend on a non-terminal one.",
+        "WHERE a document's `status` is in the `terminal` param set (default the shared \
+         terminal-status vocabulary), every document it `depends_on` must also be at a \
+         terminal status — one diagnostic per offending edge, anchored on the source \
+         document's `depends_on` line. The graph's only *state* assertion; \
+         `core.dep-resolved` / `core.dep-cycle` / `core.dep-shape` check shape. Silent when \
+         either endpoint declares no `status`, when the source is non-terminal, and for \
+         unresolved entries (those are `core.dep-resolved`'s). Params resolve from the \
+         source document's namespace; severity follows the `severity` param (`error` \
+         default). Opt-in — bound in no pack default (ADR-106 § DPS-004).",
+    ),
+    (
         "core.cross-ref",
         "Cross-reference tokens must resolve.",
-        "Reads `ast.cross_ref_tokens`; emits a diagnostic for each unresolved token that is not in code / strikethrough.",
+        "Reads `ast.cross_ref_tokens`; emits a diagnostic for each unresolved token that is not in code / strikethrough. When `[references].scan` is configured, non-markdown mentions are checked too — gated on at least one namespace enabling this rule, deduped per (file, target).",
     ),
     (
         "core.required-headings",
         "Required H2 headings must be present.",
-        "Reads `ast.headings`; emits a diagnostic per missing H2 heading, case-sensitive.",
+        "Reads `ast.headings`; emits a diagnostic per missing H2 heading. Normalized match: leading enumerator stripped, trailing colon dropped, case-insensitive.",
     ),
     (
         "core.required-metadata",
@@ -121,14 +226,49 @@ pub const CORE_DESCRIPTIONS: &[(&str, &str, &str)] = &[
 // BUILTIN_COMPILED_DESCRIPTIONS removed — descriptions are now derived from
 // crate::builtin_rules::BUILTIN_RULES at the point of use (ADR-024 § REG-002).
 
-/// Produce every `(namespace, rule-code)` entry the resolved config
-/// activates, sorted by `(namespace, code)`.
+/// Every registry rule's `(code, description)` pair — the pure `core.*`
+/// catalogue above plus every builtin-compiled rule.
+///
+/// Exported narrowly for `tests/adr_citation_status.rs`, which cross-checks
+/// the ADR citations these descriptions carry against those ADRs' recorded
+/// status; both registries are `pub(crate)`, and an integration test cannot
+/// reach them. Same shape as [`crate::builtin_param_names`], for the same
+/// reason. It lives here rather than in `builtin_rules` because the
+/// dependency runs this way (REG-003): `introspect` points down onto the
+/// registry, never the reverse.
+pub fn rule_descriptions() -> Vec<(&'static str, &'static str)> {
+    CORE_DESCRIPTIONS
+        .iter()
+        .map(|(code, _, description)| (*code, *description))
+        .chain(
+            crate::builtin_rules::BUILTIN_RULES
+                .iter()
+                .map(|r| (r.code, r.description)),
+        )
+        .collect()
+}
+
+/// Produce every `(namespace, rule-code)` entry that would actually run,
+/// sorted by `(namespace, code)`.
+///
+/// `governed` is the namespace set to report on — see
+/// [`crate::run::governed_namespaces`]. It is a superset of
+/// `config.namespaces`: a namespace claimed by a document but absent
+/// from the config resolves through [`Config::namespace_config`] to the
+/// zero-config six, exactly as the lint path resolves it, and is
+/// reported with `binding: "zero-config"` (BUG-049).
+///
+/// Passing only `config.namespaces.keys()` reproduces the pre-fix
+/// behaviour, which is why the set is a parameter rather than something
+/// this function derives: the caller that has the tree decides, and the
+/// resolution below stays the single place a namespace becomes rules.
 ///
 /// `filter` restricts output to one namespace when `Some`.
 pub fn list_rules(
     config: &Config,
     discovered: &BTreeMap<String, DiscoveredRule>,
     filter: Option<&str>,
+    governed: &BTreeSet<String>,
 ) -> Vec<RuleEntry> {
     let core_map: BTreeMap<&str, (&str, &str)> = CORE_DESCRIPTIONS
         .iter()
@@ -136,12 +276,20 @@ pub fn list_rules(
         .collect();
 
     let mut entries = Vec::new();
-    for (namespace, ns_cfg) in &config.namespaces {
+    for namespace in governed {
         if let Some(ns) = filter {
             if ns != namespace {
                 continue;
             }
         }
+        // Same resolution the lint path uses (`run::lint_run` →
+        // `config.namespace_config(ns)`), so the two cannot drift again.
+        let ns_cfg = config.namespace_config(namespace);
+        let binding = if config.namespaces.contains_key(namespace) {
+            BINDING_CONFIGURED
+        } else {
+            BINDING_ZERO_CONFIG
+        };
         for code in &ns_cfg.rules {
             let params = ns_cfg
                 .params
@@ -153,7 +301,9 @@ pub fn list_rules(
                 namespace: namespace.clone(),
                 code: code.clone(),
                 source,
+                binding: binding.to_string(),
                 params,
+                attributes: attributes_for(code),
                 summary,
                 description,
             });
@@ -253,20 +403,38 @@ fn read_readme_summary_and_body(run_path: &Path) -> (String, String) {
 /// Columns: `namespace`, `rule`, `source`, `summary`. Params and the
 /// long-form description live in [`render_detail`]; the list view
 /// optimises for grep-friendliness and vertical scanning.
+/// The `binding` column is rendered only when at least one row is
+/// `zero-config`. In a fully configured project every row would read
+/// `configured`, which is a column of noise; the column earns its width
+/// exactly when it carries news (BUG-049).
 pub fn render_table(entries: &[RuleEntry]) -> String {
     let headers = ("namespace", "rule", "source", "summary");
     let ns_w = col_width(entries, |e| &e.namespace, headers.0);
     let code_w = col_width(entries, |e| &e.code, headers.1);
     let src_w = col_width(entries, |e| &e.source, headers.2);
+    let show_binding = entries.iter().any(|e| e.binding == BINDING_ZERO_CONFIG);
+    let bind_w = if show_binding {
+        col_width(entries, |e| &e.binding, "binding")
+    } else {
+        0
+    };
 
     let mut out = String::new();
     use std::fmt::Write as _;
+    let bind_cell = |value: &str| {
+        if show_binding {
+            format!("{value:bind_w$}  ")
+        } else {
+            String::new()
+        }
+    };
     let _ = writeln!(
         out,
-        "{:ns_w$}  {:code_w$}  {:src_w$}  {}",
+        "{:ns_w$}  {:code_w$}  {:src_w$}  {}{}",
         headers.0,
         headers.1,
         headers.2,
+        bind_cell("binding"),
         headers.3,
         ns_w = ns_w,
         code_w = code_w,
@@ -275,10 +443,11 @@ pub fn render_table(entries: &[RuleEntry]) -> String {
     for e in entries {
         let _ = writeln!(
             out,
-            "{:ns_w$}  {:code_w$}  {:src_w$}  {}",
+            "{:ns_w$}  {:code_w$}  {:src_w$}  {}{}",
             e.namespace,
             e.code,
             e.source,
+            bind_cell(&e.binding),
             e.summary,
             ns_w = ns_w,
             code_w = code_w,
@@ -326,6 +495,42 @@ fn compact_params(v: &Value) -> String {
             .join(", "),
         _ => compact_value(v),
     }
+}
+
+/// One compact line per declared attribute (ADR-095 § PDOC-003), e.g.
+/// `headings (config, optional)` or
+/// `research.type (frontmatter, optional: academic|market|deep-research)`.
+/// Reads the JSON array `attributes_for` produced; an empty or non-array
+/// value yields no lines (the detail box renders `—`).
+fn compact_attributes(v: &Value) -> Vec<String> {
+    let Value::Array(items) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
+            let kind = match item.get("kind").and_then(Value::as_str) {
+                Some("frontmatter-attribute") => "frontmatter",
+                _ => "config",
+            };
+            let optional = item
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let opt = if optional { "optional" } else { "required" };
+            let values: Vec<&str> = item
+                .get("values")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if values.is_empty() {
+                format!("{name} ({kind}, {opt})")
+            } else {
+                format!("{name} ({kind}, {opt}: {})", values.join("|"))
+            }
+        })
+        .collect()
 }
 
 fn compact_value(v: &Value) -> String {
@@ -405,6 +610,14 @@ fn render_box(e: &RuleEntry) -> String {
 
     write_row(&mut out, "Source", &e.source);
     write_row(&mut out, "Params", &compact_params(&e.params));
+    let attr_lines = compact_attributes(&e.attributes);
+    if attr_lines.is_empty() {
+        write_row(&mut out, "Attributes", "—");
+    } else {
+        for line in &attr_lines {
+            write_row(&mut out, "Attribute", line);
+        }
+    }
     write_row(&mut out, "Summary", &e.summary);
 
     // Body divider (┴)
@@ -498,6 +711,15 @@ mod tests {
     use crate::config::NamespaceConfig;
     use serde_json::json;
 
+    /// The governed set a pre-BUG-049 caller implied: the config's own
+    /// namespaces and nothing else. Correct for the rendering and
+    /// resolution tests below, which supply their namespaces directly
+    /// and never touch a tree. The zero-config half is exercised in
+    /// `tests/rules_lint_agreement.rs`, against real directories.
+    fn configured_only(config: &Config) -> BTreeSet<String> {
+        config.namespaces.keys().cloned().collect()
+    }
+
     fn sample_config() -> Config {
         let mut config = Config::default();
         config.namespaces.insert(
@@ -515,6 +737,7 @@ mod tests {
                 .into(),
                 paths: None,
                 path_patterns: Vec::new(),
+                owner: None,
             },
         );
         config
@@ -542,7 +765,7 @@ mod tests {
     fn list_rules_sorts_and_annotates_source_column() {
         let config = sample_config();
         let discovered = discovered_with(&[("adr.consequences-non-empty", Origin::Repo)]);
-        let entries = list_rules(&config, &discovered, None);
+        let entries = list_rules(&config, &discovered, None, &configured_only(&config));
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].code, "adr.consequences-non-empty");
         assert_eq!(entries[0].source, "ext:repo");
@@ -555,15 +778,15 @@ mod tests {
     fn list_rules_filters_by_namespace() {
         let config = sample_config();
         let discovered = BTreeMap::new();
-        assert!(list_rules(&config, &discovered, Some("PRD")).is_empty());
-        assert_eq!(list_rules(&config, &discovered, Some("ADR")).len(), 3);
+        assert!(list_rules(&config, &discovered, Some("PRD"), &configured_only(&config)).is_empty());
+        assert_eq!(list_rules(&config, &discovered, Some("ADR"), &configured_only(&config)).len(), 3);
     }
 
     #[test]
     fn core_rules_pick_up_summary_and_description() {
         let config = sample_config();
         let discovered = BTreeMap::new();
-        let entries = list_rules(&config, &discovered, Some("ADR"));
+        let entries = list_rules(&config, &discovered, Some("ADR"), &configured_only(&config));
         let fm = entries
             .iter()
             .find(|e| e.code == "core.frontmatter")
@@ -589,10 +812,11 @@ mod tests {
                 params: Default::default(),
                 paths: None,
                 path_patterns: Vec::new(),
+                owner: None,
             },
         );
         let discovered = discovered_with(&[("adr.shared-rule", Origin::Global)]);
-        let entries = list_rules(&config, &discovered, None);
+        let entries = list_rules(&config, &discovered, None, &configured_only(&config));
         assert_eq!(entries[0].source, "ext:global");
     }
 
@@ -600,7 +824,7 @@ mod tests {
     fn render_table_columns_are_namespace_rule_source_summary() {
         let config = sample_config();
         let discovered = discovered_with(&[("adr.consequences-non-empty", Origin::Repo)]);
-        let entries = list_rules(&config, &discovered, Some("ADR"));
+        let entries = list_rules(&config, &discovered, Some("ADR"), &configured_only(&config));
         let text = render_table(&entries);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("namespace"));
@@ -623,7 +847,7 @@ mod tests {
     fn render_table_includes_summary_text_per_row() {
         let config = sample_config();
         let discovered = BTreeMap::new();
-        let entries = list_rules(&config, &discovered, Some("ADR"));
+        let entries = list_rules(&config, &discovered, Some("ADR"), &configured_only(&config));
         let text = render_table(&entries);
         // Summary strings for the two core rules in the sample.
         assert!(text.contains("Documents must contain parseable YAML frontmatter."));
@@ -668,7 +892,7 @@ mod tests {
     fn render_detail_renders_box_with_all_four_sections() {
         let config = sample_config();
         let discovered = BTreeMap::new();
-        let entries = list_rules(&config, &discovered, None);
+        let entries = list_rules(&config, &discovered, None, &configured_only(&config));
         let text = render_detail(&entries, "core.allowed-values", &discovered);
 
         // Box-drawing borders present.
@@ -709,11 +933,12 @@ mod tests {
                     params: Default::default(),
                     paths: None,
                     path_patterns: Vec::new(),
+                owner: None,
                 },
             );
         }
         let discovered = BTreeMap::new();
-        let entries = list_rules(&config, &discovered, None);
+        let entries = list_rules(&config, &discovered, None, &configured_only(&config));
         let text = render_detail(&entries, "core.cross-ref", &discovered);
         // Two distinct headers — one per namespace.
         assert!(text.contains("ADR :: core.cross-ref"));
@@ -730,7 +955,7 @@ mod tests {
     fn render_box_rows_are_all_the_same_width() {
         let config = sample_config();
         let discovered = BTreeMap::new();
-        let entries = list_rules(&config, &discovered, Some("ADR"));
+        let entries = list_rules(&config, &discovered, Some("ADR"), &configured_only(&config));
         let text = render_detail(&entries, "core.allowed-values", &discovered);
         // Collect the character widths of every non-empty line. They
         // must all be equal — otherwise the box borders misalign in
@@ -755,7 +980,7 @@ mod tests {
     fn render_json_serialises_full_entry_shape_including_summary() {
         let config = sample_config();
         let discovered = discovered_with(&[("adr.consequences-non-empty", Origin::Repo)]);
-        let entries = list_rules(&config, &discovered, Some("ADR"));
+        let entries = list_rules(&config, &discovered, Some("ADR"), &configured_only(&config));
         let json = render_json(&entries);
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(&json).expect("render_json is valid JSON");
@@ -767,6 +992,7 @@ mod tests {
         assert!(first.get("namespace").is_some());
         assert!(first.get("source").is_some());
         assert!(first.get("params").is_some());
+        assert!(first.get("attributes").is_some());
         assert!(first.get("summary").is_some());
         assert!(first.get("description").is_some());
     }
@@ -778,11 +1004,10 @@ mod tests {
 
     #[test]
     fn dep_shape_listed_as_a_normal_rule_and_conformance_is_gone() {
-        use crate::config::PipelineConfig;
-
-        // ADR-039 § DAG-003: `pipeline.conformance` no longer exists, and a
-        // declared `[pipeline]` no longer synthesizes auto-rule entries.
-        // `core.dep-shape` is a normal namespace-listed rule.
+        // ADR-039 § DAG-003: `pipeline.conformance` no longer exists.
+        // `core.dep-shape` is a normal namespace-listed rule — and since
+        // ADR-118 § STG-002 deleted `[pipeline]` outright, it is now the
+        // only namespace-level edge declaration there is.
         let mut config = Config::default();
         config.namespaces.insert(
             "SPEC".to_string(),
@@ -791,14 +1016,11 @@ mod tests {
                 params: Default::default(),
                 paths: None,
                 path_patterns: Vec::new(),
+                owner: None,
             },
         );
-        config.pipeline = Some(PipelineConfig {
-            stages: vec!["SPEC".to_string()],
-            gates: std::collections::BTreeMap::new(),
-        });
         let discovered = BTreeMap::new();
-        let entries = list_rules(&config, &discovered, None);
+        let entries = list_rules(&config, &discovered, None, &configured_only(&config));
         assert!(
             entries.iter().all(|e| e.code != "pipeline.conformance"),
             "pipeline.conformance must not appear — it was deleted (DAG-003)"

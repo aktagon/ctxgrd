@@ -62,6 +62,15 @@ pub(crate) enum FrontmatterError {
     /// No opening `---` fence on line 1, or no closing `---` fence found.
     #[error("missing '---' frontmatter fence")]
     MissingFence,
+    /// No closing `---` fence, but a YAML document-end marker `...` was
+    /// found where the fence would be. Deliberately not accepted as a
+    /// delimiter (BUG-026) — this variant exists so the diagnostic names
+    /// the near-miss instead of the generic missing-fence text.
+    #[error(
+        "missing '---' closing fence: line {line} is '...', \
+         but ctxgrd accepts only '---' as the closing fence"
+    )]
+    MissingFenceDotsTerminator { line: u32 },
     /// Fence was present and delimited a region, but the YAML inside did
     /// not deserialize as a mapping.
     #[error("invalid YAML frontmatter: {0}")]
@@ -91,9 +100,7 @@ impl Frontmatter {
         body: &str,
     ) -> Result<(Self, BTreeMap<String, u32>), FrontmatterError> {
         let body = strip_bom(body);
-        let Some(yaml) = extract_yaml_block(body) else {
-            return Err(FrontmatterError::MissingFence);
-        };
+        let yaml = extract_yaml_block(body)?;
 
         // Parse into a JSON Value so the internal representation matches
         // the rule-stdin context wire format. serde_yaml routes through
@@ -234,7 +241,7 @@ pub(crate) fn body_start_offset(body: &str) -> usize {
     for line in rest.split_inclusive('\n') {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
         cursor += line.len();
-        if trimmed == FENCE {
+        if is_closing_fence(trimmed) {
             return cursor;
         }
     }
@@ -317,14 +324,31 @@ fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
+/// Whether a line (already stripped of its terminator) closes a
+/// frontmatter block: exactly `---` after trimming trailing spaces and
+/// tabs. Trailing whitespace is invisible in every editor and accepted
+/// by the common frontmatter parsers (gray-matter, python-frontmatter),
+/// so rejecting it produced an unactionable missing-fence error
+/// (BUG-026). Only the CLOSING fence is this lenient — the opening
+/// fence is the intent signal and stays exact. Shared by
+/// [`extract_yaml_block`] and [`body_start_offset`] so the two walks
+/// cannot disagree.
+fn is_closing_fence(line_content: &str) -> bool {
+    line_content.trim_end_matches([' ', '\t']) == FENCE
+}
+
 /// Return the YAML text between an opening `---` line and the next
-/// `---` line, or `None` if either fence is missing.
+/// closing fence, or the reason no block was found.
 ///
 /// The opening fence MUST be on line 1 with no leading whitespace other
 /// than an optional BOM (already stripped upstream). A closing fence is
-/// any line that trims to exactly `---`.
-fn extract_yaml_block(body: &str) -> Option<&str> {
-    let after_fence = body.strip_prefix(FENCE)?;
+/// any line satisfying [`is_closing_fence`]. A YAML document-end marker
+/// `...` where the fence would be is reported as its own error so the
+/// diagnostic can name the near-miss (BUG-026).
+fn extract_yaml_block(body: &str) -> Result<&str, FrontmatterError> {
+    let Some(after_fence) = body.strip_prefix(FENCE) else {
+        return Err(FrontmatterError::MissingFence);
+    };
     // Require the opening fence to be its own line: allow `\n` or `\r\n`
     // immediately after `---`. Anything else (e.g. `---foo`) disqualifies.
     let rest = if let Some(r) = after_fence.strip_prefix('\n') {
@@ -332,17 +356,24 @@ fn extract_yaml_block(body: &str) -> Option<&str> {
     } else if let Some(r) = after_fence.strip_prefix("\r\n") {
         r
     } else {
-        return None;
+        return Err(FrontmatterError::MissingFence);
     };
 
-    // Walk lines looking for the closing fence.
+    // Walk lines looking for the closing fence. Line 1 is the opening
+    // fence, so the first walked line is line 2.
     let mut end_of_yaml = None;
+    let mut dots_line: Option<u32> = None;
     let mut cursor = 0usize;
+    let mut line_no: u32 = 1;
     for line in rest.split_inclusive('\n') {
+        line_no += 1;
         let line_content = line.trim_end_matches('\n').trim_end_matches('\r');
-        if line_content == FENCE {
+        if is_closing_fence(line_content) {
             end_of_yaml = Some(cursor);
             break;
+        }
+        if dots_line.is_none() && line_content.trim_end_matches([' ', '\t']) == "..." {
+            dots_line = Some(line_no);
         }
         cursor += line.len();
     }
@@ -355,7 +386,11 @@ fn extract_yaml_block(body: &str) -> Option<&str> {
         }
     }
 
-    end_of_yaml.map(|end| &rest[..end])
+    match (end_of_yaml, dots_line) {
+        (Some(end), _) => Ok(&rest[..end]),
+        (None, Some(line)) => Err(FrontmatterError::MissingFenceDotsTerminator { line }),
+        (None, None) => Err(FrontmatterError::MissingFence),
+    }
 }
 
 fn value_kind(v: &Value) -> &'static str {
@@ -435,6 +470,61 @@ mod tests {
         let body = "---\r\nid: ADR-001\r\n---\r\n# body\r\n";
         let fm = parse(body).unwrap();
         assert_eq!(fm.id.as_deref(), Some("ADR-001"));
+    }
+
+    #[test]
+    fn closing_fence_with_trailing_whitespace_accepted() {
+        // BUG-026: `--- ` — invisible in every editor, accepted by
+        // gray-matter / python-frontmatter — closes the block. Tabs too.
+        let body = "---\nid: ADR-2\ntitle: T\n--- \n## Status\n";
+        let fm = parse(body).unwrap();
+        assert_eq!(fm.id.as_deref(), Some("ADR-2"));
+        let body_tab = "---\nid: ADR-2\ntitle: T\n---\t\n## Status\n";
+        assert_eq!(parse(body_tab).unwrap().id.as_deref(), Some("ADR-2"));
+    }
+
+    #[test]
+    fn body_start_offset_accepts_trailing_whitespace_fence() {
+        // The two fence walks must agree, or the AST would re-parse the
+        // frontmatter as markdown body.
+        let body = "---\nid: ADR-2\n--- \n## Status\n";
+        let off = body_start_offset(body);
+        assert_eq!(&body[off..], "## Status\n");
+    }
+
+    #[test]
+    fn dots_terminator_rejected_with_pointed_error() {
+        // BUG-026, decided half: pandoc's `...` document-end marker is
+        // deliberately NOT a ctxgrd closing fence — but the error names
+        // the near-miss instead of the generic missing-fence text.
+        let body = "---\nid: ADR-3\ntitle: T\n...\n## Status\n";
+        let msg = parse(body).unwrap_err().to_string();
+        assert!(msg.contains("..."), "must name the `...` near-miss: {msg}");
+        assert!(
+            msg.contains("---"),
+            "must say what the closing fence has to be: {msg}"
+        );
+    }
+
+    #[test]
+    fn opening_fence_stays_strict_no_trailing_whitespace() {
+        // Only the CLOSING fence tolerates trailing whitespace — the
+        // opening fence is the intent signal and stays exact.
+        let body = "--- \nid: ADR-2\n---\n";
+        assert_eq!(parse(body).unwrap_err(), FrontmatterError::MissingFence);
+    }
+
+    #[test]
+    fn block_scalar_column_zero_dashes_are_content() {
+        // Control from the BUG-026 report: an indented `---` inside a
+        // block scalar is YAML content, not a closing fence.
+        let body = "---\nid: ADR-1\ntitle: T\nnotes: |\n  a\n  ---\n  b\n---\n## Status\n";
+        let fm = parse(body).unwrap();
+        assert_eq!(fm.id.as_deref(), Some("ADR-1"));
+        assert_eq!(
+            fm.metadata.get("notes"),
+            Some(&serde_json::json!("a\n---\nb\n"))
+        );
     }
 
     #[test]

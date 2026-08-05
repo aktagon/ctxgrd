@@ -1,0 +1,66 @@
+# summary: INTSTRIPE — the seven-phase Stripe web-integration checklist: a commit-pinned sign-off whose phases and @stripe.* anchors ctxgrd enumerates and wrkgrd's anchor-coverage proves.
+# The ctxgrd "presence" leg of the Stripe verification triad (cmplgrd PRD-001
+# orchestrates; wrkgrd's anchor-coverage proves the tier=code half; wrkgrd's
+# secret-scan + stripe-raw-price-id detector cover the fixed-shape half). Unblocked
+# by the generic core.required-headings / core.required-anchors rules — ADR-078
+# § CHK-006 deferred this pack until they shipped. No external scripts.
+#
+# Dedicated [INTSTRIPE] namespace on its OWN path (docs/integrations/stripe/**), so
+# it coexists with the generic `checklist` pack rather than colliding on
+# docs/checklists/** — do NOT point paths there (glob-subset → cfg.path-conflict).
+# It binds the checklist.* rules per-namespace: the same living|sealed +
+# commit-pinned sign-off machinery, id-less (filename = slug).
+#
+# Anchors carry their tier INLINE (tier=code|attest) — byte-identical to the
+# canonical template the dev-stripe skill ships and to what wrkgrd's anchor-coverage
+# parses. The required-anchors strings below include the tier on purpose: a
+# tier-less checklist must fail here, not slip past ctxgrd invisible to wrkgrd.
+
+[INTSTRIPE]
+paths = ["docs/integrations/stripe/**"]
+rules = [
+    "checklist.structure",
+    "checklist.complete",
+    "checklist.pinned",
+    "core.required-headings",
+    "core.required-anchors",
+]
+
+# The seven canonical Stripe web-integration phases (ADR-078 § CHK-006). Matching
+# strips a leading enumerator and is case-insensitive, so `## 1. Plan / account
+# structure` matches the unnumbered config below.
+[INTSTRIPE."core.required-headings"]
+headings = [
+    "Plan / account structure",
+    "API key provisioning",
+    "Secret storage",
+    "Implement",
+    "Test",
+    "Go-live",
+    "Post-go-live",
+]
+
+# The @stripe.* body anchors — substring markers ctxgrd asserts are present and
+# wrkgrd's anchor-coverage rule proves the code behind. Full inline-tier strings,
+# byte-identical to the dev-stripe template. Grouped by phase:
+#   Phase 2 (keys):   key-scopes (attest)
+#   Phase 3 (secret): no-committed-secret (attest)
+#   Phase 4 (impl):   getstripe-guard, error-handling, tax-customer-update,
+#                     metered-unconditional, webhook-signature, webhook-idempotency,
+#                     plan-not-priceid, atomic-price-resolution, app-scope (all code)
+#   Phase 6 (go-live): mode-parity (attest)
+[INTSTRIPE."core.required-anchors"]
+anchors = [
+    "<!-- @stripe.key-scopes tier=attest -->",
+    "<!-- @stripe.no-committed-secret tier=attest -->",
+    "<!-- @stripe.getstripe-guard tier=code -->",
+    "<!-- @stripe.error-handling tier=code -->",
+    "<!-- @stripe.tax-customer-update tier=code -->",
+    "<!-- @stripe.metered-unconditional tier=code -->",
+    "<!-- @stripe.webhook-signature tier=code -->",
+    "<!-- @stripe.webhook-idempotency tier=code -->",
+    "<!-- @stripe.plan-not-priceid tier=code -->",
+    "<!-- @stripe.atomic-price-resolution tier=code -->",
+    "<!-- @stripe.app-scope tier=code -->",
+    "<!-- @stripe.mode-parity tier=attest -->",
+]

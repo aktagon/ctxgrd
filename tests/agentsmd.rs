@@ -13,12 +13,17 @@ use std::process::Output;
 
 use assert_cmd::Command;
 
+/// Both namespaces declare an `owner` (ADR-076 § OWN-003) — without one
+/// the always-on `cfg.namespace-unowned` gate would warn here, and the
+/// `ok:` summary these tests assert on is suppressed by any diagnostic.
 const CONFIG: &str = r#"
 [AGENTS]
+owner = "developer"
 paths = ["CLAUDE.md", "AGENTS.md"]
 rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
 
 [TODO]
+owner = "developer"
 paths = ["TODO.md"]
 rules = ["todo.freshness", "todo.structure"]
 

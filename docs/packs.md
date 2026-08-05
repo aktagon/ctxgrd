@@ -19,6 +19,35 @@ ctxgrd pack list                 # every discoverable pack + its source
 ctxgrd pack show project-docs    # the namespaces, rules, and scripts it defines
 ```
 
+### The machine-readable contract
+
+`pack show <name> --format json` emits the **complete** namespace contract — not a
+summary of it. Every `[NS."rule.code"]` param table the pack declares appears under
+`namespaces[].params`, keyed by rule code: closed vocabularies in full, freshness
+windows, conditional-rule params. Nothing is withheld (ADR-113 § PKJ-001).
+
+This is the surface a tool or an agent should read when it needs to know a document's
+shape, instead of restating that shape somewhere it can drift (ADR-076 § OWN-001/002).
+
+```
+ctxgrd pack show soc2 --format json | jq '.namespaces[0].params."core.allowed-values".criterion'
+```
+
+Two properties are contractual:
+
+- **The output is canonical.** Object keys are sorted, arrays keep their declared order,
+  and two invocations are byte-identical. So you can pin a digest you compute yourself —
+  `shasum -a 256 <(ctxgrd pack show soc2 --format json)` — and fail when the pack moves.
+  ctxgrd emits no digest field of its own (ADR-113 § PKJ-002).
+- **`scope` says which artifact you are reading.** It is always `pack-definition`: the
+  pack as shipped, *not* your project's `ctxgrd.toml`. `pack add` copies blocks into your
+  config, so the two diverge as a pack evolves. `depends` names the base pack, whose
+  namespaces are part of the real contract (`soc2` layers over `security`).
+
+`pack outdated` reports the gap between your `ctxgrd.toml` and the pack definition. **It
+never sees a downstream tool or skill** — do not cite it as evidence that anything outside
+your config is in sync (ADR-113 § PKJ-004).
+
 ## Applying a pack
 
 ```
@@ -174,6 +203,23 @@ config error. So CI or an agent can branch on the outcome without parsing text.
   and the id prefix are the same string. Tactical patterns (Value Objects,
   Entities, Repositories, Domain Services) are cut outright — they are
   code-shaped and belong in code, not docs.
+- `governance` — a program/governance decision register (ADR-092). One id-claimed
+  namespace, `DEC` (`docs/decisions/[0-9]*.md`, ids `DEC-<n>`), for the
+  program-management **decision register** standard — one record per material
+  program decision, the directory listing *is* the register. Pure `core.*`: required
+  headings `Decision` / `Rationale` / `Impact` / `Approval`, required metadata `id` /
+  `title` / `status` / `decision-maker` / `date`, and a governance `status`
+  vocabulary (`proposed` / `pending` / `approved` / `rejected` / `deferred` /
+  `superseded`), all config-overridable. Deliberately *not* the `ADR` namespace: an
+  ADR is a technical decision owned by engineering; a `DEC` is a program/strategic
+  decision emphasizing **authority** (the required `decision-maker`) and cross-cutting
+  **impact** (scope / cost / schedule / benefits / risk / stakeholders) over technical
+  consequences. `DEC`→`DEC` supersession rides the `depends_on` graph
+  (`core.dep-cycle`, `core.successor-link`); external evidence (a board paper, change
+  request, minutes) goes in a free-form `evidence:` key so it never trips
+  `core.dep-resolved`. Ships no `core.min-docs`, so it is safe to adopt ahead of
+  recording the first decision. The first member of the RAID+ register family, kept
+  in its own opt-in pack the way the change register (`CR`) lives in `intake`.
 
 ## Pack layout
 

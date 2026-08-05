@@ -35,7 +35,7 @@ use crate::id::DocumentId;
 /// The cutover boundary (CHG-006). Everything from this line to EOF is
 /// hand-authored history that `--write` preserves verbatim; everything
 /// above it is regenerated.
-pub const CUTOVER_MARKER: &str =
+pub(crate) const CUTOVER_MARKER: &str =
     "<!-- ctxgrd:cutover — hand-authored history below is not regenerated (ADR-084 § CHG-006) -->";
 
 /// Keep-a-Changelog section categories, in canonical render order. A

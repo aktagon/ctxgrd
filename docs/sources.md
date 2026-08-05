@@ -30,6 +30,39 @@ project = "AUDIT"
 The table contents become the source's parameters (see below). An empty
 table `[sources.jira-stub]` is valid — the source receives `CTXGRD_SOURCE_PARAMS='{}'`.
 
+### `expect_min` — the floor on what a source must emit
+
+Writing `[sources.<name>]` states that the source is expected to produce
+something, so ctxgrd holds it to a floor of **one document by default**. A
+source that runs to completion and emits fewer warns:
+
+```
+warning[src.too-few-documents]: source 'statute' emitted 0 of an expected minimum of 1
+```
+
+This is not pedantry. A source that exits 0 without writing to stdout
+produces a run byte-identical to one where every document passed — the gate
+disappears and nothing says so. A `set -e` that aborts an emit loop partway
+is the usual way this happens.
+
+Set the floor explicitly when you know how many documents to expect, which
+also catches a partial emit:
+
+```toml
+[sources.statute]
+expect_min = 8   # one per clause of the statute
+```
+
+Set it to `0` for a source that may legitimately emit nothing:
+
+```toml
+[sources.optional-feed]
+expect_min = 0
+```
+
+`expect_min` is ctxgrd's own key and is stripped from the parameters before
+they reach the script — a source never sees it in `CTXGRD_SOURCE_PARAMS`.
+
 ## The script contract
 
 ctxgrd invokes the source once per lint run:

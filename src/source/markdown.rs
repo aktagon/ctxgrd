@@ -11,6 +11,7 @@
 //! like any other — the brief's dot-skip rule applies to *source*
 //! subdirectories (SRC-001), not markdown content.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,10 @@ pub struct ScanResult {
     /// `cfg.path-conflict` `KernelMessage`s by the orchestrator
     /// (ADR-007 § DOC-007).
     pub path_conflicts: Vec<PathConflict>,
+    /// Namespaces whose `paths` globs matched only files the walker
+    /// skipped for not being markdown — surfaced as `cfg.paths-skipped`
+    /// `KernelMessage`s by the orchestrator (ADR-119 § CLM-003).
+    pub(crate) skipped_by_extension: SkipTally,
 }
 
 /// A diagnostic generated while turning a file into a [`Document`].
@@ -73,6 +78,10 @@ pub enum ParseDiagnosticKind {
     /// for parsing. Maps to `src.markdown-decode`. `offset` is the byte
     /// position of the first invalid byte (`Utf8Error::valid_up_to`).
     Undecodable { offset: usize },
+    /// The file could not be read at all (permission denied, vanished
+    /// between walk and read). Maps to `src.markdown-read`. `message`
+    /// is the I/O error's display text (BUG-024).
+    Unreadable { message: String },
 }
 
 /// Outcome of turning one file into a document.
@@ -124,39 +133,43 @@ pub fn scan(
             &empty
         }
     };
-    let paths = sorted_markdown_files(root, ignore, claims)?;
+    let (paths, skipped_by_extension) = sorted_markdown_files_with_skips(root, ignore, claims)?;
     let mut documents = Vec::with_capacity(paths.len());
     let mut parse_diagnostics = Vec::new();
     let mut path_conflicts = Vec::new();
 
     for path in paths {
         let location = render_location(root, &path);
-        // Read bytes and decode per file, so one undecodable file is a
-        // per-file outcome — never an abort of the whole walk. A genuine
-        // I/O error (vanished file, permission denied) is still fatal via
-        // `?`; only the decode is recovered here.
-        let bytes = fs::read(&path)?;
-        let outcome = match String::from_utf8(bytes) {
-            Ok(body) => parse_one(&body, location, claims),
-            // ADR-007 §DOC-001: only files that claim intent are ctxgrd
-            // documents. An undecodable *path-claimed* file is a configured
-            // record we cannot read — a real defect that earns a diagnostic.
-            // An unclaimed one (README, scratch note) is skipped silently,
-            // exactly as a decodable non-document is. An `id:`-claim is
-            // unknowable without decoding, so the path-claim is the only
-            // signal available here.
-            Err(e) => {
-                if claims.matching_namespaces(&location).next().is_some() {
-                    ParseOutcome::Diagnostic(ParseDiagnostic {
-                        location,
-                        kind: ParseDiagnosticKind::Undecodable {
-                            offset: e.utf8_error().valid_up_to(),
-                        },
-                    })
-                } else {
-                    ParseOutcome::Skip
-                }
-            }
+        // Read and decode per file, so one unreadable or undecodable file
+        // is a per-file outcome — never an abort of the whole walk
+        // (BUG-011 for decode, BUG-024 for the read itself).
+        //
+        // ADR-007 §DOC-001: only files that claim intent are ctxgrd
+        // documents. An unreadable/undecodable *path-claimed* file is a
+        // configured record we cannot read — a real defect that earns a
+        // diagnostic. An unclaimed one (README, scratch note) is skipped
+        // silently, exactly as a decodable non-document is. An `id:`-claim
+        // is unknowable without reading, so the path-claim is the only
+        // signal available here.
+        let claimed = claims.matching_namespaces(&location).next().is_some();
+        let outcome = match fs::read(&path) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(body) => parse_one(&body, location, claims),
+                Err(e) if claimed => ParseOutcome::Diagnostic(ParseDiagnostic {
+                    location,
+                    kind: ParseDiagnosticKind::Undecodable {
+                        offset: e.utf8_error().valid_up_to(),
+                    },
+                }),
+                Err(_) => ParseOutcome::Skip,
+            },
+            Err(e) if claimed => ParseOutcome::Diagnostic(ParseDiagnostic {
+                location,
+                kind: ParseDiagnosticKind::Unreadable {
+                    message: e.to_string(),
+                },
+            }),
+            Err(_) => ParseOutcome::Skip,
         };
         match outcome {
             ParseOutcome::Document(doc) => documents.push(doc),
@@ -170,6 +183,7 @@ pub fn scan(
         documents,
         parse_diagnostics,
         path_conflicts,
+        skipped_by_extension,
     })
 }
 
@@ -357,28 +371,88 @@ pub(crate) fn sorted_markdown_files(
     ignore: Option<&globset::GlobSet>,
     claims: &PathClaims,
 ) -> io::Result<Vec<PathBuf>> {
+    Ok(sorted_markdown_files_with_skips(root, ignore, claims)?.0)
+}
+
+/// Namespace → extension → how many files that namespace's `paths` globs
+/// matched and the walker then skipped for not being markdown
+/// (ADR-119 § CLM-003).
+///
+/// Filtered to namespaces that matched *no* markdown at all: a namespace
+/// holding real documents alongside some `.png` assets is working as
+/// intended and must stay quiet. What is left is the false-green shape —
+/// a live claim that ingested nothing.
+pub(crate) type SkipTally = BTreeMap<String, BTreeMap<String, usize>>;
+
+/// The walk behind [`sorted_markdown_files`], additionally reporting what
+/// it skipped on behalf of each namespace. Split out rather than folded in
+/// so the existing callers that only want paths stay untouched — and so
+/// the tally costs no second traversal.
+pub(crate) fn sorted_markdown_files_with_skips(
+    root: &Path,
+    ignore: Option<&globset::GlobSet>,
+    claims: &PathClaims,
+) -> io::Result<(Vec<PathBuf>, SkipTally)> {
     let mut out = Vec::new();
+    let mut skipped: SkipTally = BTreeMap::new();
+    let mut markdown_seen: BTreeMap<String, usize> = BTreeMap::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !is_ignored(root, e.path(), e.file_type().is_dir(), ignore, claims));
+        .filter_entry(|e| {
+            !is_nested_project_root(root, e.path(), e.file_type().is_dir())
+                && !is_ignored(root, e.path(), e.file_type().is_dir(), ignore, claims)
+        });
     for entry in walker {
         let entry = entry.map_err(io::Error::from)?;
         if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.into_path();
+        let location = render_location(root, &path);
         if path.extension().is_some_and(|e| e == "md") {
+            for ns in claims.matching_namespaces(&location) {
+                *markdown_seen.entry(ns.to_string()).or_default() += 1;
+            }
             out.push(path);
+        } else {
+            // The single site where a non-markdown file is dropped. A
+            // namespace pointed at `src/**` is the naive first attempt at
+            // linting non-markdown, and before this it lint-ed clean.
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("(none)")
+                .to_string();
+            for ns in claims.matching_namespaces(&location) {
+                *skipped
+                    .entry(ns.to_string())
+                    .or_default()
+                    .entry(ext.clone())
+                    .or_default() += 1;
+            }
         }
     }
+    skipped.retain(|ns, _| !markdown_seen.contains_key(ns));
     // Byte-sorted path order, as CORE-001 demands.
     out.sort_by(|a, b| {
         a.as_os_str()
             .as_encoded_bytes()
             .cmp(b.as_os_str().as_encoded_bytes())
     });
-    Ok(out)
+    Ok((out, skipped))
+}
+
+/// True when `path` is a descendant project root. A regular lint run owns
+/// exactly the tree rooted at its selected `--root`; a nested `ctxgrd.toml`
+/// declares a separate contract and must be reached by targeting that root or
+/// using `--recursive` (BUG-017).
+///
+/// This deliberately tests only directories and exempts `root` itself: the
+/// selected project nearly always contains `ctxgrd.toml`, but its descendants
+/// must not be scanned with that project's config when they declare their own.
+pub(crate) fn is_nested_project_root(root: &Path, path: &Path, is_dir: bool) -> bool {
+    is_dir && path != root && path.join("ctxgrd.toml").is_file()
 }
 
 /// True if `path` should be skipped according to the configured
@@ -389,10 +463,13 @@ pub(crate) fn sorted_markdown_files(
 /// PKC-006 splits the claim exemption into two predicates:
 ///
 /// - **Traversability** (directories): a directory that is an
-///   ancestor-of, equal-to, or descendant-of any claim prefix is never
-///   pruned, even when it matches an ignore pattern — otherwise a deep
-///   claimed file (`.claude/skills/…/SKILL.md`) is unreachable under
-///   the default `**/.*` ignore.
+///   ancestor-of or equal-to any claim prefix is never pruned, even
+///   when it matches an ignore pattern — otherwise a deep claimed file
+///   (`.claude/skills/…/SKILL.md`) is unreachable under the default
+///   `**/.*` ignore. A *descendant* of a claim prefix is exempt only
+///   when every pattern that ignored it also ignores the prefix, so the
+///   exemption stays inside the tree it was granted for and
+///   `node_modules` beneath a claim prefix still prunes (BUG-034).
 /// - **Lintability** (files): an ignore-matched file is admitted only
 ///   when a `[<NS>].paths` glob positively matches it. The prefix
 ///   relation alone would whitelist every markdown file around a
@@ -418,16 +495,37 @@ fn is_ignored(
         return false;
     }
     if is_dir {
-        // Ancestor check (`prefix.starts_with(rel)`) prevents pruning the
-        // dot-dir parents before the claimed subtree is reached. Descendant
-        // check (`rel.starts_with(prefix)`) is needed because globset's
-        // default `*` matches `/`, so `**/.*` matches ANY directory whose
-        // first component starts with `.` — including deep ones like
-        // `.claude/skills/my-skill`.
-        claims
-            .prefix_dirs()
-            .iter()
-            .all(|prefix| !prefix.starts_with(rel) && !rel.starts_with(prefix))
+        // Which ignore patterns matched — the *reason* this directory is
+        // ignored, not merely that it is (BUG-034 needs to compare reasons).
+        let reasons = set.matches(rel);
+        claims.prefix_dirs().iter().all(|prefix| {
+            // Ancestor check: never prune a dot-dir parent before the
+            // claimed subtree beneath it is reached.
+            if prefix.starts_with(rel) {
+                return false;
+            }
+            // Unrelated to this prefix — the prefix grants it nothing.
+            if !rel.starts_with(prefix) {
+                return true;
+            }
+            // Descendant check. It exists because globset's default `*`
+            // matches `/`, so `**/.*` matches ANY directory whose first
+            // component starts with `.` — including deep ones like
+            // `.claude/skills/my-skill`, which would otherwise be
+            // unreachable. Narrowed to that motivating case (BUG-034): a
+            // descendant is exempt only when EVERY pattern that ignored it
+            // also ignores the claim prefix itself — i.e. it is ignored for
+            // the same reason the prefix is. `.claude/skills/my-skill` is
+            // ignored by `**/.*`, which also matches the prefix
+            // `.claude/skills`, so it is reached; `pkg/node_modules` is
+            // ignored by `**/node_modules/**`, which does not match the
+            // prefix `pkg`, so it still prunes. Without this the exemption
+            // is surgical in the prefix and indiscriminate below it, and a
+            // claim like `pkg/**/README.md` ingests every vendored
+            // dependency — the guarantee PKC-006's rationale states.
+            let prefix_reasons = set.matches(prefix);
+            !reasons.iter().all(|i| prefix_reasons.contains(i))
+        })
     } else {
         claims.matching_namespaces(rel).next().is_none()
     }
@@ -635,6 +733,20 @@ impl<'a> AstBuilder<'a> {
                 }
             }
             Event::Code(ref text) => {
+                // The span's content joins any open collector as rendered
+                // text — without backticks, consistent with bold/emphasis
+                // markup being absent from collected text. Dropping it
+                // made headings like `## Run \`make check\` first`
+                // unmatchable under any config spelling (BUG-023).
+                if let Some(h) = self.heading_open.as_mut() {
+                    h.text.push_str(text);
+                }
+                if let Some(l) = self.link_open.as_mut() {
+                    l.text.push_str(text);
+                }
+                if let Some(s) = self.strikethrough_open.as_mut() {
+                    s.text.push_str(text);
+                }
                 let (line, col_start) = self.pos(range.start);
                 let (_, col_end) = self.pos(range.end);
                 self.code_ranges
@@ -946,6 +1058,31 @@ mod tests {
     }
 
     #[test]
+    fn heading_with_inline_code_keeps_full_text() {
+        // BUG-023: an `Event::Code` inside an open heading contributed
+        // nothing to the heading's text, so `## Run `make check` first`
+        // parsed as "Run  first" — unmatchable under any config spelling.
+        // The span content joins as rendered text, without backticks,
+        // consistent with bold/emphasis markup being absent.
+        let body = "---\nid: RUN-1\n---\n## Run `make check` first\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.headings[0].text, "Run make check first");
+        // The span itself is still recorded.
+        assert_eq!(ast.inline_code_spans.len(), 1);
+        assert_eq!(ast.inline_code_spans[0].text, "make check");
+    }
+
+    #[test]
+    fn link_and_strikethrough_with_inline_code_keep_full_text() {
+        // Same gap for the other two open collectors.
+        let body =
+            "---\nid: ADR-001\n---\n\nSee [the `lint` command](docs/lint.md) and ~~old `refs` flow~~.\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.links[0].text, "the lint command");
+        assert_eq!(ast.strikethrough_spans[0].text, "old refs flow");
+    }
+
+    #[test]
     fn fenced_code_block_captured_with_lang() {
         let body = "---\nid: ADR-001\n---\n\n```rust\nfn foo() {}\n```\n";
         let ast = ast_of(body);
@@ -1144,6 +1281,7 @@ mod tests {
                     params: std::collections::BTreeMap::new(),
                     paths: Some(builder.build().unwrap()),
                     path_patterns: vec![(*glob).to_owned()],
+                    owner: None,
                 },
             );
         }
@@ -1440,6 +1578,37 @@ mod tests {
     }
 
     #[test]
+    fn scan_prunes_nested_ctxgrd_project_roots() {
+        // BUG-017: a normal parent run must not ingest a child's documents
+        // under the parent's contract. In particular, duplicate IDs in two
+        // separately configured projects are not one id-unique corpus.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ctxgrd.toml"), "[BUG]\n").unwrap();
+        std::fs::write(
+            root.path().join("parent.md"),
+            "---\nid: BUG-001\ntitle: parent\n---\n# Parent\n",
+        )
+        .unwrap();
+
+        let child = root.path().join("child-project");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("ctxgrd.toml"), "[BUG]\n").unwrap();
+        std::fs::write(
+            child.join("child.md"),
+            "---\nid: BUG-001\ntitle: child\n---\n# Child\n",
+        )
+        .unwrap();
+
+        let parent_scan = scan(root.path(), None, None).unwrap();
+        assert_eq!(parent_scan.documents.len(), 1);
+        assert_eq!(parent_scan.documents[0].location, "parent.md");
+
+        let child_scan = scan(&child, None, None).unwrap();
+        assert_eq!(child_scan.documents.len(), 1);
+        assert_eq!(child_scan.documents[0].location, "child.md");
+    }
+
+    #[test]
     fn scan_undecodable_claimed_file_is_per_file_diagnostic_not_abort() {
         // A single non-UTF-8 byte in one path-claimed file must NOT abort the
         // whole walk; it becomes a `src.markdown-decode` diagnostic anchored
@@ -1556,6 +1725,71 @@ mod tests {
         );
     }
 
+    /// ADR-119 § CLM-003, the positive control. A namespace pointed at a
+    /// tree of non-markdown is the naive first attempt at linting
+    /// non-markdown, and it used to lint clean.
+    #[test]
+    fn skip_tally_records_a_namespace_that_ingested_only_non_markdown() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/entrepreneur.pl"), ":- module(e, []).").unwrap();
+        std::fs::write(root.path().join("src/helper.pl"), "x").unwrap();
+        std::fs::write(root.path().join("src/notes.txt"), "x").unwrap();
+
+        let claims = test_claims(&[("STATUTE", &["src/**"])]);
+        let (files, skipped) = sorted_markdown_files_with_skips(root.path(), None, &claims).unwrap();
+
+        assert!(files.is_empty(), "no markdown to ingest: {files:?}");
+        let by_ext = skipped
+            .get("STATUTE")
+            .expect("STATUTE claimed files that were skipped");
+        assert_eq!(by_ext.get("pl"), Some(&2));
+        assert_eq!(by_ext.get("txt"), Some(&1));
+    }
+
+    /// The bound that keeps the warning off every real project: a
+    /// namespace holding actual documents alongside skipped assets is
+    /// working as intended. Drop this condition and every repo with
+    /// diagrams beside its ADRs starts warning.
+    #[test]
+    fn skip_tally_is_silent_when_the_namespace_also_ingested_markdown() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/adrs")).unwrap();
+        std::fs::write(root.path().join("docs/adrs/001-a.md"), "# ADR-001").unwrap();
+        std::fs::write(root.path().join("docs/adrs/diagram.png"), "not-really-a-png").unwrap();
+
+        let claims = test_claims(&[("ADR", &["docs/adrs/**"])]);
+        let (files, skipped) = sorted_markdown_files_with_skips(root.path(), None, &claims).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(
+            skipped.is_empty(),
+            "a namespace with real documents must not warn about its assets: {skipped:?}"
+        );
+    }
+
+    /// ADR-119 § CLM-001: no warning without positive evidence the claim
+    /// was live. A glob matching nothing is indistinguishable from a
+    /// directory nobody has populated yet, so it stays silent — that is
+    /// ADR-007 § DOC-001's first-touch silence, and it is load-bearing.
+    #[test]
+    fn skip_tally_is_silent_when_the_glob_matches_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Claims a directory that does not exist; the .rs file on disk is
+        // claimed by nobody.
+        let claims = test_claims(&[("ADR", &["docs/adrz/**"])]);
+        let (files, skipped) = sorted_markdown_files_with_skips(root.path(), None, &claims).unwrap();
+
+        assert!(files.is_empty());
+        assert!(
+            skipped.is_empty(),
+            "an unpopulated claim must stay silent: {skipped:?}"
+        );
+    }
+
     /// Build a [`PathClaims`] from `(namespace, paths globs)` pairs, the
     /// way `Config` would after parsing `[<NS>].paths`.
     fn test_claims(namespaces: &[(&str, &[&str])]) -> PathClaims {
@@ -1572,6 +1806,7 @@ mod tests {
                     params: std::collections::BTreeMap::new(),
                     paths: Some(builder.build().unwrap()),
                     path_patterns: patterns.iter().map(|s| (*s).to_owned()).collect(),
+                    owner: None,
                 },
             );
         }
@@ -1617,6 +1852,47 @@ mod tests {
             "found file is SKILL.md: {:?}",
             found
         );
+    }
+
+    #[test]
+    fn anchored_claim_does_not_un_prune_ignored_subtrees() {
+        // BUG-034: two `paths` globs expressing the same intent must ingest
+        // the same corpus. `pkg/**/README.md` differs from `**/README.md`
+        // only by a literal leading segment, and `*` is recursive in both,
+        // so they claim identically. Before the fix the anchored form made
+        // every directory under `pkg` a descendant of the claim prefix,
+        // exempting `pkg/node_modules` from pruning; the file half then
+        // admitted the vendored README because the claim glob genuinely
+        // matches it. Asserted as the pair over one tree so the invariant
+        // is "identical claim, identical corpus", not an expected count.
+        let root = tempfile::tempdir().unwrap();
+        let vendored = root.path().join("pkg/node_modules/dep");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(root.path().join("pkg/README.md"), "# Kept\n").unwrap();
+        std::fs::write(vendored.join("README.md"), "# Vendored dependency\n").unwrap();
+
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/node_modules/**").unwrap());
+        let set = builder.build().unwrap();
+
+        for pattern in ["**/README.md", "pkg/**/README.md"] {
+            let claims = test_claims(&[("README", &[pattern])]);
+            let found = sorted_markdown_files(root.path(), Some(&set), &claims).unwrap();
+            let rel: Vec<String> = found
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(root.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            assert_eq!(
+                rel,
+                vec!["pkg/README.md".to_owned()],
+                "claim `{pattern}` must ingest only the authored README, not the vendored one",
+            );
+        }
     }
 
     // -- req_ref_tokens tests ---------------------------------------------

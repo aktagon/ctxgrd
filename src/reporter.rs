@@ -46,8 +46,8 @@ pub fn render(diagnostics: &[Diagnostic]) -> String {
             out,
             "{}:{}:{}: {}: [{}] {}",
             d.location,
-            d.line,
-            d.col,
+            d.line.unwrap_or(0),
+            d.col.unwrap_or(0),
             d.severity.as_str(),
             d.code,
             d.message,
@@ -72,10 +72,23 @@ pub fn render(diagnostics: &[Diagnostic]) -> String {
 /// when `line > 0` and the file is readable. Diagnostics without a
 /// line anchor render as a location-only block (no snippet). A
 /// trailing summary line (`found: N error(s) · M warning(s)`) follows
-/// the block when at least one diagnostic was emitted — paired in
+/// the block when either channel carried something — paired in
 /// register with the `ok:` summary the binary emits on success.
-pub fn render_rich(diagnostics: &[Diagnostic], root: &Path) -> String {
-    if diagnostics.is_empty() {
+///
+/// `kernel_messages` is taken for the tally only; the binary renders the
+/// messages themselves ahead of this block via
+/// [`render_kernel_message_rich`]. Both the count and the empty-input
+/// early return read both channels (`BUG-039`). Gating either on
+/// `diagnostics` alone produced a run that printed a kernel warning, no
+/// `found:` line (this returned early), and no `ok:` line either
+/// ([`ok_summary`] is suppressed by the same message per ADR-119
+/// § CLM-004) — a finding on screen with nothing summarising it.
+pub fn render_rich(
+    diagnostics: &[Diagnostic],
+    kernel_messages: &[KernelMessage],
+    root: &Path,
+) -> String {
+    if diagnostics.is_empty() && kernel_messages.is_empty() {
         return String::new();
     }
     let mut out = String::new();
@@ -85,7 +98,7 @@ pub fn render_rich(diagnostics: &[Diagnostic], root: &Path) -> String {
         }
         render_rich_one(&mut out, d, root);
     }
-    let (errors, warnings) = count_by_severity(diagnostics);
+    let (errors, warnings) = count_by_severity(diagnostics, kernel_messages);
     let _ = writeln!(
         out,
         "\nfound: {} · {}",
@@ -103,20 +116,49 @@ pub fn render_rich(diagnostics: &[Diagnostic], root: &Path) -> String {
 /// contradicts itself. Gating on `diagnostics.is_empty()` keeps the two
 /// trailers mutually exclusive: a clean run shows `ok:`, any run with
 /// diagnostics shows only the `found:` line from [`render_rich`].
-pub fn ok_summary(documents: usize, rules: usize, diagnostics: &[Diagnostic]) -> Option<String> {
-    if !diagnostics.is_empty() {
+///
+/// `namespaces_undeclared` (ADR-076 § OWN-005) appends `· N namespaces
+/// undeclared` when nonzero. Reachable on a clean run because
+/// `[ignore].namespaces` silences the warning without zeroing the count:
+/// `ok: … 0 diagnostics` alone reads as "every document ran every rule",
+/// which is false whenever a namespace is linting under the six
+/// zero-config rules. Omitted at zero so the common line stays quiet.
+///
+/// `kernel_messages` suppresses the trailer on the same terms as
+/// `diagnostics` (ADR-119 § CLM-004). Kernel messages are a separate
+/// channel — `src.runtime-error` and friends are not `Diagnostic`s — so
+/// gating on diagnostics alone let `error[src.runtime-error]: …` print
+/// directly above `ok: … 0 diagnostics`, which is the self-contradiction
+/// the rest of this doc comment exists to prevent. Both channels or
+/// neither.
+pub fn ok_summary(
+    documents: usize,
+    rules: usize,
+    namespaces_undeclared: usize,
+    diagnostics: &[Diagnostic],
+    kernel_messages: &[KernelMessage],
+) -> Option<String> {
+    if !diagnostics.is_empty() || !kernel_messages.is_empty() {
         return None;
     }
-    Some(format!(
+    let mut line = format!(
         "ok: {} · {} · 0 diagnostics",
         plural(documents, "document"),
         plural(rules, "rule"),
-    ))
+    );
+    if namespaces_undeclared > 0 {
+        let _ = write!(
+            line,
+            " · {} undeclared",
+            plural(namespaces_undeclared, "namespace")
+        );
+    }
+    Some(line)
 }
 
 /// `"1 error"` vs `"2 errors"` — used by trailers and the `ok:` summary
 /// line alike so singular/plural stays consistent across surfaces.
-pub fn plural(n: usize, singular: &str) -> String {
+pub(crate) fn plural(n: usize, singular: &str) -> String {
     if n == 1 {
         format!("1 {singular}")
     } else {
@@ -148,24 +190,21 @@ fn render_rich_one(out: &mut String, d: &Diagnostic, root: &Path) {
     );
 
     // Location anchor.
-    if d.line > 0 {
-        let _ = writeln!(out, "  --> {}:{}:{}", d.location, d.line, d.col);
+    if let Some(line) = d.line {
+        let _ = writeln!(out, "  --> {}:{}:{}", d.location, line, d.col.unwrap_or(0));
     } else {
         let _ = writeln!(out, "  --> {}", d.location);
     }
 
     // Source snippet when we have a line anchor + readable file.
-    let snippet = if d.line > 0 {
-        source_line(root, &d.location, d.line)
-    } else {
-        None
-    };
+    let snippet = d.line.and_then(|line| source_line(root, &d.location, line));
     if let Some(line_text) = snippet {
-        let line_label = format!("{:>width$}", d.line, width = line_number_width(d.line));
+        let line = d.line.unwrap_or(1);
+        let line_label = format!("{:>width$}", line, width = line_number_width(line));
         let label_pad = " ".repeat(line_label.len());
         let _ = writeln!(out, "   {label_pad} |");
         let _ = writeln!(out, "   {line_label} | {line_text}");
-        let caret_col = if d.col == 0 { 1 } else { d.col } as usize;
+        let caret_col = d.col.filter(|&c| c > 0).unwrap_or(1) as usize;
         // Column is 1-indexed; caret offset in the underline is col-1.
         let caret_offset = caret_col.saturating_sub(1);
         let caret_len = d.span_len.unwrap_or(1).max(1) as usize;
@@ -258,14 +297,31 @@ fn line_number_width(line: u32) -> usize {
     w.max(2)
 }
 
-fn count_by_severity(diagnostics: &[Diagnostic]) -> (usize, usize) {
+/// The `found:` tally, summed across **both** report channels.
+///
+/// `BUG-039`: this counted `diagnostics` alone, so a kernel message the
+/// binary had just printed above the trailer went untallied — `ok:` was
+/// suppressed by it (ADR-119 § CLM-004) while `found:` denied it existed.
+/// The two channels differ only in whether a document anchor is meaningful,
+/// never in whether the finding counts.
+fn count_by_severity(
+    diagnostics: &[Diagnostic],
+    kernel_messages: &[KernelMessage],
+) -> (usize, usize) {
     use crate::diagnostic::Severity;
     let mut errors = 0usize;
     let mut warnings = 0usize;
-    for d in diagnostics {
-        match d.severity {
+    let severities = diagnostics
+        .iter()
+        .map(|d| d.severity)
+        .chain(kernel_messages.iter().map(|m| m.severity));
+    for severity in severities {
+        match severity {
             Severity::Error => errors += 1,
             Severity::Warning => warnings += 1,
+            // Info is advisory — it never escalates the exit code and is
+            // not tallied into the `found:` error/warning trailer.
+            Severity::Info => {}
         }
     }
     (errors, warnings)
@@ -274,20 +330,11 @@ fn count_by_severity(diagnostics: &[Diagnostic]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::Severity;
 
     fn diag(code: &str, location: &str, line: u32, col: u32, msg: &str) -> Diagnostic {
-        Diagnostic {
-            code: code.to_owned(),
-            severity: Severity::Error,
-            message: msg.to_owned(),
-            location: location.to_owned(),
-            line,
-            col,
-            help: None,
-            note: None,
-            span_len: None,
-        }
+        // Routes through the normalising constructor: a `0` line/col
+        // argument becomes `None` (ADR-086 § WIRE-004).
+        Diagnostic::error(code, location, line, col, msg)
     }
 
     #[test]
@@ -295,14 +342,43 @@ mod tests {
         // A warning-only run must NOT print the `ok: … 0 diagnostics`
         // trailer — it would contradict the `found: … 1 warning` line.
         let w = Diagnostic::warning("agents.context-budget", "cli/CLAUDE.md", 0, 0, "x");
-        assert_eq!(ok_summary(6, 9, std::slice::from_ref(&w)), None);
+        assert_eq!(ok_summary(6, 9, 0, std::slice::from_ref(&w), &[]), None);
+    }
+
+    /// ADR-119 § CLM-004: a kernel message suppresses the trailer on the
+    /// same terms as a diagnostic. The error case is the FEEDBACK-008
+    /// transcript — `error[src.runtime-error]` above `ok: … 0
+    /// diagnostics`; the warning case matters because it exits 0, so the
+    /// trailer is the only thing that would carry the contradiction.
+    #[test]
+    fn ok_summary_suppressed_when_kernel_messages_present() {
+        let e = KernelMessage::error("src.runtime-error", "source 'statute' exited with code 3");
+        assert_eq!(ok_summary(16, 22, 0, &[], std::slice::from_ref(&e)), None);
+
+        let w = KernelMessage::warning("src.too-few-documents", "source 'statute' emitted nothing");
+        assert_eq!(ok_summary(16, 22, 0, &[], std::slice::from_ref(&w)), None);
     }
 
     #[test]
     fn ok_summary_present_when_clean() {
         assert_eq!(
-            ok_summary(6, 9, &[]).as_deref(),
+            ok_summary(6, 9, 0, &[], &[]).as_deref(),
             Some("ok: 6 documents · 9 rules · 0 diagnostics"),
+        );
+    }
+
+    /// ADR-076 § OWN-005: the coverage field is conditional on the human
+    /// line — silent at zero, explicit when a namespace is linting under
+    /// the six zero-config rules.
+    #[test]
+    fn ok_summary_reports_undeclared_namespaces() {
+        assert_eq!(
+            ok_summary(213, 116, 1, &[], &[]).as_deref(),
+            Some("ok: 213 documents · 116 rules · 0 diagnostics · 1 namespace undeclared"),
+        );
+        assert_eq!(
+            ok_summary(213, 116, 2, &[], &[]).as_deref(),
+            Some("ok: 213 documents · 116 rules · 0 diagnostics · 2 namespaces undeclared"),
         );
     }
 
@@ -337,7 +413,7 @@ b.md:2:0: error: [core.cross-ref] z
     #[test]
     fn empty_input_renders_empty_string() {
         assert_eq!(render(&[]), "");
-        assert_eq!(render_rich(&[], Path::new(".")), "");
+        assert_eq!(render_rich(&[], &[], Path::new(".")), "");
     }
 
     #[test]
@@ -350,7 +426,7 @@ b.md:2:0: error: [core.cross-ref] z
             "missing 'Decision'",
         )
         .with_help("add a `## Decision` section");
-        let out = render_rich(&[d], Path::new("."));
+        let out = render_rich(&[d], &[], Path::new("."));
         assert!(out.contains("error[core.required-headings]"));
         assert!(out.contains("--> adrs/x.md\n"));
         assert!(out.contains("  help: add a `## Decision` section"));
@@ -363,7 +439,7 @@ b.md:2:0: error: [core.cross-ref] z
         let file = tmp.path().join("x.md");
         fs::write(&file, "line 1\nline 2 with important content\nline 3\n").unwrap();
         let d = diag("core.dep-resolved", "x.md", 2, 7, "missing target");
-        let out = render_rich(&[d], tmp.path());
+        let out = render_rich(&[d], &[], tmp.path());
         assert!(out.contains("line 2 with important content"));
         // caret should appear 6 chars after the `|` (col 7 → offset 6).
         let caret_line = out
@@ -387,7 +463,7 @@ b.md:2:0: error: [core.cross-ref] z
             "cross-reference 'ADR-042' …",
         )
         .with_span_len(7);
-        let out = render_rich(&[d], tmp.path());
+        let out = render_rich(&[d], &[], tmp.path());
         let caret_line = out.lines().find(|l| l.contains('^')).unwrap();
         assert_eq!(caret_line.matches('^').count(), 7);
     }
@@ -396,11 +472,61 @@ b.md:2:0: error: [core.cross-ref] z
     fn rich_emits_trailer_with_counts() {
         let e = diag("core.id", "a.md", 0, 0, "bad id");
         let w = Diagnostic::warning("ext.malformed-output", "a.md", 0, 0, "x");
-        let out = render_rich(&[e, w], Path::new("."));
+        let out = render_rich(&[e, w], &[], Path::new("."));
         assert!(
             out.contains("found: 1 error · 1 warning"),
             "expected normalised trailer, got:\n{out}"
         );
+    }
+
+    // --- BUG-039: the trailer counts both channels ---------------------
+
+    #[test]
+    fn rich_trailer_counts_kernel_messages() {
+        // `found:` claims to be the run's tally. Kernel messages are
+        // printed above it by the binary and were not counted, so a run
+        // showing one kernel warning reported `0 warnings` directly
+        // underneath it.
+        let e = diag("core.id", "a.md", 0, 0, "bad id");
+        let k = KernelMessage::warning("cfg.paths-skipped", "[NOTE] paths match 2 files");
+        let out = render_rich(&[e], &[k], Path::new("."));
+        assert!(
+            out.contains("found: 1 error · 1 warning"),
+            "the kernel warning is part of what was found; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rich_emits_a_trailer_for_a_kernel_only_run() {
+        // The larger hole behind `BUG-039`: `render_rich` bailed on
+        // `diagnostics.is_empty()`, so a run whose only finding was a
+        // kernel message printed no `found:` line at all — and
+        // `ok_summary` is suppressed by the same message (ADR-119
+        // § CLM-004), so the run ended with no trailer whatsoever.
+        let k = KernelMessage::warning("cfg.paths-skipped", "[NOTE] paths match 2 files");
+        let out = render_rich(&[], &[k], Path::new("."));
+        assert!(
+            out.contains("found: 0 errors · 1 warning"),
+            "a kernel-only run must still say what it found; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rich_kernel_errors_are_counted_as_errors() {
+        let k = KernelMessage::error("src.runtime-error", "source 'jira' timed out");
+        let out = render_rich(&[], &[k], Path::new("."));
+        assert!(
+            out.contains("found: 1 error · 0 warnings"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rich_stays_empty_when_both_channels_are_empty() {
+        // The paired half: the early return still exists, it is just
+        // gated on both channels rather than one. A genuinely clean run
+        // must print nothing here so the binary's `ok:` line stands alone.
+        assert_eq!(render_rich(&[], &[], Path::new(".")), "");
     }
 
     #[test]
@@ -408,7 +534,7 @@ b.md:2:0: error: [core.cross-ref] z
         let d = diag("core.id", "a.md", 0, 0, "bad id")
             .with_help("add `id: <NS>-<n>`")
             .with_note("id must match `^[A-Z][A-Z0-9]*-\\d+$`");
-        let out = render_rich(&[d], Path::new("."));
+        let out = render_rich(&[d], &[], Path::new("."));
         assert!(out.contains("  help: add `id: <NS>-<n>`"));
         assert!(out.contains("  note: id must match"));
     }
@@ -416,7 +542,7 @@ b.md:2:0: error: [core.cross-ref] z
     #[test]
     fn rich_omits_help_and_note_when_unset() {
         let d = diag("core.id-unique", "a.md", 0, 0, "collides with b.md");
-        let out = render_rich(&[d], Path::new("."));
+        let out = render_rich(&[d], &[], Path::new("."));
         assert!(!out.contains("help:"));
         assert!(!out.contains("note:"));
     }

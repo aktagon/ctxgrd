@@ -1,0 +1,148 @@
+{
+  "_note": "Catalog read off the official Official Journal text of Regulation (EU) 2024/1689 (the AI Act), retrieved 2026-07-30 from the Publications Office CELLAR (http://publications.europa.eu/resource/celex/32024R1689, Accept-Language: eng). Every article number and title below was verified against that text; nothing was written from memory. EUR-Lex's own web endpoints return HTTP 202 with an empty body to a non-browser client, so CELLAR is the retrieval path that works headlessly -- recorded here because the next revision of this catalog will need it. Verified article titles: 5 Prohibited AI practices; 6 Classification rules for high-risk AI systems; 8 Compliance with the requirements; 9 Risk management system; 10 Data and data governance; 11 Technical documentation; 12 Record-keeping; 13 Transparency and provision of information to deployers; 14 Human oversight; 15 Accuracy, robustness and cybersecurity; 16 Obligations of providers of high-risk AI systems; 17 Quality management system; 22 Authorised representatives of providers of high-risk AI systems; 23 Obligations of importers; 24 Obligations of distributors; 25 Responsibilities along the AI value chain; 26 Obligations of deployers of high-risk AI systems; 27 Fundamental rights impact assessment for high-risk AI systems; 43 Conformity assessment; 47 EU declaration of conformity; 48 CE marking; 49 Registration; 50 Transparency obligations for providers and deployers of certain AI systems; 51 Classification of general-purpose AI models as general-purpose AI models with systemic risk; 53 Obligations for providers of general-purpose AI models; 54 Authorised representatives of providers of general-purpose AI models; 55 Obligations of providers of general-purpose AI models with systemic risk; 72 Post-market monitoring by providers and post-market monitoring plan for high-risk AI systems; 73 Reporting of serious incidents. Operator roles are the Art. 3 definitions (provider, deployer, authorised representative, importer, distributor). Art. 73 sets DAY-granular incident clocks -- 15 days from awareness generally (73(2)), 2 days for a widespread infringement or an Art. 3(49)(b) incident (73(3)), 10 days on the death of a person (73(4)) -- which unlike NIS2's 24h/72h ARE expressible in ctxgrd's day-granular dates; they are filed for `core.date-interval` (ADR-116 Open Questions), not shipped. Deliberately NOT modelled: Art. 12 logs and Art. 10 datasets are operational artifacts, so the register records that a log DESIGN exists and never the logs themselves.",
+  "edition": "Regulation (EU) 2024/1689 (AI Act), OJ L series, 12.7.2024",
+  "summary": "EU AI Act obligation register (AIACT) and Art. 27 fundamental rights impact assessment register (FRIA) over the security base — Regulation (EU) 2024/1689. Paperwork existence/metadata/freshness only, never conformity or legal adequacy.",
+  "depends": [
+    "security"
+  ],
+  "vocabularies": {
+    "article": {
+      "cite": "Regulation (EU) 2024/1689, article titles as published",
+      "values": [
+        { "id": "5", "subject": "Prohibited AI practices" },
+        { "id": "6", "subject": "Classification rules for high-risk AI systems" },
+        { "id": "8", "subject": "Compliance with the requirements" },
+        { "id": "9", "subject": "Risk management system" },
+        { "id": "10", "subject": "Data and data governance" },
+        { "id": "11", "subject": "Technical documentation" },
+        { "id": "12", "subject": "Record-keeping" },
+        { "id": "13", "subject": "Transparency and provision of information to deployers" },
+        { "id": "14", "subject": "Human oversight" },
+        { "id": "15", "subject": "Accuracy, robustness and cybersecurity" },
+        { "id": "16", "subject": "Obligations of providers of high-risk AI systems" },
+        { "id": "17", "subject": "Quality management system" },
+        { "id": "22", "subject": "Authorised representatives of providers of high-risk AI systems" },
+        { "id": "23", "subject": "Obligations of importers" },
+        { "id": "24", "subject": "Obligations of distributors" },
+        { "id": "25", "subject": "Responsibilities along the AI value chain" },
+        { "id": "26", "subject": "Obligations of deployers of high-risk AI systems" },
+        { "id": "27", "subject": "Fundamental rights impact assessment for high-risk AI systems" },
+        { "id": "43", "subject": "Conformity assessment" },
+        { "id": "47", "subject": "EU declaration of conformity" },
+        { "id": "48", "subject": "CE marking" },
+        { "id": "49", "subject": "Registration" },
+        { "id": "50", "subject": "Transparency obligations for providers and deployers of certain AI systems" },
+        { "id": "51", "subject": "Classification of general-purpose AI models as general-purpose AI models with systemic risk" },
+        { "id": "53", "subject": "Obligations for providers of general-purpose AI models" },
+        { "id": "54", "subject": "Authorised representatives of providers of general-purpose AI models" },
+        { "id": "55", "subject": "Obligations of providers of general-purpose AI models with systemic risk" },
+        { "id": "72", "subject": "Post-market monitoring by providers and post-market monitoring plan for high-risk AI systems" },
+        { "id": "73", "subject": "Reporting of serious incidents" }
+      ]
+    },
+    "role": {
+      "cite": "Regulation (EU) 2024/1689 Art. 3 definitions (provider, deployer, authorised representative, importer, distributor)",
+      "values": [
+        "provider",
+        "deployer",
+        "authorised-representative",
+        "importer",
+        "distributor"
+      ]
+    },
+    "risk_tier": {
+      "cite": "Regulation (EU) 2024/1689 Art. 5 (prohibited), Art. 6 (high-risk), Art. 50 (transparency), Art. 51 (GPAI with systemic risk)",
+      "values": [
+        "prohibited",
+        "high-risk",
+        "transparency",
+        "minimal",
+        "gpai",
+        "gpai-systemic"
+      ]
+    }
+  },
+  "namespaces": [
+    {
+      "name": "AIACT",
+      "comment": "EU AI Act obligation-to-evidence register (Regulation (EU) 2024/1689, ADR-116). One document per obligation, the article projected from the verified catalog into core.allowed-values, and core.evidence-link over `article` requiring each in-scope obligation to cite an implementing POLICY/ADR or an `evidence_link`. `risk_tier` and `role` are the load-bearing fields and the reason this cannot be a plain catalog: the AI Act's requirement set is SELECTED by tier and role, so a register that does not record which tier it was built against cannot say whether it is complete — and the same entity can hold provider and deployer duties over one system simultaneously (Art. 25, Responsibilities along the AI value chain). This is the machine-checkable residue of the applicability determination; ctxgrd checks that a tier and a role were recorded, never that they were determined correctly. That determination is a legal judgment and belongs in a dated decision record the register cross-refs. The `status` vocabulary is deliberately open (ADR-114 § STV-001); the freshness field is `reviewed_date` (ADR-114 § FLD-001). Art. 12 record-keeping and Art. 10 data governance appear as obligations whose evidence is a design document — the register never holds the logs or the datasets themselves.",
+      "paths": [
+        "docs/compliance/eu-ai-act/obligations/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.dep-resolved",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "core.calendar-freshness",
+        "core.evidence-link"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "article",
+        "role",
+        "risk_tier",
+        "owner",
+        "reviewed_date"
+      ],
+      "allowed_values": [
+        "article",
+        "role",
+        "risk_tier"
+      ],
+      "calendar_freshness": {
+        "field": "reviewed_date",
+        "stale_days": 365
+      },
+      "control_evidence": {
+        "rule": "core.evidence-link",
+        "field": "article",
+        "evidence_fields": [
+          "evidence_link"
+        ],
+        "out_of_scope_status": [
+          "not-applicable"
+        ]
+      }
+    },
+    {
+      "name": "FRIA",
+      "comment": "Art. 27 fundamental rights impact assessment register (ADR-116). DPIA-shaped and modelled separately for the same reason GDPR's DPIA is: it is a dated assessment of a specific deployment, re-reviewed when the deployment changes, not a row in an obligation table. Art. 27(1) scopes the duty to deployers that are bodies governed by public law or private entities providing public services, plus deployers of the Annex III points 5(b) and (c) systems, and excludes the Annex III point 2 area — so `role` here is effectively `deployer` and the applicability question is whose body it is, which no linter can answer. `reviewed_date` under core.calendar-freshness is the whole point: an impact assessment of a deployment that has since changed is worse than none, because it carries the authority of an assessment while describing a system that no longer exists. Cross-refs the AIACT obligation it discharges (Art. 27 in that register), which core.dep-resolved and core.cross-ref hold to a target that exists (ADR-112).",
+      "paths": [
+        "docs/compliance/eu-ai-act/fria/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.dep-resolved",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "core.calendar-freshness"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "role",
+        "risk_tier",
+        "owner",
+        "reviewed_date"
+      ],
+      "allowed_values": [
+        "role",
+        "risk_tier"
+      ],
+      "calendar_freshness": {
+        "field": "reviewed_date",
+        "stale_days": 365
+      }
+    }
+  ]
+}

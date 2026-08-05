@@ -14,7 +14,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::run;
 
-pub struct Backend {
+pub(crate) struct Backend {
     client: Client,
     workspace_state: Arc<RwLock<WorkspaceState>>,
 }
@@ -128,7 +128,7 @@ impl WorkspaceIndex {
 }
 
 impl Backend {
-    pub fn new(client: Client) -> Self {
+    pub(crate) fn new(client: Client) -> Self {
         Self {
             client,
             workspace_state: Arc::new(RwLock::default()),
@@ -293,16 +293,18 @@ fn to_lsp_diagnostic(diag: crate::diagnostic::Diagnostic) -> tower_lsp::lsp_type
     let severity = match diag.severity {
         crate::diagnostic::Severity::Error => Some(DiagnosticSeverity::ERROR),
         crate::diagnostic::Severity::Warning => Some(DiagnosticSeverity::WARNING),
+        crate::diagnostic::Severity::Info => Some(DiagnosticSeverity::INFORMATION),
     };
 
-    // ctxgrd uses 1-indexed lines/cols. LSP uses 0-indexed.
+    // ctxgrd uses 1-indexed lines/cols (None when unknown). LSP uses
+    // 0-indexed and has no "unknown", so an absent position anchors at 0.
     let start_pos = Position {
-        line: diag.line.saturating_sub(1),
-        character: diag.col.saturating_sub(1),
+        line: diag.line.map_or(0, |l| l.saturating_sub(1)),
+        character: diag.col.map_or(0, |c| c.saturating_sub(1)),
     };
     let end_pos = Position {
-        line: diag.line.saturating_sub(1),
-        character: diag.col,
+        line: diag.line.map_or(0, |l| l.saturating_sub(1)),
+        character: diag.col.unwrap_or(0),
     };
 
     let mut message = diag.message;

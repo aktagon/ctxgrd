@@ -1,0 +1,16 @@
+# pack: marketing
+[PERSONA]
+paths = ["docs/marketing/personas/**"]
+rules = ["marketing.frontmatter", "core.required-headings", "core.min-docs"]
+
+[PERSONA."marketing.frontmatter"]
+types = ["campaign", "persona", "positioning", "icp"]
+
+[PERSONA."core.required-headings"]
+headings = [
+    "Priority Initiatives",
+    "Success Factors",
+    "Perceived Barriers",
+    "Buyer's Journey",
+    "Decision Criteria",
+]

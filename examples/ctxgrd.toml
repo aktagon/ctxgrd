@@ -19,6 +19,15 @@ patterns = [
   "**/tmp/**",
 ]
 
+# ───────────────────────── Roles (ADR-076 § OWN-003) ─────────────────────────
+
+# Every namespace below names the role accountable for its documents via
+# `owner`, and `cfg.namespace-unowned` reports any active namespace that does
+# not. This table is the vocabulary those values are checked against — declare
+# it and a typo is caught; omit it and `owner` is accepted as written.
+[roles]
+allowed = ["developer", "product-strategist", "ai-engineer", "writer"]
+
 # ───────────────────────── Sources ─────────────────────────
 
 # Activates the jira-stub source discovered at sources/jira-stub/run.
@@ -43,6 +52,7 @@ scan = [
 # ───────────────────────── ADR ─────────────────────────
 
 [ADR]
+owner = "developer"
 rules = [
   "core.frontmatter",
   "core.id",
@@ -69,6 +79,7 @@ status = ["draft", "accepted", "rejected", "superseded"]
 # ───────────────────────── PRD ─────────────────────────
 
 [PRD]
+owner = "product-strategist"
 rules = [
   "core.frontmatter",
   "core.id",
@@ -97,6 +108,7 @@ status = ["draft", "accepted", "rejected"]
 # the standard keys (id/title/status).
 
 [PMR]
+owner = "developer"
 rules = [
   "core.frontmatter",
   "core.id",
@@ -121,6 +133,7 @@ keys = ["id", "title", "status", "incident_date"]
 # metadata map, so `core.required-metadata` and `core.allowed-values`
 # work the same way they do for file-based ADRs.
 [JIRA]
+owner = "developer"
 rules = [
   "core.id",
   "core.id-unique",
@@ -145,6 +158,7 @@ status = ["Open", "In Progress", "Closed"]
 # under intent classification (ADR-007 § DOC-001).
 #
 [PROMPT]
+owner = "ai-engineer"
 rules = [
   "core.frontmatter",
   "core.id",
@@ -167,6 +181,7 @@ keys = ["id", "title"]
 # builtin-compiled (source: pack).
 #
 [AGENTS]
+owner = "developer"
 paths = ["CLAUDE.md", "AGENTS.md"]
 rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
 
@@ -176,6 +191,7 @@ rules = ["agents.context-headings", "agents.context-budget", "agents.context-cac
 # `todo.*` rules validate its freshness line and section structure.
 #
 [TODO]
+owner = "developer"
 paths = ["TODO.md"]
 rules = ["todo.freshness", "todo.structure"]
 

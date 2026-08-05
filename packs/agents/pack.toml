@@ -10,7 +10,7 @@
 # their own packs.
 [AGENTS]
 paths = ["AGENTS.md"]
-rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
+rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache", "writing.ai-fingerprints"]
 
 # [AGENTS."agents.context-budget"]
 # max_words = 4000        # instruction-file size budget (default 4000)

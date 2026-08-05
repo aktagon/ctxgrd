@@ -21,13 +21,14 @@ use toml::Value as TomlValue;
 
 use crate::diagnostic::KernelMessage;
 
-pub const CORE_RULES: [&str; 12] = [
+pub(crate) const CORE_RULES: [&str; 13] = [
     "core.frontmatter",
     "core.id",
     "core.id-unique",
     "core.min-docs",
     "core.dep-resolved",
     "core.dep-cycle",
+    "core.dep-status",
     "core.cross-ref",
     "core.required-headings",
     "core.required-metadata",
@@ -48,6 +49,17 @@ pub const ZERO_CONFIG_RULES: [&str; 6] = [
     "core.cross-ref",
 ];
 
+/// The envelope floor an activated source is held to when it does not
+/// declare `expect_min` (ADR-119 § CLM-002).
+///
+/// One, not zero. A filesystem namespace with zero documents is often
+/// legitimate — the directory is simply not populated yet — but a
+/// `[sources.<name>]` table is an explicit statement that this source is
+/// expected to produce something, and empty output there is nearly always
+/// a bug. An opt-in floor would not reach the user whose source script
+/// broke silently, which is the case this exists for.
+pub(crate) const DEFAULT_SOURCE_EXPECT_MIN: u32 = 1;
+
 const PARAMETERIZED_CORE_RULES: [&str; 3] = [
     "core.required-headings",
     "core.required-metadata",
@@ -57,7 +69,7 @@ const PARAMETERIZED_CORE_RULES: [&str; 3] = [
 /// Whether `code` names a builtin-compiled rule (dispatched in-process,
 /// not an external subprocess script). Derived from `BUILTIN_RULES`
 /// so the resolver and the registry cannot drift (ADR-024 § REG-002).
-pub fn is_builtin_compiled(code: &str) -> bool {
+pub(crate) fn is_builtin_compiled(code: &str) -> bool {
     crate::builtin_rules::BUILTIN_RULES
         .iter()
         .any(|r| r.code == code)
@@ -66,7 +78,7 @@ pub fn is_builtin_compiled(code: &str) -> bool {
 /// Whether `code` is a *file-level* builtin-compiled rule — one that lints
 /// id-less path-claimed singletons rather than id-keyed documents.
 /// Derived from `BUILTIN_RULES` (ADR-024 § REG-002).
-pub fn is_file_level_compiled(code: &str) -> bool {
+pub(crate) fn is_file_level_compiled(code: &str) -> bool {
     crate::builtin_rules::BUILTIN_RULES
         .iter()
         .any(|r| r.code == code && r.level == crate::builtin_rules::Level::File)
@@ -83,7 +95,7 @@ fn rule_prefix(code: &str) -> &str {
 /// list to keep in sync. External rules may not use a reserved prefix,
 /// and an unknown rule under one is a missing built-in (a ctxgrd version
 /// mismatch), not a missing script.
-pub fn is_reserved_builtin_prefix(code: &str) -> bool {
+pub(crate) fn is_reserved_builtin_prefix(code: &str) -> bool {
     let ns = rule_prefix(code);
     crate::builtin_rules::BUILTIN_RULES
         .iter()
@@ -91,16 +103,29 @@ pub fn is_reserved_builtin_prefix(code: &str) -> bool {
 }
 
 impl Config {
-    /// Namespaces that carry a builtin-compiled rule. These are
-    /// *file-level*: their documents (CLAUDE.md / AGENTS.md / TODO.md)
-    /// are id-less singletons that never become id-keyed [`Document`]s,
-    /// so they are linted by walking path-claimed files directly (see
-    /// [`crate::agent_guide::scan_file_level`]) rather than through the
-    /// per-document rule loop.
+    /// Namespaces that are *file-level*: their documents (CLAUDE.md /
+    /// AGENTS.md / TODO.md) are id-less singletons that never become
+    /// id-keyed [`Document`]s, so they are linted by walking path-claimed
+    /// files directly (see [`crate::agent_guide::scan_file_level`])
+    /// rather than through the per-document rule loop.
+    ///
+    /// A namespace qualifies only when it carries a file-level
+    /// builtin-compiled rule AND does not run the id pipeline — `core.id`
+    /// is the id-claim marker. The second clause matters since ADR-078
+    /// made `core.required-headings` / `core.required-anchors` dual-use
+    /// `Level::File` codes: an id-keyed namespace listing one of them
+    /// must stay on the id pipeline, or its parse diagnostics are
+    /// suppressed and its documents are linted twice (BUG-021).
+    /// `core.frontmatter` deliberately does NOT disqualify: the persona
+    /// pack lists it on genuinely file-level namespaces (DESIGN / STYLE /
+    /// SOUL), whose singletons never carry ids.
     pub fn file_level_namespaces(&self) -> Vec<&str> {
         self.namespaces
             .iter()
-            .filter(|(_, cfg)| cfg.rules.iter().any(|c| is_file_level_compiled(c)))
+            .filter(|(_, cfg)| {
+                cfg.rules.iter().any(|c| is_file_level_compiled(c))
+                    && !cfg.rules.iter().any(|c| c == "core.id")
+            })
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -119,6 +144,14 @@ pub struct Config {
     /// A name in this map means the source is activated; the value is
     /// the params object passed via `$CTXGRD_SOURCE_PARAMS`.
     pub sources: BTreeMap<String, Value>,
+    /// The `expect_min` declared by each activated source (ADR-119 §
+    /// CLM-002), stripped out of the params object above. Absent means
+    /// [`DEFAULT_SOURCE_EXPECT_MIN`]: writing `[sources.<name>]` at all
+    /// is a statement that the source is expected to emit something, so
+    /// the floor applies whether or not the key was written. `sources`
+    /// stays the authority on which sources are activated — this map is
+    /// consulted only for names already in it.
+    pub source_expect_min: BTreeMap<String, u32>,
     /// Compiled path-match for the top-level `[ignore].patterns`
     /// list (globset syntax — root-anchored, no `!` negation, a
     /// slash-free pattern matches only at the root; NOT gitignore,
@@ -130,6 +163,20 @@ pub struct Config {
     /// downstream introspection can surface them in `ctxgrd rules`
     /// later if wanted. Keep in sync with `ignore`.
     pub ignore_patterns: Vec<String>,
+    /// Namespace names exempted from `cfg.namespace-undeclared`
+    /// (ADR-076 § OWN-004) — the `[ignore].namespaces` list. Deliberate
+    /// staging ("we'll declare REPORT next sprint") and cross-repo id
+    /// references opt out here. Suppressing the warning does NOT zero the
+    /// coverage count: an ignored namespace still shows in
+    /// `namespaces_undeclared`, because it really is linting under the
+    /// six zero-config rules.
+    pub ignore_namespaces: Vec<String>,
+    /// The `[roles].allowed` vocabulary (ADR-076 § OWN-003). `None` means
+    /// the project declared no vocabulary, and `[<NS>].owner` is then
+    /// declare-only — any string is accepted. Deliberately NOT compiled
+    /// in: a built-in role list goes stale and over-fires, the failure
+    /// that made the `model:` allowlist a config param.
+    pub roles_allowed: Option<Vec<String>>,
     /// Globs from the top-level `[references].scan` array (ADR-001
     /// § REF-002, REF-003). The reference scanner walks files
     /// matching any of these globs and emits one [`Reference`] per
@@ -140,16 +187,11 @@ pub struct Config {
     /// of whether the namespace lists the rule explicitly. Set via
     /// `[todo.listed]\nenabled = true` in `ctxgrd.toml`.
     pub todo_listed_global: bool,
-    /// Declared `[pipeline]` table (SPEC-002 § Data model). `None`
-    /// means no pipeline is declared — `ctxgrd status` falls back to
-    /// the built-in default ladder (EARS-01.3). Runtime resolution is
-    /// declared-or-default only; it does not infer (ADR-039 § DAG-007).
-    pub pipeline: Option<PipelineConfig>,
     /// Declared `[changelog]` table (ADR-084 § CHG-002). `None` means
     /// `ctxgrd changelog` has nothing to generate — the whitelist of
     /// contributing namespaces and their status→section mapping is
-    /// entirely config-driven, never hardcoded. Local-only, like
-    /// `[pipeline]`.
+    /// entirely config-driven, never hardcoded. Local-only: a
+    /// machine-wide changelog would claim documents from every project.
     pub changelog: Option<ChangelogConfig>,
     /// Kernel-level advisories raised during config loading — e.g.,
     /// `[sources.markdown-file]` was in the file but ignored
@@ -177,35 +219,12 @@ pub struct NamespaceConfig {
     /// sync with `paths` so downstream introspection (e.g. a future
     /// `ctxgrd rules` column) can surface the configured locations.
     pub path_patterns: Vec<String>,
-}
-
-/// Declared pipeline (SPEC-002 § Data model). `stages` is the
-/// namespace DAG as a chain in declared order (EARS-01.1); `gates`
-/// holds the explicit `[pipeline.gate]` predicates. Namespaces
-/// without an entry get the EARS-02.4 defaults at evaluation time
-/// (Sprint 2) — parsing stores only what the author wrote.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipelineConfig {
-    /// Ordered list of active namespace names; order = declared DAG.
-    pub stages: Vec<String>,
-    /// Explicit gate predicates, keyed by staged namespace.
-    pub gates: BTreeMap<String, GatePredicate>,
-}
-
-/// Parsed `("any" | "all") ":" <status>` gate predicate (EARS-02.3).
-/// The grammar is enforced at parse time (EARS-05.2); whether
-/// `status` is a member of the namespace's `core.allowed-values`
-/// list is the evaluation layer's check (Sprint 2, T2.1).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatePredicate {
-    pub quantifier: GateQuantifier,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GateQuantifier {
-    Any,
-    All,
+    /// The accountable *role* for this document type — `[<NS>].owner`
+    /// (ADR-076 § OWN-003). A role (`developer`, `writer`), never a leaf
+    /// skill: leaf skills are renamed, split and absorbed, which would
+    /// turn every such change into a migration across every deployed
+    /// config. `None` is what `cfg.namespace-unowned` reports.
+    pub owner: Option<String>,
 }
 
 /// Declared `[changelog]` table (ADR-084 § CHG-002).
@@ -238,26 +257,6 @@ pub struct ChangelogNamespace {
     pub when: String,
     /// Keep-a-Changelog category (`Added`/`Changed`/`Fixed`/…).
     pub section: String,
-}
-
-impl GatePredicate {
-    /// Parse `any:<status>` / `all:<status>`. `None` means malformed —
-    /// the caller attaches namespace context to the error.
-    fn parse(raw: &str) -> Option<Self> {
-        let (quantifier, status) = raw.split_once(':')?;
-        let quantifier = match quantifier {
-            "any" => GateQuantifier::Any,
-            "all" => GateQuantifier::All,
-            _ => return None,
-        };
-        if status.is_empty() {
-            return None;
-        }
-        Some(Self {
-            quantifier,
-            status: status.to_string(),
-        })
-    }
 }
 
 impl NamespaceConfig {
@@ -335,30 +334,26 @@ impl Config {
         out
     }
 
-    /// Assemble the declared type-DAG ordering edges (ADR-039 §
-    /// DAG-002/DAG-005): the union of every namespace's `core.dep-shape`
-    /// `requires`+`allows` lifts and any `[pipeline].stages` adjacency.
+    /// Assemble the declared type-DAG ordering edges (ADR-039 § DAG-002):
+    /// every namespace's `core.dep-shape` `requires`+`allows` lift.
     ///
     /// Edge direction follows the document lift convention: a
     /// `[NS."core.dep-shape"] requires = ["T"]` declares a doc-edge
     /// `NS → T` (`depends_on`), which lifts to the ordering edge
-    /// `T → NS` (T first). `[pipeline].stages = [A, B, C]` contributes
-    /// adjacency edges `A → B`, `B → C` directly (already in ordering
-    /// direction). A self-edge (a namespace listing itself) is dropped —
-    /// it carries no ordering and would falsely trip the cycle check.
+    /// `T → NS` (T first). A self-edge (a namespace listing itself) is
+    /// dropped — it carries no ordering and would falsely trip the cycle
+    /// check.
+    ///
+    /// ADR-118 § STG-002 removed the `[pipeline].stages` adjacency that
+    /// also contributed here (DAG-005). `core.dep-shape` is now the only
+    /// declaration surface for namespace-level edges, which is the whole
+    /// point of the deletion — three overlapping surfaces became one.
     pub fn dep_shape_edges(&self) -> BTreeSet<(String, String)> {
         let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
         for name in self.namespaces.keys() {
             for target in self.dep_shape_targets(name) {
                 if &target != name {
                     edges.insert((target, name.clone()));
-                }
-            }
-        }
-        if let Some(pipeline) = &self.pipeline {
-            for pair in pipeline.stages.windows(2) {
-                if pair[0] != pair[1] {
-                    edges.insert((pair[0].clone(), pair[1].clone()));
                 }
             }
         }
@@ -416,6 +411,10 @@ pub enum ConfigError {
         "[cfg.ignore-invalid] `[ignore].patterns` entry {pattern:?} is not a valid glob: {detail}"
     )]
     IgnorePatternInvalid { pattern: String, detail: String },
+    #[error("[cfg.ignore-invalid] `[ignore]` block invalid: {detail}")]
+    IgnoreInvalid { detail: String },
+    #[error("[cfg.roles-invalid] `[roles]` block invalid: {detail}")]
+    RolesInvalid { detail: String },
     #[error("[cfg.references-invalid] `[references]` block invalid: {detail}")]
     ReferencesInvalid { detail: String },
     #[error("[cfg.paths-invalid] `[{namespace}].paths` invalid: {detail}")]
@@ -424,18 +423,14 @@ pub enum ConfigError {
         pattern: String,
         detail: String,
     },
-    #[error("[cfg.pipeline-invalid] `[pipeline]` invalid: {detail}")]
-    PipelineInvalid { detail: String },
+    /// ADR-118 § STG-002: the `[pipeline]` block was removed with the
+    /// namespace stage layer. This MUST be an error rather than an ignored
+    /// key — silently dropping it would leave an author believing an
+    /// ordering is still enforced when nothing evaluates it.
     #[error(
-        "[cfg.pipeline-stage-unknown] `[pipeline].stages` entry '{stage}' is not an active namespace"
+        "[cfg.pipeline-removed] `[pipeline]` was removed in ADR-118 — namespace stages and gates no longer exist"
     )]
-    PipelineStageUnknown { stage: String },
-    #[error("[cfg.pipeline-gate-invalid] `[pipeline.gate].{namespace}`: {detail}")]
-    PipelineGateInvalid { namespace: String, detail: String },
-    #[error(
-        "[cfg.pipeline-gate-status] `[pipeline.gate].{namespace}` status '{status}' is not a member of {namespace}'s core.allowed-values status list"
-    )]
-    PipelineGateStatusUnknown { namespace: String, status: String },
+    PipelineRemoved,
     #[error("[cfg.changelog-invalid] `[changelog]` invalid: {detail}")]
     ChangelogInvalid { detail: String },
 }
@@ -450,14 +445,14 @@ impl ConfigError {
             Self::RuleParamsMissing { .. } => Some("cfg.rule-params-missing"),
             Self::RuleParamsInvalid { .. } => Some("cfg.rule-params-invalid"),
             Self::NamespaceReserved { .. } => Some("ext.namespace-reserved"),
-            Self::IgnorePatternInvalid { .. } => Some("cfg.ignore-invalid"),
+            Self::IgnorePatternInvalid { .. } | Self::IgnoreInvalid { .. } => {
+                Some("cfg.ignore-invalid")
+            }
+            Self::RolesInvalid { .. } => Some("cfg.roles-invalid"),
             Self::ReferencesInvalid { .. } => Some("cfg.references-invalid"),
             Self::NamespaceNameNotIdLegal { .. } => Some("cfg.namespace-name-invalid"),
             Self::PathsInvalid { .. } => Some("cfg.paths-invalid"),
-            Self::PipelineInvalid { .. } => Some("cfg.pipeline-invalid"),
-            Self::PipelineStageUnknown { .. } => Some("cfg.pipeline-stage-unknown"),
-            Self::PipelineGateInvalid { .. } => Some("cfg.pipeline-gate-invalid"),
-            Self::PipelineGateStatusUnknown { .. } => Some("cfg.pipeline-gate-status"),
+            Self::PipelineRemoved => Some("cfg.pipeline-removed"),
             Self::ChangelogInvalid { .. } => Some("cfg.changelog-invalid"),
             _ => None,
         }
@@ -482,9 +477,35 @@ pub fn load(root: &Path) -> Result<Config, ConfigError> {
     load_with_global(root, global_ctxgrd_dir().as_deref())
 }
 
+/// The nearest ancestor of `start` (inclusive) carrying a `ctxgrd.toml`,
+/// or `None` when no ancestor has one (BUG-048).
+///
+/// Matches `git`, `cargo`, `npm` and `go`, and matches the sibling
+/// linters: both `wrkgrd` and `trtlgrd` already resolve their project
+/// root upward, leaving ctxgrd the only member of the family that
+/// degraded to zero-config the moment you `cd` into a subdirectory —
+/// lint 258 documents under 120 rules at the root, 120 documents under 6
+/// from `docs/adrs/`, and print `ok` both times.
+///
+/// Nearest wins, which is what a subtree carrying its own `ctxgrd.toml`
+/// means: a separate lint root with its own namespace DAG, not the
+/// parent's.
+///
+/// Deliberately **not** applied when the user passes `--root` — an
+/// explicit path means exactly that directory. `ctxgrd init --force`
+/// resolves its target the same way every other command does, so an
+/// upward search there would let `ctxgrd init --force` run from
+/// `docs/adrs/` overwrite the repository's real config.
+pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join("ctxgrd.toml").is_file())
+        .map(Path::to_path_buf)
+}
+
 /// Testable entry point: pass `None` for "no global config" or
 /// `Some(path)` pointing at a specific `.ctxgrd` directory.
-pub fn load_with_global(root: &Path, global_dir: Option<&Path>) -> Result<Config, ConfigError> {
+pub(crate) fn load_with_global(root: &Path, global_dir: Option<&Path>) -> Result<Config, ConfigError> {
     let external = discover_external_rules_with_global(root, global_dir)?;
 
     // Start with global namespace configs, if any.
@@ -492,67 +513,78 @@ pub fn load_with_global(root: &Path, global_dir: Option<&Path>) -> Result<Config
 
     // Local ctxgrd.toml overrides per namespace.
     let path = root.join("ctxgrd.toml");
-    if !path.exists() {
-        return Ok(config);
+    if path.exists() {
+        let text = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let value: TomlValue = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.clone(),
+            source,
+        })?;
+        let local = parse_and_validate(value, &external, root)?;
+        merge_local_over_global(&mut config, local);
     }
-    let text = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let value: TomlValue = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-        path: path.clone(),
-        source,
-    })?;
-    let local = parse_and_validate(value, &external, root)?;
-    merge_local_over_global(&mut config, local);
-    validate_pipeline_stages(&config)?;
-    validate_pipeline_gates(&config)?;
+    // After the merge, never before: a global `~/.ctxgrd/namespaces/<NS>.toml`
+    // and a local block each contribute rules, and only the merged list says
+    // what the namespace actually binds.
+    let inert = inert_rule_messages(&config);
+    config.kernel_messages.extend(inert);
     Ok(config)
 }
 
-/// T2.1 / EARS-05.2: every explicit `[pipeline.gate]` predicate must
-/// name a status that is a member of that namespace's
-/// `core.allowed-values` status list. Runs post-merge so the list may
-/// come from a global namespace file. A namespace that does not
-/// constrain `status` has no list to check against — the gate is
-/// accepted (we reject only statuses that contradict an explicit
-/// allow-list, never invent one). Default gates (EARS-02.4) are not
-/// checked here: they are built-in and apply only when no explicit
-/// gate is written.
-fn validate_pipeline_gates(config: &Config) -> Result<(), ConfigError> {
-    let Some(pipeline) = &config.pipeline else {
-        return Ok(());
-    };
-    for (namespace, predicate) in &pipeline.gates {
-        let ns_cfg = config.namespace_config(namespace);
-        let Some(allowed) = ns_cfg.allowed_status_values() else {
+/// `cfg.rule-inert` (`BUG-040`): one message per rule a namespace binds
+/// that its own classification prevents from ever running.
+///
+/// The inertness needs **two** conditions, and testing either alone is
+/// wrong. `core.id` puts the namespace on the id pipeline, which
+/// [`NamespaceConfig::file_level_namespaces`] excludes from the file-level
+/// scan — but a handful of `Level::File` codes carry an explicit id-keyed
+/// arm in [`crate::run`]'s step 6 and still fire
+/// ([`crate::builtin_rules::ID_KEYED_FILE_LEVEL_RULES`]). Flagging on
+/// `core.id` + `Level::File` alone would false-positive on this repo's own
+/// `[ADR]` block; flagging on the missing arm alone would fire on every
+/// path-claimed namespace, where the file-level scan is the intended path.
+///
+/// Reported as a `KernelMessage` rather than a [`ConfigError`] because the
+/// run is not prevented — everything else in the config resolves and lints
+/// normally. It is an error rather than a warning because the config makes
+/// a claim that is false: `ctxgrd rules` lists the binding as active and
+/// the summary counts it in `N rules`, so a user verifying their gate
+/// before trusting it is told the gate exists.
+fn inert_rule_messages(config: &Config) -> Vec<KernelMessage> {
+    let mut out = Vec::new();
+    for (namespace, ns_cfg) in &config.namespaces {
+        if !ns_cfg.rules.iter().any(|c| c == "core.id") {
             continue;
-        };
-        if !allowed.iter().any(|s| s == &predicate.status) {
-            return Err(ConfigError::PipelineGateStatusUnknown {
-                namespace: namespace.clone(),
-                status: predicate.status.clone(),
-            });
+        }
+        for code in &ns_cfg.rules {
+            if !is_file_level_compiled(code)
+                || crate::builtin_rules::ID_KEYED_FILE_LEVEL_RULES.contains(&code.as_str())
+            {
+                continue;
+            }
+            out.push(
+                KernelMessage::error(
+                    "cfg.rule-inert",
+                    format!(
+                        "[{namespace}] binds {code}, but core.id puts this namespace on the \
+                         id pipeline where that rule cannot run"
+                    ),
+                )
+                .with_help(format!(
+                    "drop `core.id` from [{namespace}].rules to make the namespace \
+                     path-claimed, or drop {code} — as written the rule is listed as \
+                     active and never runs"
+                ))
+                .with_note(
+                    "file-level rules lint id-less path-claimed files (CLAUDE.md, TODO.md); \
+                     a namespace claiming ids is linted per document instead",
+                ),
+            );
         }
     }
-    Ok(())
-}
-
-/// EARS-05.2 (parse-time half): every `[pipeline].stages` entry must
-/// name an active namespace. Runs after the local/global merge so a
-/// stage configured only in `~/.ctxgrd/namespaces/` is still active.
-fn validate_pipeline_stages(config: &Config) -> Result<(), ConfigError> {
-    let Some(pipeline) = &config.pipeline else {
-        return Ok(());
-    };
-    for stage in &pipeline.stages {
-        if !config.namespaces.contains_key(stage) {
-            return Err(ConfigError::PipelineStageUnknown {
-                stage: stage.clone(),
-            });
-        }
-    }
-    Ok(())
+    out
 }
 
 /// Load every `~/.ctxgrd/namespaces/<NS>.toml` as a per-namespace
@@ -611,25 +643,35 @@ fn merge_local_over_global(global: &mut Config, local: Config) {
     for (name, params) in local.sources {
         global.sources.insert(name, params);
     }
+    // Must travel with `sources` above, or a local `[sources.<name>]`
+    // silently reverts to DEFAULT_SOURCE_EXPECT_MIN and the `expect_min = 0`
+    // escape hatch stops working (ADR-119 § CLM-002).
+    for (name, floor) in local.source_expect_min {
+        global.source_expect_min.insert(name, floor);
+    }
     // [ignore] is local-only for v1 — per-user global file patterns
     // would require careful semantics (who overrides whom?); deferred.
     if local.ignore.is_some() {
         global.ignore = local.ignore;
         global.ignore_patterns = local.ignore_patterns;
     }
+    if !local.ignore_namespaces.is_empty() {
+        global.ignore_namespaces = local.ignore_namespaces;
+    }
+    // [roles] is local-only for the same reason as [ignore]: a role
+    // vocabulary is a property of one project's org, not of the machine.
+    // (There is no global top-level toml to carry it anyway — the global
+    // layer is per-namespace files, which may still set `owner`.)
+    if local.roles_allowed.is_some() {
+        global.roles_allowed = local.roles_allowed;
+    }
     // [references] is also local-only for v1: global scan globs make
     // even less sense (paths only resolve against the lint root).
     if !local.reference_scan_globs.is_empty() {
         global.reference_scan_globs = local.reference_scan_globs;
     }
-    // [pipeline] is local-only for v1 — a global pipeline would claim
-    // a process shape for every repo on the machine; deferred until a
-    // consumer asks (same posture as [ignore]).
-    if local.pipeline.is_some() {
-        global.pipeline = local.pipeline;
-    }
-    // [changelog] is local-only, same posture as [pipeline]: a machine-wide
-    // changelog whitelist makes no sense.
+    // [changelog] is local-only: a machine-wide changelog whitelist would
+    // claim documents from every repo on the machine.
     if local.changelog.is_some() {
         global.changelog = local.changelog;
     }
@@ -682,7 +724,7 @@ pub fn discover_external_rules(
 
 /// Testable variant of [`discover_external_rules`] — `None` for
 /// "no global dir", `Some(path)` to point at a specific one.
-pub fn discover_external_rules_with_global(
+pub(crate) fn discover_external_rules_with_global(
     root: &Path,
     global_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, DiscoveredRule>, ConfigError> {
@@ -751,7 +793,7 @@ fn collect_rules_in(
 /// `~/.ctxgrd/` — returned as an absolute path when `$HOME` is set
 /// AND the directory exists, else `None`. Callers treat `None` as
 /// "no global config available".
-pub fn global_ctxgrd_dir() -> Option<PathBuf> {
+pub(crate) fn global_ctxgrd_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let path = PathBuf::from(home).join(".ctxgrd");
     if path.is_dir() {
@@ -786,9 +828,15 @@ fn parse_and_validate(
             parse_references(val, &mut config)?;
             continue;
         }
-        if key == "pipeline" {
-            config.pipeline = Some(parse_pipeline(val)?);
+        if key == "roles" {
+            config.roles_allowed = Some(parse_roles(val)?);
             continue;
+        }
+        // ADR-118 § STG-002: refuse rather than ignore. The key is still
+        // matched here — not left to fall through to the unknown-key path —
+        // so the error can name the ADR and point at the replacement.
+        if key == "pipeline" {
+            return Err(ConfigError::PipelineRemoved);
         }
         if key == "changelog" {
             config.changelog = Some(parse_changelog(val)?);
@@ -813,6 +861,42 @@ fn parse_and_validate(
         config.namespaces.insert(key, ns_cfg);
     }
     Ok(config)
+}
+
+/// Parse the top-level `[roles]` block (ADR-076 § OWN-003).
+///
+/// Shape is `allowed = ["developer", "writer", …]` — the vocabulary
+/// `[<NS>].owner` values are validated against. A `[roles]` table with no
+/// `allowed` key declares an *empty* vocabulary, which rejects every owner;
+/// that is almost certainly a typo, so it is an error rather than a silently
+/// inert table. To opt out of value-checking, omit `[roles]` entirely.
+fn parse_roles(val: TomlValue) -> Result<Vec<String>, ConfigError> {
+    let TomlValue::Table(mut table) = val else {
+        return Err(ConfigError::RolesInvalid {
+            detail: "`[roles]` must be a table".into(),
+        });
+    };
+    let Some(allowed) = table.remove("allowed") else {
+        return Err(ConfigError::RolesInvalid {
+            detail: "`allowed` is required — a `[roles]` table without it would reject \
+                     every owner; omit the table to leave `owner` declare-only"
+                .into(),
+        });
+    };
+    let TomlValue::Array(items) = allowed else {
+        return Err(ConfigError::RolesInvalid {
+            detail: "`allowed` must be an array of role-name strings".into(),
+        });
+    };
+    items
+        .into_iter()
+        .map(|v| match v {
+            TomlValue::String(s) => Ok(s),
+            _ => Err(ConfigError::RolesInvalid {
+                detail: "`allowed` entries must be strings".into(),
+            }),
+        })
+        .collect()
 }
 
 /// Parse the top-level `[references]` block (ADR-001 § REF-003).
@@ -843,91 +927,6 @@ fn parse_references(val: TomlValue, config: &mut Config) -> Result<(), ConfigErr
     }
     config.reference_scan_globs = globs;
     Ok(())
-}
-
-/// Parse the top-level `[pipeline]` block (SPEC-002 § Data model).
-/// Structural shape and gate-predicate grammar are rejected here with
-/// named errors (T1.1's half of EARS-05.2); whether each stage names
-/// an active namespace is checked post-merge by
-/// [`validate_pipeline_stages`]. Unknown keys inside `[pipeline]` are
-/// silently ignored, matching the top-level future-proofing posture.
-fn parse_pipeline(val: TomlValue) -> Result<PipelineConfig, ConfigError> {
-    let TomlValue::Table(mut table) = val else {
-        return Err(ConfigError::PipelineInvalid {
-            detail: "`[pipeline]` must be a table".into(),
-        });
-    };
-
-    let stages = match table.remove("stages") {
-        Some(TomlValue::Array(items)) => items
-            .into_iter()
-            .map(|v| match v {
-                TomlValue::String(s) => Ok(s),
-                _ => Err(ConfigError::PipelineInvalid {
-                    detail: "`stages` must be an array of namespace-name strings".into(),
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        Some(_) => {
-            return Err(ConfigError::PipelineInvalid {
-                detail: "`stages` must be an array of namespace-name strings".into(),
-            });
-        }
-        None => {
-            return Err(ConfigError::PipelineInvalid {
-                detail: "`stages` is required — a declared pipeline without stages is meaningless"
-                    .into(),
-            });
-        }
-    };
-    if stages.is_empty() {
-        return Err(ConfigError::PipelineInvalid {
-            detail: "`stages` must list at least one namespace".into(),
-        });
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for stage in &stages {
-        if !seen.insert(stage.as_str()) {
-            return Err(ConfigError::PipelineInvalid {
-                detail: format!("duplicate `stages` entry '{stage}'"),
-            });
-        }
-    }
-
-    let mut gates = BTreeMap::new();
-    if let Some(gate_val) = table.remove("gate") {
-        let TomlValue::Table(gate_table) = gate_val else {
-            return Err(ConfigError::PipelineInvalid {
-                detail: "`[pipeline.gate]` must be a table of `<NS> = \"<predicate>\"` entries"
-                    .into(),
-            });
-        };
-        for (namespace, value) in gate_table {
-            if !stages.contains(&namespace) {
-                return Err(ConfigError::PipelineGateInvalid {
-                    namespace,
-                    detail: "names a namespace not listed in `stages`".into(),
-                });
-            }
-            let TomlValue::String(raw) = value else {
-                return Err(ConfigError::PipelineGateInvalid {
-                    namespace,
-                    detail: "predicate must be a string".into(),
-                });
-            };
-            let Some(predicate) = GatePredicate::parse(&raw) else {
-                return Err(ConfigError::PipelineGateInvalid {
-                    namespace,
-                    detail: format!(
-                        "predicate {raw:?} is malformed — expected `any:<status>` or `all:<status>`"
-                    ),
-                });
-            };
-            gates.insert(namespace, predicate);
-        }
-    }
-
-    Ok(PipelineConfig { stages, gates })
 }
 
 /// Parse the top-level `[changelog]` block (ADR-084 § CHG-002).
@@ -1059,6 +1058,25 @@ fn parse_ignore(val: TomlValue, config: &mut Config) -> Result<(), ConfigError> 
     let TomlValue::Table(mut table) = val else {
         return Ok(());
     };
+    // ADR-076 § OWN-004: `namespaces` exempts a namespace from the
+    // undeclared-coverage warning. Independent of `patterns` — a config may
+    // carry either, both, or neither.
+    if let Some(ns_val) = table.remove("namespaces") {
+        let TomlValue::Array(items) = ns_val else {
+            return Err(ConfigError::IgnoreInvalid {
+                detail: "`[ignore].namespaces` must be an array of namespace-name strings".into(),
+            });
+        };
+        config.ignore_namespaces = items
+            .into_iter()
+            .map(|v| match v {
+                TomlValue::String(s) => Ok(s),
+                _ => Err(ConfigError::IgnoreInvalid {
+                    detail: "`[ignore].namespaces` entries must be strings".into(),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
     let Some(patterns_val) = table.remove("patterns") else {
         return Ok(());
     };
@@ -1118,7 +1136,7 @@ fn parse_sources(val: TomlValue, config: &mut Config) -> Result<(), ConfigError>
     let TomlValue::Table(sources) = val else {
         return Ok(());
     };
-    for (name, source_val) in sources {
+    for (name, mut source_val) in sources {
         if name == "markdown-file" {
             config.kernel_messages.push(KernelMessage::warning(
                 "cfg.reserved-source",
@@ -1126,8 +1144,33 @@ fn parse_sources(val: TomlValue, config: &mut Config) -> Result<(), ConfigError>
             ));
             continue;
         }
-        let params = toml_to_json(&source_val);
-        config.sources.insert(name, params);
+        // ADR-119 § CLM-002. `expect_min` is ctxgrd's own knob, so it is
+        // removed from the table before it becomes `$CTXGRD_SOURCE_PARAMS`
+        // — a source script must not have to know about a reserved key it
+        // never set.
+        let mut expect_min = DEFAULT_SOURCE_EXPECT_MIN;
+        if let TomlValue::Table(table) = &mut source_val {
+            if let Some(raw) = table.remove("expect_min") {
+                match raw.as_integer() {
+                    Some(n) if n >= 0 => expect_min = u32::try_from(n).unwrap_or(u32::MAX),
+                    _ => config.kernel_messages.push(
+                        KernelMessage::warning(
+                            "cfg.expect-min-invalid",
+                            format!(
+                                "[sources.{name}].expect_min must be a non-negative integer; \
+                                 using the default of {DEFAULT_SOURCE_EXPECT_MIN}"
+                            ),
+                        )
+                        .with_help(
+                            "set `expect_min = 0` to accept a source that legitimately \
+                             emits nothing",
+                        ),
+                    ),
+                }
+            }
+        }
+        config.source_expect_min.insert(name.clone(), expect_min);
+        config.sources.insert(name, toml_to_json(&source_val));
     }
     Ok(())
 }
@@ -1176,6 +1219,18 @@ fn parse_namespace(
         None => (None, Vec::new()),
     };
 
+    // ADR-076 § OWN-003. Removed from the table before the params sweep
+    // below, or it would land in `params` as a phantom rule named `owner`.
+    let owner = match table.remove("owner") {
+        Some(TomlValue::String(s)) => Some(s),
+        Some(_) => {
+            return Err(ConfigError::RolesInvalid {
+                detail: format!("[{namespace}].owner must be a role-name string"),
+            });
+        }
+        None => None,
+    };
+
     let mut params: BTreeMap<String, Value> = BTreeMap::new();
     for (k, v) in table {
         params.insert(k, toml_to_json(&v));
@@ -1221,6 +1276,7 @@ fn parse_namespace(
             params,
             paths,
             path_patterns,
+            owner,
         },
         warnings,
     ))
@@ -1306,9 +1362,11 @@ fn validate_rule(
                     code: code.to_string(),
                 })?;
             validate_core_rule_params(namespace, code, p)?;
-        } else if code == "core.successor-link" {
-            // `core.successor-link` params are optional (SUCC-003): absent
-            // values fall back to documented defaults. Validate the shape
+        } else if code == "core.successor-link" || code == "core.dep-status" {
+            // These rules' params are optional (SUCC-003, DPS-003): absent
+            // values fall back to documented defaults, so they must stay
+            // out of PARAMETERIZED_CORE_RULES — membership there makes a
+            // missing block a `RuleParamsMissing` error. Validate the shape
             // only when a table is present.
             if let Some(p) = params.get(code) {
                 validate_core_rule_params(namespace, code, p)?;
@@ -1442,6 +1500,48 @@ fn validate_core_rule_params(
                             ),
                         });
                     }
+                }
+            }
+            Ok(())
+        }
+        "core.dep-status" => {
+            // Two optional params: `terminal` (array of strings) and
+            // `severity` (`error` | `warning`), both defaulted (DPS-003).
+            // Absent is fine; present-but-wrong-shape is a configuration
+            // mistake, not a silent fallback.
+            if let Some(value) = map.get("terminal") {
+                let Value::Array(items) = value else {
+                    return Err(ConfigError::RuleParamsInvalid {
+                        namespace: namespace.to_string(),
+                        code: code.to_string(),
+                        detail: format!(
+                            "`terminal` expected array of strings, got {}",
+                            value_kind(value)
+                        ),
+                    });
+                };
+                if items.iter().any(|i| !i.is_string()) {
+                    return Err(ConfigError::RuleParamsInvalid {
+                        namespace: namespace.to_string(),
+                        code: code.to_string(),
+                        detail: "`terminal` expected array of strings, got array of mixed types"
+                            .to_string(),
+                    });
+                }
+            }
+            if let Some(value) = map.get("severity") {
+                let is_valid = value
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("error") || s.eq_ignore_ascii_case("warning"));
+                if !is_valid {
+                    return Err(ConfigError::RuleParamsInvalid {
+                        namespace: namespace.to_string(),
+                        code: code.to_string(),
+                        detail: format!(
+                            "`severity` expected \"error\" or \"warning\", got {}",
+                            value_kind(value)
+                        ),
+                    });
                 }
             }
             Ok(())
@@ -2290,324 +2390,38 @@ paths = ["docs/adrs/**"]
         assert!(config.namespaces.is_empty());
     }
 
-    // -- SPEC-002 T1.1: `[pipeline]` parsing (EARS-05.2, parse-time) ----
+    // -- ADR-118 § STG-002: `[pipeline]` is refused, not ignored --------
 
     #[test]
-    fn pipeline_absent_is_none() {
+    fn stg002_a_declared_pipeline_is_refused() {
+        let err = parse("[ADR]\nrules = []\n\n[pipeline]\nstages = [\"ADR\"]\n").unwrap_err();
+        assert!(matches!(err, ConfigError::PipelineRemoved), "got {err:?}");
+        assert_eq!(err.code(), Some("cfg.pipeline-removed"));
+    }
+
+    #[test]
+    fn stg002_a_bare_gate_table_is_refused_too() {
+        // `[pipeline.gate]` with no `[pipeline]` header still creates the
+        // `pipeline` table in TOML, so the check must catch it. Missing this
+        // would leave the gate half of the layer quietly accepted.
+        let err = parse("[ADR]\nrules = []\n\n[pipeline.gate]\nADR = \"any:accepted\"\n").unwrap_err();
+        assert!(matches!(err, ConfigError::PipelineRemoved), "got {err:?}");
+    }
+
+    #[test]
+    fn stg002_a_config_without_a_pipeline_still_loads() {
+        // The paired half. Without it, "every `[pipeline]` config fails" is
+        // indistinguishable from "every config fails".
         let config = parse("[ADR]\nrules = []\n").unwrap();
-        assert!(config.pipeline.is_none());
+        assert!(config.namespaces.contains_key("ADR"));
     }
 
     #[test]
-    fn pipeline_parses_stages_and_gates_typed() {
-        let text = r#"
-[ADR]
-rules = []
-[PRD]
-rules = []
-[TASK]
-rules = []
-
-[pipeline]
-stages = ["PRD", "ADR", "TASK"]
-
-[pipeline.gate]
-PRD = "any:accepted"
-TASK = "all:done"
-"#;
-        let config = parse(text).unwrap();
-        let pipeline = config.pipeline.as_ref().expect("pipeline parsed");
-        assert_eq!(pipeline.stages, vec!["PRD", "ADR", "TASK"]);
-        assert_eq!(
-            pipeline.gates.get("PRD"),
-            Some(&GatePredicate {
-                quantifier: GateQuantifier::Any,
-                status: "accepted".to_string(),
-            })
-        );
-        assert_eq!(
-            pipeline.gates.get("TASK"),
-            Some(&GatePredicate {
-                quantifier: GateQuantifier::All,
-                status: "done".to_string(),
-            })
-        );
-        assert!(!pipeline.gates.contains_key("ADR"), "no explicit ADR gate");
-    }
-
-    #[test]
-    fn pipeline_gate_table_is_optional() {
-        let text = "[ADR]\nrules = []\n\n[pipeline]\nstages = [\"ADR\"]\n";
-        let config = parse(text).unwrap();
-        let pipeline = config.pipeline.as_ref().unwrap();
-        assert_eq!(pipeline.stages, vec!["ADR"]);
-        assert!(pipeline.gates.is_empty());
-    }
-
-    #[test]
-    fn pipeline_stages_missing_errors() {
-        let err = parse("[pipeline]\ngate = {}\n").unwrap_err();
-        match err {
-            ConfigError::PipelineInvalid { detail } => {
-                assert!(detail.contains("stages"), "got detail: {detail}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pipeline_stages_must_be_array_of_strings() {
-        let not_array = parse("[pipeline]\nstages = \"PRD\"\n").unwrap_err();
-        assert!(matches!(not_array, ConfigError::PipelineInvalid { .. }));
-        let mixed = parse("[pipeline]\nstages = [\"PRD\", 42]\n").unwrap_err();
-        assert!(matches!(mixed, ConfigError::PipelineInvalid { .. }));
-    }
-
-    #[test]
-    fn pipeline_stages_empty_errors() {
-        let err = parse("[pipeline]\nstages = []\n").unwrap_err();
-        match err {
-            ConfigError::PipelineInvalid { detail } => {
-                assert!(detail.contains("at least one"), "got detail: {detail}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pipeline_stages_duplicate_errors() {
-        let err = parse("[pipeline]\nstages = [\"PRD\", \"ADR\", \"PRD\"]\n").unwrap_err();
-        match err {
-            ConfigError::PipelineInvalid { detail } => {
-                assert!(detail.contains("duplicate"), "got detail: {detail}");
-                assert!(detail.contains("PRD"), "got detail: {detail}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pipeline_gate_for_unstaged_namespace_errors() {
-        let text =
-            "[pipeline]\nstages = [\"PRD\", \"ADR\"]\n\n[pipeline.gate]\nSPEC = \"any:accepted\"\n";
-        let err = parse(text).unwrap_err();
-        match err {
-            ConfigError::PipelineGateInvalid { namespace, detail } => {
-                assert_eq!(namespace, "SPEC");
-                assert!(detail.contains("stages"), "got detail: {detail}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pipeline_gate_predicate_grammar_rejections() {
-        // EARS-02.3 grammar is `("any" | "all") ":" <status>` — anything
-        // else is a parse-time configuration error (EARS-05.2).
-        for bad in ["accepted", "some:accepted", "any:", "ANY:accepted", ""] {
-            let text =
-                format!("[pipeline]\nstages = [\"PRD\"]\n\n[pipeline.gate]\nPRD = \"{bad}\"\n");
-            let err = parse(&text).unwrap_err();
-            match err {
-                ConfigError::PipelineGateInvalid { namespace, .. } => {
-                    assert_eq!(namespace, "PRD", "predicate {bad:?}");
-                }
-                other => panic!("predicate {bad:?}: unexpected error: {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn pipeline_gate_predicate_must_be_string() {
-        let text = "[pipeline]\nstages = [\"PRD\"]\n\n[pipeline.gate]\nPRD = 42\n";
-        let err = parse(text).unwrap_err();
-        assert!(matches!(err, ConfigError::PipelineGateInvalid { .. }));
-    }
-
-    #[test]
-    fn pipeline_stage_unknown_namespace_rejected_at_load() {
-        // `stages` may only name active namespaces (SPEC-002 § Data
-        // model). SPEC is not declared anywhere → cfg error.
-        let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join("ctxgrd.toml"),
-            r#"
-[ADR]
-rules = []
-
-[pipeline]
-stages = ["ADR", "SPEC"]
-"#,
-        );
-        let err = load_with_global(tmp.path(), None).unwrap_err();
-        match err {
-            ConfigError::PipelineStageUnknown { stage } => assert_eq!(stage, "SPEC"),
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pipeline_stage_active_via_global_namespace_is_accepted() {
-        // Activeness is checked against the *merged* config: a stage
-        // configured only in ~/.ctxgrd/namespaces/ is still active.
-        let tmp = tempfile::tempdir().unwrap();
-        let global = tmp.path().join("global");
-        write(
-            &global.join("namespaces/SPEC.toml"),
-            r#"rules = ["core.frontmatter"]"#,
-        );
-        write(
-            &tmp.path().join("ctxgrd.toml"),
-            r#"
-[ADR]
-rules = []
-
-[pipeline]
-stages = ["ADR", "SPEC"]
-"#,
-        );
-        let config = load_with_global(tmp.path(), Some(&global)).unwrap();
-        let pipeline = config.pipeline.as_ref().unwrap();
-        assert_eq!(pipeline.stages, vec!["ADR", "SPEC"]);
-    }
-
-    // -- SPEC-002 T2.1: gate status validated against allowed-values ----
-
-    #[test]
-    fn pipeline_gate_status_outside_allowed_values_rejected_at_load() {
-        // EARS-05.2 / SPEC § Error model: a gate predicate naming a
-        // status that is not in the namespace's core.allowed-values
-        // list is a configuration error.
-        let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join("ctxgrd.toml"),
-            r#"
-[ADR]
-rules = ["core.allowed-values"]
-[ADR."core.allowed-values"]
-status = ["draft", "accepted", "rejected"]
-
-[pipeline]
-stages = ["ADR"]
-
-[pipeline.gate]
-ADR = "any:shipped"
-"#,
-        );
-        let err = load_with_global(tmp.path(), None).unwrap_err();
-        match err {
-            ConfigError::PipelineGateStatusUnknown { namespace, status } => {
-                assert_eq!(namespace, "ADR");
-                assert_eq!(status, "shipped");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pipeline_gate_status_in_allowed_values_accepted() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join("ctxgrd.toml"),
-            r#"
-[ADR]
-rules = ["core.allowed-values"]
-[ADR."core.allowed-values"]
-status = ["draft", "accepted", "rejected"]
-
-[pipeline]
-stages = ["ADR"]
-
-[pipeline.gate]
-ADR = "any:accepted"
-"#,
-        );
-        let config = load_with_global(tmp.path(), None).unwrap();
-        assert!(config.pipeline.is_some());
-    }
-
-    #[test]
-    fn pipeline_gate_status_unchecked_when_namespace_has_no_allowed_values() {
-        // A namespace that does not constrain `status` has no list to
-        // be a member of — the gate is accepted (lenient: we only
-        // reject statuses that contradict an explicit allow-list).
-        let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join("ctxgrd.toml"),
-            r#"
-[ADR]
-rules = ["core.frontmatter"]
-
-[pipeline]
-stages = ["ADR"]
-
-[pipeline.gate]
-ADR = "any:whatever"
-"#,
-        );
-        let config = load_with_global(tmp.path(), None).unwrap();
-        assert!(config.pipeline.is_some());
-    }
-
-    #[test]
-    fn pipeline_gate_status_validated_against_merged_global_allowed_values() {
-        // Activeness AND allowed-values both resolve against the merged
-        // config: a namespace configured only in ~/.ctxgrd/namespaces/
-        // still contributes its allowed-values status list.
-        let tmp = tempfile::tempdir().unwrap();
-        let global = tmp.path().join("global");
-        write(
-            &global.join("namespaces/SPEC.toml"),
-            r#"
-rules = ["core.allowed-values"]
-["core.allowed-values"]
-status = ["draft", "accepted"]
-"#,
-        );
-        write(
-            &tmp.path().join("ctxgrd.toml"),
-            r#"
-[pipeline]
-stages = ["SPEC"]
-
-[pipeline.gate]
-SPEC = "all:shipped"
-"#,
-        );
-        let err = load_with_global(tmp.path(), Some(&global)).unwrap_err();
-        match err {
-            ConfigError::PipelineGateStatusUnknown { namespace, status } => {
-                assert_eq!(namespace, "SPEC");
-                assert_eq!(status, "shipped");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pipeline_gate_status_error_code_is_named() {
-        let err = ConfigError::PipelineGateStatusUnknown {
-            namespace: "ADR".into(),
-            status: "shipped".into(),
-        };
-        assert_eq!(err.code(), Some("cfg.pipeline-gate-status"));
-    }
-
-    #[test]
-    fn pipeline_error_codes_are_named() {
-        // T1.1 done-when: invalid configs are rejected with *named*
-        // errors — the `cfg.pipeline-*` codes the CLI prints.
-        let invalid = ConfigError::PipelineInvalid { detail: "x".into() };
-        assert_eq!(invalid.code(), Some("cfg.pipeline-invalid"));
-        let unknown = ConfigError::PipelineStageUnknown {
-            stage: "SPEC".into(),
-        };
-        assert_eq!(unknown.code(), Some("cfg.pipeline-stage-unknown"));
-        let gate = ConfigError::PipelineGateInvalid {
-            namespace: "PRD".into(),
-            detail: "x".into(),
-        };
-        assert_eq!(gate.code(), Some("cfg.pipeline-gate-invalid"));
+    fn stg002_the_error_names_the_adr_so_the_fix_is_findable() {
+        let err = parse("[pipeline]\nstages = [\"ADR\"]\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ADR-118"), "message must name the decision: {msg}");
+        assert!(msg.contains("[pipeline]"), "message must name the key: {msg}");
     }
 
     #[test]

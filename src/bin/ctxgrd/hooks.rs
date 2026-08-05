@@ -2,38 +2,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-
-use anyhow::Result;
 
 use ctxgrd::diagnostic::Diagnostic;
-use ctxgrd::run;
 
-use super::{emit_error, relative_display};
-
-/// Render the pre-commit hook script. The hook is intentionally
-/// minimal (ADR-014 § HOOK-005): it delegates entirely to `ctxgrd` and
-/// lets the three-valued exit code decide the commit — a non-zero exit
-/// (lint failure `1` or kernel error `2`) aborts it. The
-/// `command -v ctxgrd` guard hard-gates: a machine that has activated the
-/// hook but lacks ctxgrd on PATH aborts the commit with an actionable
-/// message, rather than silently skipping the lint (ADR-014 § HOOK-005).
-fn render_precommit_hook(root: &std::path::Path) -> String {
-    let root_arg = root.display();
-    format!(
-        "#!/bin/sh\n\
-         # Installed by `ctxgrd hooks install` (ADR-014).\n\
-         # Gates commits on ctxgrd; a non-zero exit aborts the commit.\n\
-         command -v ctxgrd >/dev/null 2>&1 || {{\n\
-         \techo 'ctxgrd not found on PATH — install it or remove this hook (unset core.hooksPath)' >&2\n\
-         \texit 1\n\
-         }}\n\
-         # Signals commit context so the agents.context-cache rule can warn\n\
-         # on cache-busting edits to CLAUDE.md/AGENTS.md (ADR-020).\n\
-         export CTXGRD_COMMIT_CONTEXT=1\n\
-         exec ctxgrd --root \"{root_arg}\"\n"
-    )
-}
+use super::command::{Command, Ctx, KernelError, Outcome};
+use super::{relative_display, Format};
 
 /// The shared `run-parts`-style pre-commit *runner* (ADR-014 § HOOK-008).
 /// When `core.hooksPath` points away from `.git/hooks/`, ctxgrd composes with
@@ -86,6 +59,19 @@ const CTXGRD_FRAGMENT: &str = "#!/bin/sh\n\
      export CTXGRD_COMMIT_CONTEXT=1\n\
      exec ctxgrd --root \".\"\n";
 
+/// The fresh-clone bootstrap `scripts/setup-hooks.sh` (ADR-014 § HOOK-010).
+/// `core.hooksPath` is *local* git config, not tracked in the repo, so a clone
+/// that never runs this has the tracked `.githooks/` sitting inert. This script
+/// activates it. Written only when absent (`write_setup_hooks_if_absent`), so it
+/// never clobbers the byte-different bootstrap a sibling `*grd` tool (wrkgrd) may
+/// already have committed — both do the same `git config`, so whichever is present
+/// is correct. The echo names the `*grd` family, not ctxgrd specifically.
+const SETUP_HOOKS: &str = "#!/bin/sh\n\
+     set -eu\n\
+     # Point this repo's git hooks at the tracked .githooks directory.\n\
+     git -C \"$(git rev-parse --show-toplevel)\" config core.hooksPath .githooks\n\
+     echo \"core.hooksPath -> .githooks (grd pre-commit hooks active)\"\n";
+
 /// Resolve the active hooks directory from `git config core.hooksPath`.
 ///
 /// Returns `Ok(None)` when `core.hooksPath` is unset or names the default
@@ -129,17 +115,19 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Install the composable `pre-commit.d/` drop-in into `hooks_path` (ADR-014
-/// §§ HOOK-008, HOOK-009). Ensures the shared `run-parts` runner exists at
-/// `<hooks_path>/pre-commit` (byte-identical to wrkgrd's), then writes ctxgrd's
-/// `10-ctxgrd` fragment (mode 0755).
+/// Write the composable `pre-commit.d/` drop-in into `hooks_path` (ADR-014
+/// §§ HOOK-008, HOOK-009, HOOK-010). Ensures the shared `run-parts` runner exists
+/// at `<hooks_path>/pre-commit` (byte-identical to wrkgrd's), then writes ctxgrd's
+/// `10-ctxgrd` fragment (mode 0755). Does no printing — the caller composes the
+/// success report so it can describe the surrounding install (`core.hooksPath`,
+/// `setup-hooks.sh`) that this function knows nothing about.
 ///
 /// Idempotent: re-running refreshes only the runner and `10-ctxgrd`, and NEVER
-/// deletes or modifies a foreign fragment (e.g. `50-wrkgrd`). `--force` is not
-/// consulted here — the drop-in never clobbers another tool's work, so there is
-/// nothing to force. A fragment without the execute bit is silently skipped by
-/// the runner, so the fragment is always chmod 0755.
-fn install_dropin(root: &PathBuf, hooks_path: &Path) -> Result<ExitCode> {
+/// deletes or modifies a foreign fragment (e.g. `50-wrkgrd`). A fragment without
+/// the execute bit is silently skipped by the runner, so the fragment is always
+/// chmod 0755. On any I/O failure it returns the diagnostic for the dispatcher
+/// to render (exit 2).
+fn write_dropin(root: &Path, hooks_path: &Path) -> Result<(), KernelError> {
     let runner = hooks_path.join("pre-commit");
     let fragment_dir = hooks_path.join("pre-commit.d");
     let fragment = fragment_dir.join(CTXGRD_FRAGMENT_NAME);
@@ -149,8 +137,7 @@ fn install_dropin(root: &PathBuf, hooks_path: &Path) -> Result<ExitCode> {
         let d = Diagnostic::error("io.mkdir", &rel, 0, 0, format!("could not create {rel}"))
             .with_help("check file permissions on the hooks directory")
             .with_note(format!("cause: {e}"));
-        emit_error(&d, root);
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+        return Err(KernelError::report(d));
     }
 
     // The shared runner: write it only when absent or stale, so a re-install
@@ -162,16 +149,14 @@ fn install_dropin(root: &PathBuf, hooks_path: &Path) -> Result<ExitCode> {
             let d = Diagnostic::error("io.write", &rel, 0, 0, format!("could not write {rel}"))
                 .with_help("check file permissions")
                 .with_note(format!("cause: {e}"));
-            emit_error(&d, root);
-            return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+            return Err(KernelError::report(d));
         }
         if let Err(e) = set_executable(&runner) {
             let rel = relative_display(&runner, root);
             let d = Diagnostic::error("io.chmod", &rel, 0, 0, format!("could not chmod {rel}"))
                 .with_help("check file permissions")
                 .with_note(format!("cause: {e}"));
-            emit_error(&d, root);
-            return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+            return Err(KernelError::report(d));
         }
     }
 
@@ -182,31 +167,80 @@ fn install_dropin(root: &PathBuf, hooks_path: &Path) -> Result<ExitCode> {
         let d = Diagnostic::error("io.write", &rel, 0, 0, format!("could not write {rel}"))
             .with_help("check file permissions")
             .with_note(format!("cause: {e}"));
-        emit_error(&d, root);
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+        return Err(KernelError::report(d));
     }
     if let Err(e) = set_executable(&fragment) {
         let rel = relative_display(&fragment, root);
         let d = Diagnostic::error("io.chmod", &rel, 0, 0, format!("could not chmod {rel}"))
             .with_help("check file permissions")
             .with_note(format!("cause: {e}"));
-        emit_error(&d, root);
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+        return Err(KernelError::report(d));
     }
 
-    let frag_rel = relative_display(&fragment, root);
-    let runner_rel = relative_display(&runner, root);
-    println!("{frag_rel}");
-    println!();
-    println!(
-        "core.hooksPath points at {} — installed ctxgrd as a composable",
-        relative_display(hooks_path, root)
-    );
-    println!("pre-commit fragment so a sibling *grd gate is not shadowed.");
-    println!("The shared run-parts runner is at {runner_rel}; it dispatches every");
-    println!("executable fragment in pre-commit.d/ and aborts on the first failure.");
-    println!("Remove ctxgrd's gate with `rm {frag_rel}`.");
-    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+    Ok(())
+}
+
+/// Write the fresh-clone bootstrap `scripts/setup-hooks.sh` (ADR-014 § HOOK-010),
+/// but only when it does not already exist — never clobbering a sibling `*grd`
+/// tool's committed bootstrap. Returns `Ok(true)` when it wrote the file,
+/// `Ok(false)` when one was already present, and `Err` (exit 2) on an I/O failure.
+fn write_setup_hooks_if_absent(root: &Path) -> Result<bool, KernelError> {
+    let scripts = root.join("scripts");
+    let setup = scripts.join("setup-hooks.sh");
+    if setup.exists() {
+        return Ok(false);
+    }
+    if let Err(e) = fs::create_dir_all(&scripts) {
+        let rel = relative_display(&scripts, root);
+        let d = Diagnostic::error("io.mkdir", &rel, 0, 0, format!("could not create {rel}"))
+            .with_help("check file permissions")
+            .with_note(format!("cause: {e}"));
+        return Err(KernelError::report(d));
+    }
+    if let Err(e) = fs::write(&setup, SETUP_HOOKS.as_bytes()) {
+        let rel = relative_display(&setup, root);
+        let d = Diagnostic::error("io.write", &rel, 0, 0, format!("could not write {rel}"))
+            .with_help("check file permissions")
+            .with_note(format!("cause: {e}"));
+        return Err(KernelError::report(d));
+    }
+    if let Err(e) = set_executable(&setup) {
+        let rel = relative_display(&setup, root);
+        let d = Diagnostic::error("io.chmod", &rel, 0, 0, format!("could not chmod {rel}"))
+            .with_help("check file permissions")
+            .with_note(format!("cause: {e}"));
+        return Err(KernelError::report(d));
+    }
+    Ok(true)
+}
+
+/// `git -C <root> config core.hooksPath .githooks` (ADR-014 § HOOK-010). Shelling
+/// out to git keeps the config write canonical (correct section, quoting) rather
+/// than hand-editing the INI, and reuses the binary already required to use a hook
+/// at all. Mirrors wrkgrd's `set_hooks_path`. On failure emits a `hooks.git-config`
+/// diagnostic (exit 2).
+fn set_hooks_path(root: &Path) -> Result<(), KernelError> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "core.hooksPath", ".githooks"])
+        .output();
+    let failed = match out {
+        Ok(o) if o.status.success() => return Ok(()),
+        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        Err(e) => e.to_string(),
+    };
+    let rel = relative_display(root, root);
+    let d = Diagnostic::error(
+        "hooks.git-config",
+        &rel,
+        0,
+        0,
+        "could not set core.hooksPath to .githooks".to_string(),
+    )
+    .with_help("run `git config core.hooksPath .githooks` manually")
+    .with_note(format!("cause: {failed}"));
+    Err(KernelError::report(d))
 }
 
 /// The pre-commit-framework snippet printed when `.pre-commit-config.yaml`
@@ -271,154 +305,270 @@ fn claude_stop_hook_wired(path: &Path) -> bool {
         })
 }
 
-/// `hooks claude`: print the Claude Code Stop-hook wiring and report
-/// whether it is already installed. Print-and-detect only — never mutates
-/// the shared, user-global `settings.json` (ADR-062 § STOP-004).
-pub(super) fn hooks_claude_cmd(root: &Path) -> Result<ExitCode> {
-    println!("Claude Code Stop-hook — a turn-end lint gate (ADR-062).");
-    println!("Add this to .claude/settings.json (project) or ~/.claude/settings.json (global):");
-    println!();
-    println!("{}", render_claude_stop_settings_snippet());
-    println!();
-    println!("It runs `ctxgrd lint --harness claude` when the agent ends a turn;");
-    println!("an error-severity diagnostic blocks the turn until it is fixed. Warnings");
-    println!("never block, and a clean run is silent.");
-    println!();
-
-    // Detection: the project-local file and the user-global one — the two
-    // places Claude Code reads Stop hooks from.
-    let project = root.join(".claude").join("settings.json");
-    let global = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".claude").join("settings.json"));
-
-    let mut wired_anywhere = false;
-    if claude_stop_hook_wired(&project) {
-        println!("wired: {}", relative_display(&project, root));
-        wired_anywhere = true;
-    }
-    if let Some(global) = &global {
-        if claude_stop_hook_wired(global) {
-            println!("wired: {}", global.display());
-            wired_anywhere = true;
-        }
-    }
-    if !wired_anywhere {
-        println!("not wired: no ctxgrd `--harness claude` Stop hook found in project or global settings.");
-    }
-    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+/// `ctxgrd hooks claude` — print the Claude Code Stop-hook wiring and report
+/// whether it is already installed. Print-and-detect only — never mutates the
+/// shared, user-global `settings.json` (ADR-062 § STOP-004).
+pub(super) struct HooksClaudeCmd {
+    pub(super) format: Format,
 }
 
-pub(super) fn hooks_install_cmd(root: &PathBuf, force: bool, dry_run: bool) -> Result<ExitCode> {
-    // HOOK-004: a repo managed by the pre-commit framework owns its
-    // hooks — writing a raw `.git/hooks/pre-commit` would be clobbered
-    // on the framework's next `pre-commit install`. Detect it and emit
-    // the framework's native config instead. This takes precedence over
-    // everything else, including --dry-run: the "what would I do" answer
-    // here is simply "print this snippet".
-    if root.join(".pre-commit-config.yaml").exists() {
-        println!(
-            "{} already exists — add ctxgrd to it rather than writing a raw hook:",
-            relative_display(&root.join(".pre-commit-config.yaml"), root)
-        );
-        println!();
-        print!("{}", render_precommit_framework_snippet());
-        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
+impl Command for HooksClaudeCmd {
+    type Json = serde_json::Value;
+
+    fn emits_json(&self) -> bool {
+        matches!(self.format, Format::Json)
     }
 
-    let script = render_precommit_hook(root);
-
-    // HOOK-006: --dry-run previews the script and writes nothing. Allowed
-    // outside a git repo too — it is a harmless preview.
-    if dry_run {
-        print!("{script}");
-        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
+    fn render_json(out: &Self::Json) -> String {
+        serde_json::to_string_pretty(out).unwrap_or_else(|_| "{}".to_string())
     }
 
-    // Git-repo precondition: a `.git` directory must be present. Worktrees
-    // and submodules (where `.git` is a file) are deferred per ADR-014's
-    // Open Questions — report rather than guess.
-    let git_dir = root.join(".git");
-    if !git_dir.is_dir() {
-        let rel = relative_display(root, root);
-        let d = Diagnostic::error(
-            "hooks.not-a-repo",
-            &rel,
-            0,
-            0,
-            "not a git repository (no .git directory)".to_string(),
-        )
-        .with_help("run `ctxgrd hooks install` from a git repository root")
-        .with_note("pass --root to point at the repository containing .git");
-        emit_error(&d, root);
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
-    }
+    fn run(self, ctx: &Ctx) -> Result<Outcome<Self::Json>, KernelError> {
+        let root = &ctx.root;
+        // Detection: the project-local file and the user-global one — the two
+        // places Claude Code reads Stop hooks from. Read-only (STOP-004).
+        let project = root.join(".claude").join("settings.json");
+        let global = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| h.join(".claude").join("settings.json"));
 
-    // HOOK-008: when `core.hooksPath` points away from `.git/hooks/`, the raw
-    // `.git/hooks/pre-commit` this command used to write would be ignored by
-    // git — silently dead on arrival, and a sibling `*grd` gate that owns the
-    // active hooks dir would shadow ctxgrd entirely (BUG-012). Install ctxgrd
-    // as a composable `pre-commit.d/10-ctxgrd` fragment in the *active*
-    // directory instead, beside the shared run-parts runner. This path is
-    // idempotent and `--force`-free — it never clobbers another tool's work.
-    if let Some(hooks_path) = active_hooks_path(root) {
-        return install_dropin(root, &hooks_path);
-    }
-
-    let hook_path = git_dir.join("hooks").join("pre-commit");
-
-    // HOOK-003: never clobber an existing hook without --force. Mirrors
-    // init_cmd's ctxgrd.toml guard.
-    if hook_path.exists() && !force {
-        let rel = relative_display(&hook_path, root);
-        let d = Diagnostic::error("io.exists", &rel, 0, 0, format!("{rel} already exists"))
-            .with_help("re-run with --force to overwrite, or --dry-run to preview");
-        emit_error(&d, root);
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
-    }
-
-    let hooks_dir = git_dir.join("hooks");
-    if let Err(e) = fs::create_dir_all(&hooks_dir) {
-        let rel = relative_display(&hooks_dir, root);
-        let d = Diagnostic::error("io.mkdir", &rel, 0, 0, format!("could not create {rel}"))
-            .with_help("check file permissions on the .git directory")
-            .with_note(format!("cause: {e}"));
-        emit_error(&d, root);
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
-    }
-    if let Err(e) = fs::write(&hook_path, script.as_bytes()) {
-        let rel = relative_display(&hook_path, root);
-        let d = Diagnostic::error("io.write", &rel, 0, 0, format!("could not write {rel}"))
-            .with_help("check file permissions")
-            .with_note(format!("cause: {e}"));
-        emit_error(&d, root);
-        return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)) {
-            let rel = relative_display(&hook_path, root);
-            let d = Diagnostic::error("io.chmod", &rel, 0, 0, format!("could not chmod {rel}"))
-                .with_help("check file permissions")
-                .with_note(format!("cause: {e}"));
-            emit_error(&d, root);
-            return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
+        let mut wired_paths: Vec<String> = Vec::new();
+        if claude_stop_hook_wired(&project) {
+            wired_paths.push(relative_display(&project, root));
         }
+        if let Some(global) = &global {
+            if claude_stop_hook_wired(global) {
+                wired_paths.push(global.display().to_string());
+            }
+        }
+        let wired_anywhere = !wired_paths.is_empty();
+
+        // ADR-096 § CMD-003: `--format json` emits `{installed, wiring}` on a
+        // clean stdout (the dispatcher writes it) so an agent can branch on
+        // install state without parsing the wiring block.
+        if matches!(self.format, Format::Json) {
+            let obj = serde_json::json!({
+                "installed": wired_anywhere,
+                "wiring": {
+                    "command": CLAUDE_STOP_HOOK_COMMAND,
+                    "settings_snippet": render_claude_stop_settings_snippet(),
+                    "wired_paths": wired_paths,
+                },
+            });
+            return Ok(Outcome::Did(obj));
+        }
+
+        println!("Claude Code Stop-hook — a turn-end lint gate (ADR-062).");
+        println!("Add this to .claude/settings.json (project) or ~/.claude/settings.json (global):");
+        println!();
+        println!("{}", render_claude_stop_settings_snippet());
+        println!();
+        println!("It runs `ctxgrd lint --harness claude` when the agent ends a turn;");
+        println!("an error-severity diagnostic blocks the turn until it is fixed. Warnings");
+        println!("never block, and a clean run is silent.");
+        println!();
+
+        for path in &wired_paths {
+            println!("wired: {path}");
+        }
+        if !wired_anywhere {
+            println!("not wired: no ctxgrd `--harness claude` Stop hook found in project or global settings.");
+        }
+        Ok(Outcome::Did(serde_json::Value::Null))
+    }
+}
+
+/// `ctxgrd hooks install` — install ctxgrd as a composable pre-commit fragment.
+pub(super) struct HooksInstallCmd {
+    pub(super) force: bool,
+    pub(super) dry_run: bool,
+    pub(super) format: Format,
+}
+
+/// ADR-096 § CMD-001 wire shape for `ctxgrd hooks install --format json`.
+#[derive(serde::Serialize)]
+pub(super) struct HooksInstallJson {
+    status: &'static str,
+    path: String,
+}
+
+impl Command for HooksInstallCmd {
+    type Json = HooksInstallJson;
+
+    fn emits_json(&self) -> bool {
+        matches!(self.format, Format::Json)
     }
 
-    let rel = relative_display(&hook_path, root);
-    println!("{rel}");
-    println!();
-    println!("Installed a pre-commit hook. It runs `ctxgrd` before each commit;");
-    println!("a lint failure aborts the commit. Remove it with `rm {rel}`.");
-    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+    fn run(self, ctx: &Ctx) -> Result<Outcome<Self::Json>, KernelError> {
+        let root = &ctx.root;
+        // `--force` is retained for CLI back-compat only (ADR-014 § HOOK-010):
+        // the composable drop-in never clobbers a foreign fragment, so there is
+        // nothing to force. Kept so old invocations do not error.
+        let _ = self.force;
+        let dry_run = self.dry_run;
+
+        // ADR-096 § CMD-001: `--format json` emits `{status, path}` on a clean
+        // stdout; the human "Next steps" narration stays on stderr.
+        let json = matches!(self.format, Format::Json);
+
+        // HOOK-004: a repo managed by the pre-commit framework owns its hooks —
+        // a tracked `.githooks/` gate would sit unused while the framework
+        // drives `.git/hooks/`. Detect it and emit the framework's native
+        // config instead. Takes precedence over everything, including --dry-run.
+        if root.join(".pre-commit-config.yaml").exists() {
+            let config_rel = relative_display(&root.join(".pre-commit-config.yaml"), root);
+            if json {
+                eprintln!("{config_rel} already exists — add ctxgrd to it rather than writing a raw hook:");
+                eprintln!();
+                eprint!("{}", render_precommit_framework_snippet());
+            } else {
+                println!("{config_rel} already exists — add ctxgrd to it rather than writing a raw hook:");
+                println!();
+                print!("{}", render_precommit_framework_snippet());
+            }
+            return Ok(Outcome::Did(HooksInstallJson {
+                status: "framework",
+                path: config_rel,
+            }));
+        }
+
+        // HOOK-010: install ctxgrd as a composable fragment under a *tracked*
+        // hooks directory (wrkgrd's convention), never an untracked
+        // `.git/hooks/pre-commit`. Read `core.hooksPath`: a custom
+        // (non-`.githooks`) value is composed into as-is; otherwise default to
+        // `.githooks` and establish the convention.
+        let resolved = active_hooks_path(root);
+        let githooks = root.join(".githooks");
+        let on_githooks = resolved.as_deref().map_or(true, |p| p == githooks.as_path());
+        let target = resolved.clone().unwrap_or_else(|| githooks.clone());
+
+        let frag_rel = relative_display(
+            &target.join("pre-commit.d").join(CTXGRD_FRAGMENT_NAME),
+            root,
+        );
+        let runner_rel = relative_display(&target.join("pre-commit"), root);
+        let setup_path = root.join("scripts").join("setup-hooks.sh");
+
+        // Whether ctxgrd's fragment is already on disk — distinguishes an
+        // initial install from an idempotent refresh in the JSON status.
+        let fragment_existed = target
+            .join("pre-commit.d")
+            .join(CTXGRD_FRAGMENT_NAME)
+            .exists();
+
+        // HOOK-006: --dry-run previews the plan and writes nothing. Allowed
+        // outside a git repo — a harmless preview.
+        if dry_run {
+            if json {
+                eprintln!("would install:");
+                eprintln!("  {frag_rel}   (ctxgrd pre-commit gate)");
+                eprintln!("  {runner_rel}   (shared run-parts runner)");
+            } else {
+                println!("would install:");
+                println!("  {frag_rel}   (ctxgrd pre-commit gate)");
+                println!("  {runner_rel}   (shared run-parts runner)");
+                if on_githooks {
+                    if !setup_path.exists() {
+                        println!(
+                            "  {}   (fresh-clone bootstrap)",
+                            relative_display(&setup_path, root)
+                        );
+                    }
+                    if resolved.is_none() {
+                        println!("would run: git config core.hooksPath .githooks");
+                    }
+                }
+            }
+            return Ok(Outcome::Did(HooksInstallJson {
+                status: "would-install",
+                path: frag_rel,
+            }));
+        }
+
+        // Git-repo precondition: a `.git` directory must be present. Worktrees
+        // and submodules (where `.git` is a file) are deferred per ADR-014's
+        // Open Questions — report rather than guess.
+        let git_dir = root.join(".git");
+        if !git_dir.is_dir() {
+            let rel = relative_display(root, root);
+            let d = Diagnostic::error(
+                "hooks.not-a-repo",
+                &rel,
+                0,
+                0,
+                "not a git repository (no .git directory)".to_string(),
+            )
+            .with_help("run `ctxgrd hooks install` from a git repository root")
+            .with_note("pass --root to point at the repository containing .git");
+            return Err(KernelError::report(d));
+        }
+
+        write_dropin(root, &target)?;
+
+        // Establish the tracked convention only when we are on `.githooks` —
+        // never override a user's custom `core.hooksPath`.
+        let mut wrote_setup = false;
+        let mut set_config = false;
+        if on_githooks {
+            wrote_setup = write_setup_hooks_if_absent(root)?;
+            // Set `core.hooksPath` only when it is not already pointed at
+            // `.githooks` (a sibling `*grd` tool may have set it).
+            if resolved.is_none() {
+                set_hooks_path(root)?;
+                set_config = true;
+            }
+        }
+
+        if json {
+            let status = if fragment_existed { "exists" } else { "installed" };
+            eprintln!("Installed ctxgrd as a composable pre-commit fragment at {frag_rel}.");
+            if wrote_setup {
+                eprintln!("Bootstrap a fresh clone with scripts/setup-hooks.sh.");
+            }
+            if set_config {
+                eprintln!("Set core.hooksPath -> .githooks.");
+            }
+            return Ok(Outcome::Did(HooksInstallJson {
+                status,
+                path: frag_rel,
+            }));
+        }
+
+        println!("{frag_rel}");
+        println!();
+        if on_githooks {
+            if set_config {
+                println!("Installed ctxgrd as a composable pre-commit fragment under the tracked");
+                println!(".githooks/ directory and set core.hooksPath -> .githooks.");
+            } else {
+                println!("Installed ctxgrd as a composable pre-commit fragment under the tracked");
+                println!(".githooks/ directory (core.hooksPath already -> .githooks).");
+            }
+        } else {
+            println!(
+                "Installed ctxgrd as a composable pre-commit fragment in {} (core.hooksPath",
+                relative_display(&target, root)
+            );
+            println!("already points there); a sibling *grd gate is not shadowed.");
+        }
+        println!("The shared run-parts runner at {runner_rel} dispatches every executable");
+        println!("fragment in pre-commit.d/ (10-ctxgrd before a sibling *grd's 50- gate) and");
+        println!("aborts on the first failure.");
+        if wrote_setup {
+            println!("Bootstrap a fresh clone with scripts/setup-hooks.sh.");
+        }
+        println!("Remove ctxgrd's gate with `rm {frag_rel}`.");
+        let status = if fragment_existed { "exists" } else { "installed" };
+        Ok(Outcome::Did(HooksInstallJson {
+            status,
+            path: frag_rel,
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CTXGRD_FRAGMENT, CTXGRD_FRAGMENT_NAME, PRE_COMMIT_RUNNER};
+    use super::{CTXGRD_FRAGMENT, CTXGRD_FRAGMENT_NAME, PRE_COMMIT_RUNNER, SETUP_HOOKS};
 
     /// The shared runner ctxgrd writes MUST be byte-identical to the runner the
     /// sibling wrkgrd installer writes (`PRE_COMMIT` in wrkgrd's `src/hooks.rs`),
@@ -473,5 +623,17 @@ done
     fn fragment_name_orders_before_wrkgrd() {
         assert_eq!(CTXGRD_FRAGMENT_NAME, "10-ctxgrd");
         assert!(CTXGRD_FRAGMENT_NAME < "50-wrkgrd");
+    }
+
+    /// HOOK-010: the fresh-clone bootstrap points `core.hooksPath` at the tracked
+    /// `.githooks/` directory, so a clone that runs it activates the composed
+    /// hooks. It is a POSIX sh script (git runs it as the setup step).
+    #[test]
+    fn setup_hooks_sets_the_tracked_hooks_path() {
+        assert!(SETUP_HOOKS.starts_with("#!/bin/sh"));
+        assert!(
+            SETUP_HOOKS.contains("config core.hooksPath .githooks"),
+            "bootstrap must set core.hooksPath: {SETUP_HOOKS}"
+        );
     }
 }

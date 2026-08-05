@@ -1,6 +1,7 @@
-# summary: SPEC/TASK/PROMPT — ctxgrd's harness-neutral agent-development document pipeline: a SPEC is implemented via TASKs, and reusable PROMPTs are versioned.
-# Id-claimed: each namespace activates when you author the document. Split out of
-# the old `agents` pack by ADR-051 so the harness-neutral docs no longer ride a
+# summary: SPEC/TASK/PROMPT/HANDOFF — ctxgrd's harness-neutral agent-development document pipeline: a SPEC is implemented via TASKs, reusable PROMPTs are versioned, and a HANDOFF carries work to the next session.
+# SPEC/TASK/PROMPT are id-claimed: each activates when you author the document.
+# HANDOFF is path-claimed on `docs/handoffs/**` (ADR-105). Split out of the old
+# `agents` pack by ADR-051 so the harness-neutral docs no longer ride a
 # harness-named pack.
 
 [SPEC]
@@ -10,6 +11,7 @@ rules = [
   "core.id-unique",
   "core.dep-resolved",
   "core.dep-cycle",
+  "core.dep-status",
   "core.cross-ref",
   "core.required-headings",
   "core.required-metadata",
@@ -37,10 +39,25 @@ rules = [
   "core.id-unique",
   "core.cross-ref",
   "core.dep-resolved",
+  "core.dep-status",
   "core.dep-shape",
   "core.required-headings",
   "core.required-metadata",
   "core.allowed-values",
+  # ADR-122 § ACC-001. A TASK at `done` cannot carry an unchecked `- [ ]` under
+  # its required `Acceptance` heading: an agent loop terminates by writing a
+  # status field, and this is what stops it declaring completion its own body
+  # does not support.
+  #
+  # Bound HERE and deliberately NOT on [SPEC] or [PRD]. The rule keys off a
+  # *terminal status*, and only TASK's vocabulary has one that means delivered
+  # (todo/doing/**done**/blocked). SPEC and PRD terminate at `accepted`, which
+  # means the design or plan is agreed — a freshly-accepted SPEC correctly has
+  # every box unchecked. Measured across 275 terminal documents in the local
+  # fleet: TASK fired on 0 of the 20 that use checkboxes, SPEC on 9 of 9.
+  # No parameter sub-table: `Acceptance` is already this namespace's required
+  # heading and the rule's default, and the default terminal set covers `done`.
+  "core.acceptance-complete",
   "agent.assigned",
 ]
 
@@ -71,3 +88,42 @@ headings = ["System prompt", "Output format"]
 
 [PROMPT."core.required-metadata"]
 keys = ["id", "title"]
+
+# ADR-105: the session-continuity store. A handoff is a ready-to-execute prompt
+# for the next session, written to `docs/handoffs/<NNN>-<name>.md` and marked
+# `consumed` in place when picked up — the directory is its own history.
+#
+# Path-claimed, not id-claimed (HND-001): the whole directory is governed, so a
+# handoff written without an `id` is a diagnostic rather than a silently skipped
+# file. That silence is what let this repo's own store fork into two frontmatter
+# shapes at 013 with nothing flagging it.
+[HANDOFF]
+paths = ["docs/handoffs/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[HANDOFF."core.required-headings"]
+headings = ["Goal", "Context", "Next Steps", "Routing", "Verification"]
+
+# `date` is deliberately absent: the template writes the timestamp into the body
+# (`_Written: …_`), not the frontmatter (ADR-105 § HND-002).
+[HANDOFF."core.required-metadata"]
+keys = ["id", "title", "status"]
+
+# The first three are the claim protocol, not taste: `in_progress` is written by
+# the atomic lock when an agent claims the handoff, `consumed` is set in place on
+# completion. The last two are the terminal states a handoff reaches without ever
+# being executed — `superseded` (replaced by a later handoff) and `deferred`
+# (postponed indefinitely) — neither of which is honestly `consumed`.
+#
+# No `done` or `open` aliases: `done` duplicates `consumed` and `open` duplicates
+# `pending`, and two words for one state is the ambiguity this namespace removes
+# (ADR-105 § HND-002).
+[HANDOFF."core.allowed-values"]
+status = ["pending", "in_progress", "consumed", "superseded", "deferred"]

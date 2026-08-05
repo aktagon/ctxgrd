@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4a91da98d1fae9a06dc4faebb86c240f3331b3835e745c0d23361df0603476ca # shrinks to report = Report { lineage: None, shared: [], documents: [DocReadiness { id: "ADR-001", namespace: "ADR", status: Some("accepted"), ready: false, blocked_by: ["ADR-001"], deps: [] }] }
+cc 764fb9c09944497eaae5f7824dbe3e8fab487347cfab6443752d6c2276832135 # shrinks to report = Report { lineage: None, shared: [], documents: [DocReadiness { id: "ADR-001", namespace: "ADR", status: Some("accepted"), ready: true, blocked_by: [], deps: [] }] }
+cc a72d0111b38021c15afaf5eb2302fc50f3495439587ad726d23995e068abf4aa # shrinks to report = Report { lineage: None, shared: [], documents: [DocReadiness { id: "ADR-001", namespace: "ADR", status: Some("draft"), ready: false, blocked_by: [], deps: [] }] }

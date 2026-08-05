@@ -1,0 +1,7 @@
+[ADR]
+owner = "developer"
+rules = ["core.acceptance-complete"]
+
+[ADR."core.acceptance-complete"]
+headings = ["Open Questions"]
+

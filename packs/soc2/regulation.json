@@ -78,12 +78,13 @@
   "namespaces": [
     {
       "name": "SOC2",
-      "comment": "SOC 2 control-to-evidence register (AICPA Trust Services Criteria, SOC-001/002/003). Each entry maps one Trust Services criterion (from the closed catalog, projected into core.allowed-values) to its implementing control and operating-effectiveness evidence — a reused POLICY, an ADR, or an `evidence_link` (an access-review log, change ticket, or config export). SOC 2 introduces no statutory document namespace of its own; the criterion-to-control-to-evidence mapping is its sole artifact, reusing POLICY/RISK/VULN from the security base. Path-claim with an `id` so an audit or a cross-ref can resolve a control. core.calendar-freshness over `review_date` surfaces a stale control (the Type I / Type II distinction lives at the freshness layer: a stale review is a point-in-time snapshot masquerading as period evidence). soc2.control-evidence (SOC-002) reuses the hipaa.safeguard-evidence conditional machinery: an in-scope control asserting a criterion with neither a POLICY/ADR cross-ref nor a non-empty `evidence_link` fails; a `not-applicable` control is out of scope.",
+      "comment": "SOC 2 control-to-evidence register (AICPA Trust Services Criteria, SOC-001/002/003). Each entry maps one Trust Services criterion (from the closed catalog, projected into core.allowed-values) to its implementing control and operating-effectiveness evidence — a reused POLICY, an ADR, or an `evidence_link` (an access-review log, change ticket, or config export). SOC 2 introduces no statutory document namespace of its own; the criterion-to-control-to-evidence mapping is its sole artifact, reusing POLICY/RISK/VULN from the security base. Path-claim with an `id` so an audit or a cross-ref can resolve a control. core.calendar-freshness over `reviewed_date` surfaces a stale control (the Type I / Type II distinction lives at the freshness layer: a stale review is a point-in-time snapshot masquerading as period evidence). soc2.control-evidence (SOC-002) reuses the hipaa.safeguard-evidence conditional machinery: an in-scope control asserting a criterion with neither a POLICY/ADR cross-ref nor a non-empty `evidence_link` fails; a `not-applicable` control is out of scope. The `status` vocabulary is deliberately open (ADR-114 \u00a7 STV-001) \u2014 a program's lifecycle words are its own \u2014 with one machine-read exception: the `out-of-scope-status` value must be spelled `not-applicable` (case-insensitive), or the Statement-of-Applicability exemption does not apply and the control is held to the evidence requirement. The freshness field is `reviewed_date`, one spelling across this whole family (ADR-114 \u00a7 FLD-001): it records when the review happened, which is what core.calendar-freshness ages.",
       "paths": ["docs/compliance/soc2/controls/**"],
       "rules": [
         "core.frontmatter",
         "core.id",
         "core.id-unique",
+        "core.dep-resolved",
         "core.cross-ref",
         "core.required-metadata",
         "core.allowed-values",
@@ -97,14 +98,14 @@
         "criterion",
         "owner",
         "category",
-        "review_date"
+        "reviewed_date"
       ],
       "allowed_values": [
         "criterion",
         "category"
       ],
       "calendar_freshness": {
-        "field": "review_date",
+        "field": "reviewed_date",
         "stale_days": 365
       },
       "control_evidence": {

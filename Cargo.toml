@@ -1,6 +1,6 @@
 [package]
 name = "ctxgrd"
-version = "0.52.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Document linter with pluggable sources and rules"
@@ -80,6 +80,14 @@ tokio = { version = "1", features = ["full"] }
 insta = "1"
 assert_cmd = "2"
 predicates = "3"
+# Property-based testing for the reporting layer (HANDOFF-037 § A10).
+# Approved 2026-08-02. Of 41 filed bugs, 18 live in claim/dispatch (11)
+# and reporting (7) while exactly one is in the DAG — the reporting
+# surfaces are where hand-picked examples keep missing cases, because the
+# defects are arithmetic relationships between counts (`ready + blocked +
+# settled == |documents|`) rather than behaviours of a particular input.
+# Test-only; no runtime surface.
+proptest = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

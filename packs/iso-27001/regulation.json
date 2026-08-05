@@ -396,7 +396,7 @@
   "namespaces": [
     {
       "name": "ISO27001",
-      "comment": "ISO 27001 control-to-evidence register (ISO/IEC 27001:2022 Annex A, ISO-001/002/003). Each entry maps one Annex A control (from the closed catalog, projected into core.allowed-values) to its implementing evidence \u2014 a reused POLICY, an ADR, or an `evidence_link`. ISO 27001 introduces no statutory document namespace of its own; the control-to-evidence mapping is its sole artifact, reusing POLICY/RISK/VULN from the security base. Path-claim with an `id` so an audit or a cross-ref can resolve a control. core.calendar-freshness over `review_date` surfaces a stale control. The Statement of Applicability's applicable/not-applicable decision rides the control `status`: a `not-applicable` control is out of scope. iso27001.control-evidence (ISO-002) reuses the shared conditional-evidence machinery: an in-scope control asserting an Annex A control with neither a POLICY/ADR cross-ref nor a non-empty `evidence_link` fails.",
+      "comment": "ISO 27001 control-to-evidence register (ISO/IEC 27001:2022 Annex A, ISO-001/002/003). Each entry maps one Annex A control (from the closed catalog, projected into core.allowed-values) to its implementing evidence \u2014 a reused POLICY, an ADR, or an `evidence_link`. ISO 27001 introduces no statutory document namespace of its own; the control-to-evidence mapping is its sole artifact, reusing POLICY/RISK/VULN from the security base. Path-claim with an `id` so an audit or a cross-ref can resolve a control. core.calendar-freshness over `reviewed_date` surfaces a stale control. The Statement of Applicability's applicable/not-applicable decision rides the control `status`: a `not-applicable` control is out of scope. iso27001.control-evidence (ISO-002) reuses the shared conditional-evidence machinery: an in-scope control asserting an Annex A control with neither a POLICY/ADR cross-ref nor a non-empty `evidence_link` fails. The `status` vocabulary is deliberately open (ADR-114 \u00a7 STV-001) \u2014 a program's lifecycle words are its own \u2014 with one machine-read exception: the `out-of-scope-status` value must be spelled `not-applicable` (case-insensitive), or the Statement-of-Applicability exemption does not apply and the control is held to the evidence requirement. The freshness field is `reviewed_date`, one spelling across this whole family (ADR-114 \u00a7 FLD-001): it records when the review happened, which is what core.calendar-freshness ages.",
       "paths": [
         "docs/compliance/iso-27001/controls/**"
       ],
@@ -404,6 +404,7 @@
         "core.frontmatter",
         "core.id",
         "core.id-unique",
+        "core.dep-resolved",
         "core.cross-ref",
         "core.required-metadata",
         "core.allowed-values",
@@ -417,14 +418,14 @@
         "control",
         "owner",
         "theme",
-        "review_date"
+        "reviewed_date"
       ],
       "allowed_values": [
         "control",
         "theme"
       ],
       "calendar_freshness": {
-        "field": "review_date",
+        "field": "reviewed_date",
         "stale_days": 365
       },
       "control_evidence": {

@@ -3,19 +3,21 @@
 //! One record per problem found. Kernel collects them from rule
 //! evaluation and from the sources' parse stages, then sorts and
 //! prints via [`crate::reporter`]. Severity governs exit code:
-//! `Error` contributes to exit 1, `Warning` never escalates past 0.
+//! `Error` contributes to exit 1, `Warning` and `Info` never escalate
+//! past 0.
 
 /// Severity of a single diagnostic.
 ///
-/// Two levels is intentional — the brief (RUN-001) only distinguishes
-/// "an error happened" from "everything else". Adding `info` or
-/// `hint` would force the reporter and exit-code rules to care about
-/// more variants without a corresponding user-visible need.
+/// The uniform three-level set the *grd family shares (ADR-086 §
+/// WIRE-003): `error` escalates the exit code, `warning` and `info`
+/// never do — `info` behaves exactly like `warning` for the exit-code
+/// verdict and differs only in how the reporter labels it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
     Warning,
+    Info,
 }
 
 impl Severity {
@@ -23,25 +25,27 @@ impl Severity {
         match self {
             Self::Error => "error",
             Self::Warning => "warning",
+            Self::Info => "info",
         }
     }
 }
 
 /// A single reporter line's worth of data.
 ///
-/// `line` / `col` are 1-indexed when known; `0` is the sentinel for
-/// "don't know" (matches the reporter's expected rendering in the
-/// acceptance transcript, e.g. `:0:0:` for a file-level diagnostic).
-/// `location` is a display string — typically a path rendered
-/// relative to the lint root.
+/// `line` / `col` are 1-indexed when known and `None` when unknown
+/// (ADR-086 § WIRE-004 — no `0` sentinel on the wire). The
+/// convenience constructors accept a plain `u32` for ergonomics and
+/// normalise a `0` argument to `None`, so an internal caller with no
+/// position can still pass `0`. `location` is a display string —
+/// typically a path rendered relative to the lint root.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Diagnostic {
     pub code: String,
     pub severity: Severity,
     pub message: String,
     pub location: String,
-    pub line: u32,
-    pub col: u32,
+    pub line: Option<u32>,
+    pub col: Option<u32>,
     /// Actionable fix suggestion, rendered as `help:` in the rich
     /// reporter. `None` when the diagnostic doesn't have a
     /// deterministic fix hint.
@@ -65,8 +69,8 @@ impl Diagnostic {
     pub fn error(
         code: impl Into<String>,
         location: impl Into<String>,
-        line: u32,
-        col: u32,
+        line: impl Into<Option<u32>>,
+        col: impl Into<Option<u32>>,
         message: impl Into<String>,
     ) -> Self {
         Self {
@@ -74,8 +78,8 @@ impl Diagnostic {
             severity: Severity::Error,
             message: message.into(),
             location: location.into(),
-            line,
-            col,
+            line: line.into().filter(|&n| n > 0),
+            col: col.into().filter(|&n| n > 0),
             help: None,
             note: None,
             span_len: None,
@@ -86,8 +90,8 @@ impl Diagnostic {
     pub fn warning(
         code: impl Into<String>,
         location: impl Into<String>,
-        line: u32,
-        col: u32,
+        line: impl Into<Option<u32>>,
+        col: impl Into<Option<u32>>,
         message: impl Into<String>,
     ) -> Self {
         Self {
@@ -95,8 +99,8 @@ impl Diagnostic {
             severity: Severity::Warning,
             message: message.into(),
             location: location.into(),
-            line,
-            col,
+            line: line.into().filter(|&n| n > 0),
+            col: col.into().filter(|&n| n > 0),
             help: None,
             note: None,
             span_len: None,

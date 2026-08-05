@@ -33,9 +33,131 @@ use crate::rules;
 use crate::source::markdown::{ParseDiagnostic, ParseDiagnosticKind};
 use crate::source::{external as source_ext, markdown};
 
+/// The raw `lint --pack <name> --namespace <NS>` selectors, straight from
+/// argv (ADR-080 § AVS-001). Both are repeatable and comma-separable;
+/// values within one flag union, the two flags intersect. Empty on both
+/// sides means "the whole resolved config" — lint's behaviour to date.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeSelector {
+    pub packs: Vec<String>,
+    pub namespaces: Vec<String>,
+}
+
+impl ScopeSelector {
+    pub fn is_empty(&self) -> bool {
+        self.packs.is_empty() && self.namespaces.is_empty()
+    }
+}
+
+/// A [`ScopeSelector`] resolved against one project's config: the set of
+/// namespace names a run is restricted to, or `None` for an unscoped run.
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    names: Option<BTreeSet<String>>,
+}
+
+impl Scope {
+    /// The unscoped run — every namespace the config resolves.
+    pub fn all() -> Self {
+        Self { names: None }
+    }
+
+    /// Whether a scope filter is in force at all. Kept explicit so the
+    /// unscoped path stays byte-identical to pre-ADR-080 behaviour.
+    pub fn is_scoped(&self) -> bool {
+        self.names.is_some()
+    }
+
+    /// Whether `namespace` is in scope. Always true when unscoped.
+    pub fn allows(&self, namespace: &str) -> bool {
+        match &self.names {
+            Some(names) => names.contains(namespace),
+            None => true,
+        }
+    }
+}
+
+/// Resolve `selector` against a loaded config plus the project's own
+/// `ctxgrd.toml` text (ADR-080 § AVS-001/AVS-004).
+///
+/// `--namespace` resolves directly against the resolved namespace names;
+/// `--pack` resolves through the ADR-053 provenance stamps in the
+/// project's config, never through the built-in pack definition. A value
+/// matching nothing, or an empty intersection, is a config-class error
+/// (exit 2) rather than a run that quietly lints nothing.
+fn resolve_scope(root: &Path, config: &Config, selector: &ScopeSelector) -> Result<Scope, LintError> {
+    if selector.is_empty() {
+        return Ok(Scope::all());
+    }
+    let declared: BTreeSet<&str> = config.namespaces.keys().map(String::as_str).collect();
+
+    // A namespace the config never declares can still be governed — an
+    // id-claimed document pulls it in and it lints under the zero-config
+    // six. `ctxgrd rules` reports exactly those (BUG-049), so rejecting
+    // them here made the obvious follow-up fail: enumerate namespaces from
+    // `rules --format json`, then `lint --namespace <each>`, and every
+    // zero-config row exits 2.
+    //
+    // Resolved lazily. The scan costs a full markdown walk, so it runs only
+    // on the branch that would otherwise have errored — a scope naming
+    // declared namespaces (the normal case) never pays for it.
+    let mut governed: Option<BTreeSet<String>> = None;
+    let mut from_namespaces: BTreeSet<String> = BTreeSet::new();
+    for name in &selector.namespaces {
+        if !declared.contains(name.as_str()) {
+            let claimed = match &governed {
+                Some(g) => g,
+                None => governed.insert(governed_namespaces(root, config)?),
+            };
+            if !claimed.contains(name) {
+                return Err(LintError::ScopeUnknown {
+                    flag: "namespace",
+                    value: name.clone(),
+                });
+            }
+        }
+        from_namespaces.insert(name.clone());
+    }
+
+    let mut from_packs: BTreeSet<String> = BTreeSet::new();
+    if !selector.packs.is_empty() {
+        let toml = std::fs::read_to_string(root.join("ctxgrd.toml")).unwrap_or_default();
+        for name in &selector.packs {
+            // Only namespaces the resolved config still declares count —
+            // a stamped block that was later deleted names nothing.
+            let matched: BTreeSet<String> = crate::pack::stamped_namespaces(root, name, &toml)
+                .into_iter()
+                .filter(|ns| declared.contains(ns.as_str()))
+                .collect();
+            if matched.is_empty() {
+                return Err(LintError::ScopeUnknown {
+                    flag: "pack",
+                    value: name.clone(),
+                });
+            }
+            from_packs.extend(matched);
+        }
+    }
+
+    let names = match (selector.namespaces.is_empty(), selector.packs.is_empty()) {
+        (false, true) => from_namespaces,
+        (true, false) => from_packs,
+        // Both given: intersect (AVS-001).
+        _ => from_namespaces
+            .intersection(&from_packs)
+            .cloned()
+            .collect::<BTreeSet<String>>(),
+    };
+    if names.is_empty() {
+        return Err(LintError::ScopeEmpty);
+    }
+    Ok(Scope { names: Some(names) })
+}
+
 /// Exit code bucket. RUN-001 in the brief.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExitStatus {
+    #[default]
     Ok,
     LintFailure,
     KernelError,
@@ -52,6 +174,7 @@ impl ExitStatus {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct LintOutcome {
     /// Per-document diagnostics, sorted per REP-001.
     pub diagnostics: Vec<Diagnostic>,
@@ -68,6 +191,22 @@ pub struct LintOutcome {
     /// Sum of `(namespace, rule)` pairs that were in scope for at
     /// least one scanned document. Drives the `ok:` summary line.
     pub rules_active: usize,
+    /// How many namespaces documents claim by id that the config never
+    /// declares (ADR-076 § OWN-005). Always `0` in zero-config mode and
+    /// under a `--pack`/`--namespace` scope. Reported on the human `ok:`
+    /// line only when nonzero, and always in `--format json`, so an agent
+    /// can branch on it without having to distinguish "none" from "this
+    /// ctxgrd is too old to know".
+    pub namespaces_undeclared: usize,
+    /// The root this run actually resolved (BUG-048 follow-up).
+    ///
+    /// Every diagnostic `file` is relative to this, and since the upward
+    /// search made the root an *ancestor* of the working directory, a
+    /// reader standing in a subdirectory can no longer assume the two are
+    /// the same — `docs/adrs/001.md` printed from inside `docs/adrs/` does
+    /// not resolve from there. Carrying the root is what makes those paths
+    /// resolvable again, for an agent reading JSON as much as for a human.
+    pub root: PathBuf,
 }
 
 /// What can go wrong at kernel-orchestration level.
@@ -110,6 +249,15 @@ pub enum LintError {
     /// false-confidence `ok: 0 documents`.
     #[error("no ctxgrd.toml found and no documents claim intent — nothing was linted")]
     NothingToLint,
+    /// A `--pack` / `--namespace` scope value matched nothing in the
+    /// resolved config (ADR-080 § AVS-004). A config-class error, not an
+    /// empty run: scoping to nothing would report a false clean.
+    #[error("--{flag} {value} matches nothing in the resolved config")]
+    ScopeUnknown { flag: &'static str, value: String },
+    /// `--pack` and `--namespace` were both given and their intersection
+    /// is empty — the run would lint nothing (ADR-080 § AVS-001).
+    #[error("--pack and --namespace select no namespace in common")]
+    ScopeEmpty,
 }
 
 impl LintError {
@@ -120,6 +268,9 @@ impl LintError {
             Self::NothingToLint => Some("cfg.missing"),
             Self::TempDir(_) => Some("ext.tempdir"),
             Self::ExternalRule { .. } => Some("ext.io"),
+            Self::ScopeUnknown { flag: "pack", .. } => Some("cli.unknown-pack"),
+            Self::ScopeUnknown { .. } => Some("cli.unknown-namespace"),
+            Self::ScopeEmpty => Some("cli.empty-scope"),
         }
     }
 
@@ -171,6 +322,35 @@ impl LintError {
             .with_help(
                 "run `ctxgrd init` to create a starter config, or pass `--root <dir>` \
                  if you meant a different directory",
+            ),
+            Self::ScopeUnknown { flag, value } => Diagnostic::error(
+                if *flag == "pack" {
+                    "cli.unknown-pack"
+                } else {
+                    "cli.unknown-namespace"
+                },
+                "ctxgrd.toml",
+                0,
+                0,
+                format!("--{flag} '{value}' matches nothing in the resolved config"),
+            )
+            .with_help(if *flag == "pack" {
+                "`--pack` selects the namespaces stamped `# pack: <name>` in this \
+                 project's ctxgrd.toml — run `ctxgrd pack add <name>` to adopt it, \
+                 or select a hand-written block with `--namespace <NS>`"
+            } else {
+                "run `ctxgrd list` to see the namespaces this config declares"
+            }),
+            Self::ScopeEmpty => Diagnostic::error(
+                "cli.empty-scope",
+                "ctxgrd.toml",
+                0,
+                0,
+                "--pack and --namespace select no namespace in common",
+            )
+            .with_help(
+                "the two scope flags intersect — drop one, or name a namespace the \
+                 pack actually stamped",
             ),
         }
     }
@@ -326,6 +506,18 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
              at any depth (e.g. `docs/drafts/**`, `**/node_modules/**`); `!` negation is not \
              supported",
         ),
+        C::IgnoreInvalid { detail } => {
+            Diagnostic::error("cfg.ignore-invalid", "ctxgrd.toml", 0, 0, detail.clone()).with_help(
+                "expected `[ignore]\\nnamespaces = [\"REPORT\"]` — namespace names, \
+                 not globs (globs go in `patterns`)",
+            )
+        }
+        C::RolesInvalid { detail } => {
+            Diagnostic::error("cfg.roles-invalid", "ctxgrd.toml", 0, 0, detail.clone()).with_help(
+                "expected `[roles]\\nallowed = [\"developer\", \"writer\"]`, and \
+                 `owner = \"<role>\"` inside each namespace block",
+            )
+        }
         C::ReferencesInvalid { detail } => Diagnostic::error(
             "cfg.references-invalid",
             "ctxgrd.toml",
@@ -353,51 +545,23 @@ pub fn config_error_to_diagnostic(err: &ConfigError, root: &Path) -> Diagnostic 
             "globs follow globset syntax, anchored at the lint root — prefix `**/` to match \
              at any depth (e.g. `docs/adrs/**`)",
         ),
-        C::PipelineInvalid { detail } => Diagnostic::error(
-            "cfg.pipeline-invalid",
+        // ADR-118 § STG-002. The help text carries the migration because
+        // this is the only place a project on an older config meets the
+        // change — an author who deletes the block without being told where
+        // ordering went will assume it stopped being enforceable.
+        C::PipelineRemoved => Diagnostic::error(
+            "cfg.pipeline-removed",
             "ctxgrd.toml",
             0,
             0,
-            format!("[pipeline] {detail}"),
+            "[pipeline] was removed in ADR-118 — namespace stages and gates no longer exist"
+                .to_string(),
         )
         .with_help(
-            "expected `[pipeline]\\nstages = [\"PRD\", \"ADR\", …]` with an optional \
-             `[pipeline.gate]` table",
+            "delete the [pipeline] block. Readiness now comes from each document's \
+             depends_on; for namespace-level edge constraints use \
+             [<NS>.\"core.dep-shape\"] requires/allows, which lint enforces per document",
         ),
-        C::PipelineStageUnknown { stage } => Diagnostic::error(
-            "cfg.pipeline-stage-unknown",
-            "ctxgrd.toml",
-            0,
-            0,
-            format!("[pipeline].stages entry '{stage}' is not an active namespace"),
-        )
-        .with_help(format!(
-            "declare [{stage}] in ctxgrd.toml, or remove '{stage}' from `stages`"
-        )),
-        C::PipelineGateInvalid { namespace, detail } => Diagnostic::error(
-            "cfg.pipeline-gate-invalid",
-            "ctxgrd.toml",
-            0,
-            0,
-            format!("[pipeline.gate].{namespace}: {detail}"),
-        )
-        .with_help(
-            "gate predicates are `any:<status>` or `all:<status>` for a namespace \
-             listed in `stages`",
-        ),
-        C::PipelineGateStatusUnknown { namespace, status } => Diagnostic::error(
-            "cfg.pipeline-gate-status",
-            "ctxgrd.toml",
-            0,
-            0,
-            format!(
-                "[pipeline.gate].{namespace} status '{status}' is not in {namespace}'s \
-                 core.allowed-values"
-            ),
-        )
-        .with_help(format!(
-            "use a status from [{namespace}.\"core.allowed-values\"].status, or add '{status}' to it"
-        )),
         C::ChangelogInvalid { detail } => Diagnostic::error(
             "cfg.changelog-invalid",
             "ctxgrd.toml",
@@ -440,6 +604,10 @@ pub(crate) struct IngestResult {
     pub(crate) parse_diagnostics: Vec<ParseDiagnostic>,
     pub(crate) kernel_messages: Vec<KernelMessage>,
     pub(crate) path_claims: crate::path_claims::PathClaims,
+    /// The resolved ADR-080 scope. `config.namespaces` has already been
+    /// narrowed to it; the rule loops consult it for id-claimed documents,
+    /// which reach the corpus without a path claim.
+    pub(crate) scope: Scope,
 }
 
 /// Source-aggregation pipeline shared by [`lint`] and
@@ -449,14 +617,40 @@ pub(crate) struct IngestResult {
 /// runs" — so any future change to source ordering or envelope
 /// translation lives here, not in two places.
 pub(crate) fn ingest(root: &Path) -> Result<IngestResult, LintError> {
+    ingest_scoped(root, &ScopeSelector::default())
+}
+
+/// [`ingest`], restricted to an ADR-080 scope. Narrowing `config.namespaces`
+/// here — before [`crate::path_claims::PathClaims`] is built — is what makes
+/// out-of-scope path-claimed files *unclaimed* rather than errored, preserving
+/// DOC-001 first-touch silence (ADR-007).
+///
+/// The document corpus itself is deliberately NOT narrowed: id-claimed
+/// documents stay in `documents` so the shared dependency graph is still
+/// whole. Scoping the graph would make every cross-namespace `depends_on`
+/// edge report a phantom `core.dep-resolved` failure. The scope is applied
+/// to *rule execution and diagnostics* in [`lint_run`] instead.
+pub(crate) fn ingest_scoped(
+    root: &Path,
+    selector: &ScopeSelector,
+) -> Result<IngestResult, LintError> {
     let mut config = config::load(root)?;
+    let scope = resolve_scope(root, &config, selector)?;
+    if scope.is_scoped() {
+        config.namespaces.retain(|name, _| scope.allows(name));
+    }
     // Drain config-load advisories so they ride the same channel as
     // every other kernel-level message. `config` is local; the take()
     // leaves it in a clean state for downstream rule scheduling.
     let mut kernel_messages = std::mem::take(&mut config.kernel_messages);
 
     let discovered_sources = source_ext::discover_sources(root);
-    let source_run = source_ext::run_activated_sources(root, &discovered_sources, &config.sources);
+    let source_run = source_ext::run_activated_sources(
+        root,
+        &discovered_sources,
+        &config.sources,
+        &config.source_expect_min,
+    );
     kernel_messages.extend(source_run.messages);
 
     let path_claims = crate::path_claims::PathClaims::from_config(&config);
@@ -472,6 +666,39 @@ pub(crate) fn ingest(root: &Path) -> Result<IngestResult, LintError> {
     // diagnostics never fire against them.
     for conflict in &scan.path_conflicts {
         kernel_messages.push(conflict.to_kernel_message());
+    }
+
+    // ADR-119 § CLM-003: a namespace whose `paths` matched files on disk
+    // that the walker skipped, and which ingested no markdown at all.
+    // The `help:` line is most of the value — this is the one point in the
+    // product where a user meets external sources at the moment they need
+    // them. A glob matching *nothing* is deliberately absent from the
+    // tally: that is indistinguishable from an unpopulated directory, and
+    // warning on it would erode ADR-007 § DOC-001 (CLM-001).
+    for (namespace, by_ext) in &scan.skipped_by_extension {
+        let total: usize = by_ext.values().sum();
+        let extensions = by_ext
+            .keys()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        kernel_messages.push(
+            KernelMessage::warning(
+                "cfg.paths-skipped",
+                format!(
+                    "[{namespace}] paths match {} the walker skipped, and the \
+                     namespace ingested no documents",
+                    crate::reporter::plural(total, "file")
+                ),
+            )
+            .with_note(format!(
+                "only .md files are ingested; the skipped files had: {extensions}"
+            ))
+            .with_help(
+                "to lint non-markdown facts, emit them from a source \
+                 (`ctxgrd docs sources`) — a namespace cannot claim them directly",
+            ),
+        );
     }
 
     // Translate source envelopes into documents. Malformed envelopes
@@ -502,22 +729,21 @@ pub(crate) fn ingest(root: &Path) -> Result<IngestResult, LintError> {
         parse_diagnostics,
         kernel_messages,
         path_claims,
+        scope,
     })
 }
 
-/// The full result of a lint run: the user-facing [`LintOutcome`] plus
-/// the resolved [`Config`] and [`Document`] set it was computed from.
+/// The full result of a lint run.
 ///
-/// `ctxgrd status` (SPEC-002) needs the same document set and rule
-/// diagnostics `lint` produces — statuses come from the documents,
-/// per-document lint-cleanliness from `outcome.diagnostics` joined on
-/// `location`. Exposing them here keeps status on the *exact* same
-/// pipeline rather than re-implementing any check (SPEC § Workflows
-/// step 2).
+/// This carried the resolved [`Config`] and [`Document`] set alongside the
+/// outcome so `ctxgrd status` could join per-document lint-cleanliness onto
+/// its stage gates. ADR-118 removed the gates, and with them the only
+/// caller — `status` now runs [`ingest`] and never executes a rule. The
+/// extra fields went with that caller rather than being kept warm behind an
+/// `allow(dead_code)`; [`ingest`] is the seam for anything that needs the
+/// document set without the diagnostics.
 pub(crate) struct LintRun {
     pub(crate) outcome: LintOutcome,
-    pub(crate) config: Config,
-    pub(crate) documents: Vec<Document>,
 }
 
 /// Discover every directory under `root` that holds a `ctxgrd.toml`,
@@ -546,11 +772,61 @@ pub fn discover_config_roots(root: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// The namespaces a lint of `root` would dispatch rules for: every
+/// namespace `config` declares, plus every namespace the markdown on
+/// disk claims by id but the config never mentions (BUG-049).
+///
+/// The undeclared half is the part that matters. `lint` derives its
+/// namespace set from the *documents* and resolves each through
+/// [`Config::namespace_config`], which falls back to
+/// [`crate::config::ZERO_CONFIG_RULES`] — so an id-claimed namespace no
+/// config declares is really linted with six rules. Introspection that
+/// reads `config.namespaces` alone cannot see those, and reports an
+/// empty set for a tree `lint` is actively governing.
+///
+/// The two sets are deliberately not identical. `lint` counts only
+/// namespaces that have documents; this also returns a namespace the
+/// config declares but nothing populates yet, because "what am I held
+/// to" must stay answerable in a project that has written its config
+/// before its first document. The containment direction is the
+/// invariant: everything `lint` dispatches appears here.
+///
+/// **External sources are not run.** [`ingest`] executes
+/// `sources/<name>/run` as a subprocess; introspection must not, so
+/// this walks markdown only. A namespace that exists solely in an
+/// external source's envelopes is therefore absent — the one gap, and
+/// the right trade against giving `ctxgrd rules` side effects.
+/// A scan failure is propagated rather than swallowed: falling back to
+/// the config's own namespaces on error would silently reproduce the
+/// under-reporting this function exists to fix, and do it in exactly
+/// the case — an unreadable tree — where the caller most needs to know.
+pub fn governed_namespaces(root: &Path, config: &Config) -> Result<BTreeSet<String>, LintError> {
+    let mut namespaces: BTreeSet<String> = config.namespaces.keys().cloned().collect();
+    let path_claims = crate::path_claims::PathClaims::from_config(config);
+    let scan = markdown::scan(root, config.ignore.as_ref(), Some(&path_claims))
+        .map_err(LintError::MarkdownScan)?;
+    namespaces.extend(scan.documents.into_iter().map(|d| d.id.namespace));
+    Ok(namespaces)
+}
+
 pub fn lint(root: &Path) -> Result<LintOutcome, LintError> {
     lint_run(root).map(|r| r.outcome)
 }
 
+/// [`lint`], restricted to the ADR-080 `--pack` / `--namespace` scope.
+/// An empty selector is exactly [`lint`].
+pub fn lint_scoped(root: &Path, selector: &ScopeSelector) -> Result<LintOutcome, LintError> {
+    lint_run_scoped(root, selector).map(|r| r.outcome)
+}
+
 pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
+    lint_run_scoped(root, &ScopeSelector::default())
+}
+
+pub(crate) fn lint_run_scoped(
+    root: &Path,
+    selector: &ScopeSelector,
+) -> Result<LintRun, LintError> {
     // Steps 1–4: load config, run sources, walk markdown, translate
     // envelopes. See `ingest()` for the SRC-002 invariant.
     let IngestResult {
@@ -559,7 +835,8 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
         parse_diagnostics,
         mut kernel_messages,
         path_claims,
-    } = ingest(root)?;
+        scope,
+    } = ingest_scoped(root, selector)?;
 
     // An unconfigured root that produced no work at all fails loudly
     // (exit 2) instead of a false-confidence `ok: 0 documents`. The
@@ -583,8 +860,19 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     let file_level_ns = config.file_level_namespaces();
     let mut diagnostics: Vec<Diagnostic> = parse_diagnostics
         .iter()
+        // ADR-080 § AVS-001: under a scope, a file only reaches the report
+        // if an in-scope namespace claims it. `path_claims` was built from
+        // the already-narrowed config, so this is the whole test — an
+        // out-of-scope file is skipped, never errored.
         .filter(|pd| {
-            file_level_ns.is_empty()
+            !scope.is_scoped() || path_claims.matching_namespaces(&pd.location).next().is_some()
+        })
+        .filter(|pd| {
+            // An unreadable file is never suppressed: the file-level pass
+            // cannot lint what it cannot read, so this parse diagnostic
+            // is the only signal the record exists at all (BUG-024).
+            matches!(pd.kind, ParseDiagnosticKind::Unreadable { .. })
+                || file_level_ns.is_empty()
                 || !path_claims
                     .matching_namespaces(&pd.location)
                     .any(|ns| file_level_ns.contains(&ns))
@@ -601,12 +889,27 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     let dep_graph = crate::dag::DepGraph::new(&documents);
     aggregate.extend(rules::dep_resolved(&dep_graph));
     aggregate.extend(rules::dep_cycle(&dep_graph));
+    // ADR-106 § DPS-001: the graph's first state assertion. Takes `config`
+    // because its `terminal` / `severity` params resolve from the source
+    // document's namespace while the edge is in hand (DPS-003) — the
+    // per-namespace `retain` below can only filter by location afterwards.
+    aggregate.extend(rules::dep_status(&dep_graph, &config));
     let declared_namespaces: BTreeSet<&str> =
         config.namespaces.keys().map(String::as_str).collect();
     // ADR-001 § REF-002: scan non-markdown files for pointer mentions
     // when `[references].scan` is configured. Empty globs short-circuit
-    // (current behaviour).
-    let references = if config.reference_scan_globs.is_empty() {
+    // (current behaviour). The scanner side of `core.cross-ref` is
+    // corpus-gated: it runs only when at least one namespace enables the
+    // rule (zero-config namespaces enable it by default), so disabling
+    // `core.cross-ref` everywhere silences code-file hits too — scanner
+    // diagnostics anchor in non-document files, which the per-namespace
+    // retain filter below cannot see (BUG-025).
+    let scanner_cross_ref_enabled = config.namespaces.is_empty()
+        || config
+            .namespaces
+            .values()
+            .any(|ns| ns.enables("core.cross-ref"));
+    let references = if config.reference_scan_globs.is_empty() || !scanner_cross_ref_enabled {
         Vec::new()
     } else {
         match crate::reference::scan(root, &config.reference_scan_globs) {
@@ -656,9 +959,12 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
         .collect();
     aggregate.retain(|d| {
         let Some(ns) = loc_to_ns.get(d.location.as_str()).copied() else {
-            return true;
+            // Diagnostics anchored outside the document corpus (reference-
+            // scanner hits in source files) belong to no namespace, so a
+            // scoped run — which reports only its own slice — drops them.
+            return !scope.is_scoped();
         };
-        config.namespace_config(ns).enables(&d.code)
+        scope.allows(ns) && config.namespace_config(ns).enables(&d.code)
     });
     diagnostics.extend(aggregate);
 
@@ -676,6 +982,9 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     let empty_params = Value::Object(Default::default());
 
     for doc in &documents {
+        if !scope.allows(&doc.id.namespace) {
+            continue;
+        }
         let ns_cfg = config.namespace_config(&doc.id.namespace);
 
         // 6: core parameterised rules
@@ -687,6 +996,19 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
             if code == "core.successor-link" {
                 let params = ns_cfg.params.get(code).unwrap_or(&empty_params);
                 diagnostics.extend(rules::successor_link(doc, params, &dep_graph));
+                continue;
+            }
+            // ADR-109 § BDG-003: the id-keyed half of `core.file-budget`'s
+            // dual dispatch. Registered `Level::File` for path-claimed
+            // singletons, it needs this arm to reach id-keyed documents —
+            // and, like `core.successor-link`, must run on its documented
+            // default when the namespace lists it without a params block.
+            if code == "core.file-budget" {
+                diagnostics.extend(agent_guide::check_file_budget(
+                    doc,
+                    ns_cfg.params.get(code),
+                    root,
+                ));
                 continue;
             }
             let Some(params) = ns_cfg.params.get(code) else {
@@ -728,6 +1050,26 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
         &file_level_scan.namespaces,
     ));
 
+    // 6b'': the ADR-076 coverage gates (`cfg.namespace-undeclared`,
+    // `cfg.namespace-unowned`). Extended straight onto `diagnostics`, never
+    // through `aggregate`: that vector is retained against
+    // `namespace_config(ns).enables(code)`, which would drop an always-on
+    // `cfg.*` code — no namespace lists it, by design. Runs here for the
+    // same reason `core.min-docs` does: it needs both presence corpora,
+    // id-keyed documents and the file-level singletons.
+    //
+    // Skipped entirely under an ADR-080 scope (OWN-004): coverage is a
+    // property of the whole config, but `config.namespaces` has been
+    // narrowed to the slice — every namespace outside it would read as
+    // undeclared, and a whole-config finding anchored at `ctxgrd.toml`
+    // is not part of any one namespace's slice (AVS-001).
+    let coverage = if scope.is_scoped() {
+        crate::coverage::Coverage::none()
+    } else {
+        crate::coverage::check(&config, &documents, &file_level_scan.namespaces, root)
+    };
+    diagnostics.extend(coverage.diagnostics);
+
     // 6c: document-level builtin-compiled rules (id-claim namespaces, e.g.
     // `tasks.*`). Unlike 6b these lint real id-keyed documents in the
     // per-document loop — `tasks.files-allowed` is the first (ADR-022 §
@@ -741,7 +1083,36 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     let managed: Vec<String> = config.dep_shape_managed().into_iter().collect();
     let managed_json = Value::Array(managed.iter().map(|s| Value::String(s.clone())).collect());
 
+    // BUG-030/BUG-031: the conditional-link rules
+    // (`builtin_rules::RESOLUTION_AWARE_RULES`) decide whether a document
+    // cites evidence, and until now they tested only that a token of the
+    // right namespace was *present* — never that it resolved, and never
+    // excluding the document's own id. Resolution is a whole-corpus fact a
+    // per-document rule cannot see, so it rides the same synthesized-param
+    // channel `core.dep-shape` uses for `managed`.
+    //
+    // Each document is passed only its *own* resolving references, not the
+    // corpus index, so the payload stays proportional to the document.
+    // Keyed by `location`, which is unique per document even when two share
+    // an id (that collision is `core.id-unique`'s to report).
+    let known_ids: BTreeSet<crate::id::DocumentId> =
+        documents.iter().map(|d| d.id.clone()).collect();
+    let resolved_refs: BTreeMap<&str, Value> = documents
+        .iter()
+        .map(|d| {
+            let refs = agent_guide::resolved_refs(d, &known_ids);
+            (
+                d.location.as_str(),
+                Value::Array(refs.into_iter().map(Value::String).collect()),
+            )
+        })
+        .collect();
+    let no_refs = Value::Array(Vec::new());
+
     for doc in &documents {
+        if !scope.allows(&doc.id.namespace) {
+            continue;
+        }
         let ns_cfg = config.namespace_config(&doc.id.namespace);
         for code in &ns_cfg.rules {
             if let Some(check_fn) = agent_guide::document_check(code) {
@@ -756,6 +1127,27 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
                         .unwrap_or_else(|| Value::Object(Default::default()));
                     if let Value::Object(map) = &mut merged {
                         map.insert("managed".to_string(), managed_json.clone());
+                    }
+                    Some(merged)
+                } else if crate::builtin_rules::RESOLUTION_AWARE_RULES.contains(&code.as_str()) {
+                    // Merged unconditionally — a namespace may list one of
+                    // these rules with no `[NS."rule"]` block at all, and
+                    // `ns_cfg.params.get(code)` would then be `None`,
+                    // leaving the rule to fail closed on a tree that is
+                    // actually fine.
+                    let mut merged = ns_cfg
+                        .params
+                        .get(code)
+                        .cloned()
+                        .unwrap_or_else(|| Value::Object(Default::default()));
+                    if let Value::Object(map) = &mut merged {
+                        map.insert(
+                            agent_guide::RESOLVED_REFS_PARAM.to_string(),
+                            resolved_refs
+                                .get(doc.location.as_str())
+                                .unwrap_or(&no_refs)
+                                .clone(),
+                        );
                     }
                     Some(merged)
                 } else {
@@ -774,7 +1166,7 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     // configured external rule once over all docs in that namespace.
     if let Some(tmp) = ext_tmp.as_ref() {
         let mut docs_by_ns: BTreeMap<&str, Vec<&Document>> = BTreeMap::new();
-        for doc in &documents {
+        for doc in documents.iter().filter(|d| scope.allows(&d.id.namespace)) {
             docs_by_ns
                 .entry(doc.id.namespace.as_str())
                 .or_default()
@@ -831,14 +1223,75 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
     // id-keyed documents but are still linted (finding #3). Excluding the
     // latter understated coverage — a user could conclude their
     // instruction files were not being linted.
-    let documents_linted = documents.len() + file_level_scan.files_linted;
-    let mut namespaces: BTreeSet<&str> =
-        documents.iter().map(|d| d.id.namespace.as_str()).collect();
+    let scoped_documents = documents
+        .iter()
+        .filter(|d| scope.allows(&d.id.namespace))
+        .count();
+    let documents_linted = scoped_documents + file_level_scan.files_linted;
+    let mut namespaces: BTreeSet<&str> = documents
+        .iter()
+        .filter(|d| scope.allows(&d.id.namespace))
+        .map(|d| d.id.namespace.as_str())
+        .collect();
     namespaces.extend(file_level_scan.namespaces.iter().map(String::as_str));
     let rules_active: usize = namespaces
         .iter()
         .map(|ns| config.namespace_config(ns).rules.len())
         .sum();
+
+    // BUG-048: a run that found no `ctxgrd.toml` anywhere and linted
+    // documents anyway must say so. The disclosure used to be exactly
+    // inverted — ctxgrd spoke up in an *empty* directory ("run `ctxgrd
+    // init`…") and went quiet in one containing markdown, because the
+    // condition it fired on was "nothing to lint" rather than "no config
+    // found". The warning appeared when it was least needed and vanished
+    // when it was most.
+    //
+    // Warning, not error: it keeps `exit == Ok`, so a project that
+    // deliberately runs zero-config is not broken by the upgrade. What it
+    // does change is the summary — the reporter renders `found:` instead
+    // of `ok:` once any message exists — so a reduced run no longer reads
+    // identically to a fully configured clean one.
+    //
+    // Gated on a namespace actually falling back, not merely on the file
+    // being absent: a global `~/.ctxgrd/namespaces/<NS>.toml` can supply
+    // real config with no local file, and calling that run "zero-config"
+    // would be its own false statement.
+    let fell_back: Vec<&str> = namespaces
+        .iter()
+        .copied()
+        .filter(|ns| !config.namespaces.contains_key(*ns))
+        .collect();
+    if !root.join("ctxgrd.toml").exists() && !fell_back.is_empty() {
+        kernel_messages.push(
+            KernelMessage::warning(
+                "cfg.zero-config",
+                // States only what is verifiable from here. An earlier
+                // wording said "or any parent", which is a lie whenever
+                // `--root` was passed explicitly — no parent is searched in
+                // that case, and this warning exists precisely because
+                // ctxgrd must not misreport what it inspected (BUG-048).
+                // The lib cannot see how the root was chosen without
+                // plumbing a flag through the public `lint` signature; the
+                // note below states the rule generically instead.
+                format!(
+                    "no ctxgrd.toml at {} — linted {} across {} under the {} zero-config core rules",
+                    root.display(),
+                    crate::reporter::plural(documents_linted, "document"),
+                    plural_namespaces(&fell_back),
+                    crate::config::ZERO_CONFIG_RULES.len(),
+                ),
+            )
+            .with_help(
+                "run `ctxgrd init` to create a config here, or pass `--root <dir>` to point at an existing project",
+            )
+            .with_note(format!(
+                "without `--root`, ctxgrd searches parent directories for ctxgrd.toml; with it, only that directory. \
+                 the zero-config set is {} — no required-headings, required-metadata, allowed-values, or min-docs",
+                crate::config::ZERO_CONFIG_RULES.join(", ")
+            )),
+        );
+    }
 
     Ok(LintRun {
         outcome: LintOutcome {
@@ -847,10 +1300,28 @@ pub(crate) fn lint_run(root: &Path) -> Result<LintRun, LintError> {
             exit,
             documents_linted,
             rules_active,
+            namespaces_undeclared: coverage.namespaces_undeclared,
+            root: root.to_path_buf(),
         },
-        config,
-        documents,
     })
+}
+
+/// `2 namespaces (ADR, SPEC)` / `1 namespace (ADR)` — the namespace list
+/// is named rather than counted so the message says which documents were
+/// checked under the reduced set.
+///
+/// The document count rides this message rather than the summary line
+/// because a warning flips the trailer from `ok: N documents · M rules`
+/// to `found:`, which carries diagnostic counts only. Without it the
+/// disclosure fix would cost the corpus size it exists to disclose —
+/// BUG-039's complaint, which this must not deepen.
+fn plural_namespaces(names: &[&str]) -> String {
+    let noun = if names.len() == 1 {
+        "namespace"
+    } else {
+        "namespaces"
+    };
+    format!("{} {noun} ({})", names.len(), names.join(", "))
 }
 
 /// One pointer to the document with id `<target>` (ADR-001 § REF-008).
@@ -931,9 +1402,15 @@ pub fn find_references(root: &Path, target_id: &str) -> Result<Vec<ReferenceHit>
         }
     }
 
-    // Hit kind 2: depends_on edges.
+    // Hit kind 2: depends_on edges. Parsed comparison, not raw string —
+    // `depends_on: ["ADR-07"]` must be found by `refs ADR-7` and vice
+    // versa, matching the (namespace, number) semantics of every other
+    // consumer of these edges (BUG-022).
     for doc in &documents {
-        if !doc.depends_on.iter().any(|d| d == target_id) {
+        if !doc.depends_on.iter().any(|d| {
+            d.parse::<crate::id::DocumentId>()
+                .is_ok_and(|id| id.namespace == target.namespace && id.number == target.number)
+        }) {
             continue;
         }
         let line = doc
@@ -978,12 +1455,14 @@ pub fn find_references(root: &Path, target_id: &str) -> Result<Vec<ReferenceHit>
     if !config.reference_scan_globs.is_empty() {
         if let Ok(report) = crate::reference::scan(root, &config.reference_scan_globs) {
             for r in report.references {
-                // Equality on the full id is sufficient — any token
-                // matching `target_id` necessarily has the right
-                // namespace prefix, so the prefix check earlier
-                // versions did was redundant (and allocated a
-                // throwaway `String` per record).
-                if r.token != target_id {
+                // Parsed comparison, not raw string — a `// see ADR-07`
+                // mention must be found by `refs ADR-7` and vice versa
+                // (BUG-022). Unparseable tokens cannot match any target.
+                let matches_target = r
+                    .token
+                    .parse::<crate::id::DocumentId>()
+                    .is_ok_and(|id| id.namespace == target.namespace && id.number == target.number);
+                if !matches_target {
                     continue;
                 }
                 hits.push(ReferenceHit {
@@ -1024,10 +1503,52 @@ fn kind_ordinal(kind: &ReferenceHitKind) -> u8 {
 /// via a dedicated struct — so we can rename / reshape the internal
 /// type without breaking downstream tooling.
 pub fn render_json_outcome(outcome: &LintOutcome) -> String {
+    // The ADR-086 canonical diagnostic shape (WIRE-003/004): the path is
+    // carried under `file`. For one transition release `location` is also
+    // emitted with the same value so downstream readers of the old key do
+    // not break; a later phase drops the alias. `line`/`col` always
+    // serialise (as `null` when unknown) — no `0` sentinel.
+    #[derive(serde::Serialize)]
+    struct DiagWire<'a> {
+        code: &'a str,
+        severity: crate::diagnostic::Severity,
+        message: &'a str,
+        file: &'a str,
+        location: &'a str,
+        line: Option<u32>,
+        col: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        help: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        span_len: Option<u32>,
+    }
+
+    // ADR-086 § WIRE-005: fixed-key counts over the `diagnostics` array.
+    // `infos` is always present (0 when no info-severity finding fired).
+    // `namespaces_undeclared` is ctxgrd's ADR-076 § OWN-005 extension —
+    // additive, and always present for the same reason `infos` is.
+    #[derive(serde::Serialize)]
+    struct Summary {
+        errors: usize,
+        warnings: usize,
+        infos: usize,
+        files: usize,
+        namespaces_undeclared: usize,
+    }
+
     #[derive(serde::Serialize)]
     struct Wire<'a> {
         exit_code: u8,
-        diagnostics: &'a [Diagnostic],
+        // The root every `file` below is relative to (BUG-048 follow-up).
+        // Since the upward search made the root an ancestor of the working
+        // directory, a consumer cannot assume cwd == root and needs this to
+        // resolve a diagnostic to a file on disk. Additive extension field;
+        // grd-output.schema.json sets additionalProperties: true.
+        root: String,
+        summary: Summary,
+        diagnostics: Vec<DiagWire<'a>>,
         kernel_messages: &'a [KernelMessage],
         // ADR-038 § HINT-002/003: the "fix the documents, not the
         // config" advisory, present only when rule diagnostics were
@@ -1035,13 +1556,79 @@ pub fn render_json_outcome(outcome: &LintOutcome) -> String {
         #[serde(skip_serializing_if = "Option::is_none")]
         hint: Option<&'static str>,
     }
+
+    let (mut errors, mut warnings, mut infos) = (0usize, 0usize, 0usize);
+    for d in &outcome.diagnostics {
+        match d.severity {
+            Severity::Error => errors += 1,
+            Severity::Warning => warnings += 1,
+            Severity::Info => infos += 1,
+        }
+    }
+
+    let diagnostics: Vec<DiagWire<'_>> = outcome
+        .diagnostics
+        .iter()
+        .map(|d| DiagWire {
+            code: &d.code,
+            severity: d.severity,
+            message: &d.message,
+            file: &d.location,
+            location: &d.location,
+            line: d.line,
+            col: d.col,
+            help: d.help.as_deref(),
+            note: d.note.as_deref(),
+            span_len: d.span_len,
+        })
+        .collect();
+
     let wire = Wire {
         exit_code: outcome.exit.code(),
-        diagnostics: &outcome.diagnostics,
+        root: outcome.root.display().to_string(),
+        summary: Summary {
+            errors,
+            warnings,
+            infos,
+            files: outcome.documents_linted,
+            namespaces_undeclared: outcome.namespaces_undeclared,
+        },
+        diagnostics,
         kernel_messages: &outcome.kernel_messages,
-        hint: (!outcome.diagnostics.is_empty()).then_some(crate::reporter::LINT_HINT),
+        // ADR-038 § HINT-004: the "fix the documents, not `ctxgrd.toml`" nudge
+        // must not fire for a config error, where the fault *is* the
+        // configuration and the advice is therefore backwards. The rich
+        // renderer already honoured this; the JSON path did not, because it
+        // gated on the array being non-empty rather than on the verdict. Only
+        // reachable once the exit-2 path emits an object at all, so it was a
+        // latent divergence until now, not a live one.
+        hint: (!outcome.diagnostics.is_empty()
+            && !matches!(outcome.exit, ExitStatus::KernelError))
+        .then_some(crate::reporter::LINT_HINT),
     };
     serde_json::to_string_pretty(&wire).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// The exit-2 wire object (ADR-086 § WIRE-005).
+///
+/// `exit_code` lives *inside* the object, so an error path that writes nothing
+/// to stdout makes the documented value `2` unreachable by construction: a
+/// `--format json` consumer gets an empty stream and cannot tell a broken
+/// config from a binary that never ran. The human error block still goes to
+/// stderr (WIRE-007); this is what stdout owes a machine caller.
+///
+/// Deliberately built as a [`LintOutcome`] and passed through
+/// [`render_json_outcome`] rather than assembling a second struct: the error
+/// object is then *the same wire shape by construction*, and a later change to
+/// the envelope cannot reshape one path while leaving the other behind. The
+/// counts are honest on their own — `files` is 0 because nothing was linted.
+pub fn render_error_json(d: &Diagnostic, root: &Path) -> String {
+    render_json_outcome(&LintOutcome {
+        exit: ExitStatus::KernelError,
+        diagnostics: vec![d.clone()],
+        root: root.to_path_buf(),
+        ..Default::default()
+    })
 }
 
 /// Render the Claude Code `Stop`-hook decision for a completed lint
@@ -1286,6 +1873,8 @@ mod tests {
             exit: ExitStatus::LintFailure,
             documents_linted: 1,
             rules_active: 6,
+            namespaces_undeclared: 0,
+            root: PathBuf::new(),
         };
         let json = render_json_outcome(&outcome);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1316,6 +1905,8 @@ mod tests {
             exit: ExitStatus::LintFailure,
             documents_linted: 1,
             rules_active: 6,
+            namespaces_undeclared: 0,
+            root: PathBuf::new(),
         };
         let json = render_json_outcome(&outcome);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1338,6 +1929,8 @@ mod tests {
             exit: ExitStatus::LintFailure,
             documents_linted: 1,
             rules_active: 6,
+            namespaces_undeclared: 0,
+            root: PathBuf::new(),
         };
         let json = render_claude_stop(&outcome).expect("error run blocks");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1362,6 +1955,8 @@ mod tests {
             exit: ExitStatus::LintFailure,
             documents_linted: 0,
             rules_active: 0,
+            namespaces_undeclared: 0,
+            root: PathBuf::new(),
         };
         let json = render_claude_stop(&outcome).expect("kernel error blocks");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1379,6 +1974,8 @@ mod tests {
             exit: ExitStatus::Ok,
             documents_linted: 7,
             rules_active: 6,
+            namespaces_undeclared: 0,
+            root: PathBuf::new(),
         };
         assert_eq!(render_claude_stop(&outcome), None);
     }
@@ -1400,6 +1997,8 @@ mod tests {
             exit: ExitStatus::Ok,
             documents_linted: 1,
             rules_active: 6,
+            namespaces_undeclared: 0,
+            root: PathBuf::new(),
         };
         assert_eq!(render_claude_stop(&outcome), None);
     }
@@ -1425,6 +2024,8 @@ mod tests {
             exit: ExitStatus::Ok,
             documents_linted: 0,
             rules_active: 0,
+            namespaces_undeclared: 0,
+            root: PathBuf::new(),
         };
         let json = render_json_outcome(&outcome);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1478,5 +2079,67 @@ mod tests {
 
         let found = discover_config_roots(root);
         assert_eq!(found, vec![root.to_path_buf()]);
+    }
+
+    /// BUG-022 fixture: ADR-07 authored zero-padded; ADR-8 points at it
+    /// three ways — `depends_on: ["ADR-07"]`, a body mention, and a
+    /// scanner hit in a non-markdown file.
+    fn refs_padding_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("docs/adrs")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("ctxgrd.toml"),
+            "[ADR]\npaths = [\"docs/adrs/**\"]\nrules = [\"core.frontmatter\", \"core.id\", \"core.dep-resolved\"]\n\n[references]\nscan = [\"src/**/*.rs\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("docs/adrs/007-first.md"),
+            "---\nid: ADR-07\ntitle: First\n---\n## Context\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("docs/adrs/008-second.md"),
+            "---\nid: ADR-8\ntitle: Second\ndepends_on: [\"ADR-07\"]\n---\n## Context\nSee ADR-07 for background.\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/main.rs"), "// see ADR-07\n").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn refs_finds_padded_depends_on_and_scanner_hits_via_collapsed_query() {
+        // BUG-022: hit kinds 2 (depends_on) and 4 (scanner) compared raw
+        // strings against the typed query, so `refs ADR-7` missed edges
+        // authored `ADR-07`. All four kinds match on (namespace, number).
+        let tmp = refs_padding_fixture();
+        let hits = find_references(tmp.path(), "ADR-7").unwrap();
+        let kinds: Vec<u8> = hits.iter().map(|h| kind_ordinal(&h.kind)).collect();
+        assert!(
+            hits.iter()
+                .any(|h| matches!(h.kind, ReferenceHitKind::DependsOn { .. })),
+            "depends_on [\"ADR-07\"] must be found via `refs ADR-7`; kinds: {kinds:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|h| matches!(h.kind, ReferenceHitKind::ScannerHit)),
+            "scanner hit `ADR-07` must be found via `refs ADR-7`; kinds: {kinds:?}"
+        );
+        assert_eq!(hits.len(), 4, "self + depends_on + body + scanner: {hits:?}");
+    }
+
+    #[test]
+    fn refs_finds_collapsed_spellings_via_padded_query() {
+        // The reverse asymmetry: querying the zero-padded form must find
+        // everything too, and both spellings return the same hit set.
+        let tmp = refs_padding_fixture();
+        let padded = find_references(tmp.path(), "ADR-07").unwrap();
+        let collapsed = find_references(tmp.path(), "ADR-7").unwrap();
+        assert_eq!(padded.len(), 4, "{padded:?}");
+        assert_eq!(
+            padded, collapsed,
+            "the hit set must not depend on the query's zero-padding"
+        );
     }
 }

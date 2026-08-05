@@ -145,6 +145,13 @@ struct SafeguardEvidence {
 struct ControlEvidence {
     /// The rule code this block configures (e.g. `soc2.control-evidence`).
     rule: String,
+    /// The trigger metadata key, emitted as the `field` param. Omitted by the
+    /// three framework packs, whose rule codes each carry a hard-wired default
+    /// (`criterion`, `control`); **required** by any namespace binding the
+    /// regime-neutral `core.evidence-link`, which has no neutral default
+    /// (ADR-115 § REG-001).
+    #[serde(default)]
+    field: Option<String>,
     /// Metadata fields whose non-empty value counts as evidence
     /// (SOC 2's `evidence_link`). Emitted as the `evidence-fields` param.
     #[serde(default)]
@@ -274,6 +281,9 @@ fn render(reg: &Regulation) -> String {
         if let Some(evidence) = &ns.control_evidence {
             out.push('\n');
             writeln!(out, "[{}.\"{}\"]", ns.name, evidence.rule).unwrap();
+            if let Some(field) = &evidence.field {
+                writeln!(out, "field = \"{field}\"").unwrap();
+            }
             if !evidence.evidence_fields.is_empty() {
                 writeln!(out, "evidence-fields = {}", inline_list(&evidence.evidence_fields))
                     .unwrap();

@@ -1,0 +1,5 @@
+# pack: research
+[RESEARCH]
+owner = "researcher"
+paths = ["docs/research/**"]
+rules = ["research.evidence", "core.min-docs"]

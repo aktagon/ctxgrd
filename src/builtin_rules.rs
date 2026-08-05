@@ -29,6 +29,30 @@ pub(crate) enum Level {
     Document,
 }
 
+/// Whether a configurable attribute is a `ctxgrd.toml` config param
+/// (set under `[NS."rule.code"]`) or a frontmatter/metadata attribute
+/// the rule reads from the document itself (ADR-095 § PDOC-001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamKind {
+    ConfigParam,
+    FrontmatterAttribute,
+}
+
+/// One structured, machine-readable record of a configurable attribute
+/// a rule accepts — the single source of truth the introspection
+/// surfaces and the dogfood self-lint both read (ADR-095 § PDOC-001).
+pub(crate) struct Param {
+    /// The exact key: config key or frontmatter field (e.g. `headings`,
+    /// `research.type`).
+    pub name: &'static str,
+    pub kind: ParamKind,
+    pub optional: bool,
+    /// Closed vocabulary, or `&[]` for an open / free-form value.
+    pub values: &'static [&'static str],
+    /// One short sentence describing the attribute.
+    pub doc: &'static str,
+}
+
 /// One total record for a builtin-compiled rule (REG-001). All fields
 /// are required; omitting any is a compile error.
 pub(crate) struct BuiltinRule {
@@ -37,7 +61,60 @@ pub(crate) struct BuiltinRule {
     pub check: CheckFn,
     pub summary: &'static str,
     pub description: &'static str,
+    /// The rule's configurable attributes, one entry per param or
+    /// frontmatter attribute it reads (ADR-095 § PDOC-001). `&[]` for a
+    /// parameterless rule.
+    pub params: &'static [Param],
 }
+
+/// The conditional-link rules: every builtin-compiled rule whose verdict
+/// depends on whether a `depends_on` entry or body cross-ref **resolves**
+/// to a document present in the run (BUG-030/BUG-031).
+///
+/// [`crate::run`] threads each of these the synthesized
+/// [`crate::agent_guide::RESOLVED_REFS_PARAM`] — the same cross-corpus
+/// channel `core.dep-shape` uses for `managed` (ADR-039 § DAG-003). The
+/// list is declared here rather than inline in the dispatch so it sits
+/// beside the registry it indexes; `resolution_aware_rules_are_registered`
+/// pins every entry to a `Level::Document` code.
+///
+/// A rule added here that `run.rs` does not thread fails **closed**: its
+/// candidate set is empty and it reports a gap. That is deliberate — the
+/// unfixed form of every rule in this list was a false green, so a dropped
+/// threading must be loud.
+pub(crate) const RESOLUTION_AWARE_RULES: &[&str] = &[
+    "security.risk-expiry",
+    "security.remediation-link",
+    "gdpr.processor-dpa",
+    "hipaa.safeguard-evidence",
+    "soc2.control-evidence",
+    "iso27001.control-evidence",
+    "nist.control-evidence",
+    "core.evidence-link",
+];
+
+/// The `Level::File` rules that ALSO carry an explicit id-keyed arm in
+/// [`crate::run`]'s step-6 per-document loop, and so are **not** inert on a
+/// namespace that binds `core.id`.
+///
+/// Registration level alone cannot answer that question. `Level::File`
+/// routes a rule through `Config::file_level_namespaces`, which excludes
+/// `core.id` namespaces — but step 6 dispatches a few codes by name for
+/// exactly this case, giving them a second, id-keyed path. ADR-078 made
+/// `core.required-headings` dual-use, and ADR-109 § BDG-003 did the same
+/// for `core.file-budget`. Every other `Level::File` code falls into step
+/// 6's `_ => {}` and genuinely cannot fire there.
+///
+/// This is a second statement of a fact the dispatch owns, which is the
+/// drift shape `cfg.rule-inert` exists to catch — so it is pinned from both
+/// sides. `id_keyed_file_level_rules_are_registered_file_level` checks the
+/// codes are real and `Level::File`;
+/// `the_dual_dispatch_allow_list_actually_runs_on_an_id_keyed_document`
+/// (`tests/rule_inert.rs`) checks step 6 still runs each of them. Drift the
+/// other way — a new arm added to step 6 and not listed here — produces a
+/// false `cfg.rule-inert`, which is loud rather than silent.
+pub(crate) const ID_KEYED_FILE_LEVEL_RULES: &[&str] =
+    &["core.required-headings", "core.file-budget"];
 
 /// The authoritative registry of all builtin-compiled rules (REG-001).
 /// `config`, `agent_guide`, and `introspect` derive their views from
@@ -57,6 +134,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             (volatile state churns the cached prefix), errors when a root TODO.md exists but \
             the file does not link to it, and warns when that pointer is an eager `@TODO.md` \
             import (which pays the file's tokens every session) rather than a lazy plain link.",
+        params: &[],
     },
     BuiltinRule {
         code: "agents.context-budget",
@@ -66,6 +144,13 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
         description: "Warns when an `@path` import points to a missing file (a dropped \
             reference), and when the body exceeds `max_words` (default 4000) — an \
             always-loaded file taxes every request.",
+        params: &[Param {
+            name: "max_words",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &[],
+            doc: "Body word budget before the file is flagged (default 4000).",
+        }],
     },
     BuiltinRule {
         code: "agents.context-cache",
@@ -76,6 +161,13 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             edit to CLAUDE.md/AGENTS.md busts the prompt cache, and that the file churned two \
             or more times within `churn_min_hours` (opt-in, default 0). Silent in plain \
             CLI/LSP and without git.",
+        params: &[Param {
+            name: "churn_min_hours",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &[],
+            doc: "Window (hours) within which a second edit is flagged as churn (default 0, opt-in).",
+        }],
     },
     BuiltinRule {
         code: "todo.freshness",
@@ -85,6 +177,13 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
         description: "Errors when no parseable `Last updated: YYYY-MM-DD` line is present; \
             warns when the date is older than `stale_days` (default 30). Staleness is a \
             warning, never an error.",
+        params: &[Param {
+            name: "stale_days",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &[],
+            doc: "Age (days) past which the freshness line is considered stale (default 30).",
+        }],
     },
     BuiltinRule {
         code: "todo.structure",
@@ -93,6 +192,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
         summary: "TODO.md has a checklist and a context section.",
         description: "Errors when there is no `### TODO` section, or a `### TODO` section \
             with no `- [ ]` item; warns when there is no `### Context` section.",
+        params: &[],
     },
     BuiltinRule {
         code: "todo.sections",
@@ -103,6 +203,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             `## Later`, `## Done` in that order; when Now/Next/Later have no open `- [ ]` \
             items; or when Done contains an open `- [ ]` (Done is for completed items). \
             Opt-in — not enabled by the agent-context pack default.",
+        params: &[],
     },
     BuiltinRule {
         code: "tasks.files-allowed",
@@ -113,6 +214,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             neither as a file nor as a directory whose parent is present (a typo or stale \
             reference). A new file in an existing directory does not warn. Opt-in — not \
             enabled by the agent-build pack default.",
+        params: &[],
     },
     BuiltinRule {
         code: "skills.frontmatter",
@@ -121,6 +223,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
         summary: "SKILL.md frontmatter has non-empty `name` and `description`.",
         description: "Errors when SKILL.md is missing a `---` frontmatter fence, or when \
             `name` or `description` keys are absent or are not non-empty strings.",
+        params: &[],
     },
     BuiltinRule {
         code: "agent.frontmatter",
@@ -133,6 +236,50 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             shorter than `desc_min_chars` (default 40) or longer than an opt-in `desc_max_chars`, \
             or when `model` is outside a team-pinned `models` allowlist. The binary enumerates no \
             model names — the allowlist is config-only.",
+        params: &[
+            Param {
+                name: "desc_min_chars",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Minimum `description` length before a warning (default 40).",
+            },
+            Param {
+                name: "desc_max_chars",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Opt-in maximum `description` length before a warning.",
+            },
+            Param {
+                name: "models",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Team-pinned allowlist of `model` values; the binary enumerates none.",
+            },
+            Param {
+                name: "name",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: false,
+                values: &[],
+                doc: "Agent name; must be present, non-empty, and match the filename stem.",
+            },
+            Param {
+                name: "description",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: false,
+                values: &[],
+                doc: "Agent description; must be present and non-empty.",
+            },
+            Param {
+                name: "model",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: true,
+                values: &[],
+                doc: "Optional model pin, checked against the `models` allowlist when set.",
+            },
+        ],
     },
     BuiltinRule {
         code: "opencode.frontmatter",
@@ -145,6 +292,43 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             `desc_min_chars` (default 40) or longer than an opt-in `desc_max_chars`, or when \
             `model` is outside a team-pinned `models` allowlist. The binary enumerates no model \
             names — the allowlist is config-only.",
+        params: &[
+            Param {
+                name: "desc_min_chars",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Minimum `description` length before a warning (default 40).",
+            },
+            Param {
+                name: "desc_max_chars",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Opt-in maximum `description` length before a warning.",
+            },
+            Param {
+                name: "models",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Team-pinned allowlist of `model` values; the binary enumerates none.",
+            },
+            Param {
+                name: "description",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: false,
+                values: &[],
+                doc: "Agent description; must be present and non-empty (opencode derives the name from the filename).",
+            },
+            Param {
+                name: "model",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: true,
+                values: &[],
+                doc: "Optional model pin, checked against the `models` allowlist when set.",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-057 § AOT-003/AOT-004). One generic,
@@ -165,6 +349,29 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             The diagnostic names the searched locations, the available file agents, and a \
             nearest-match suggestion. Presence of `agents` is `core.required-metadata`'s concern \
             (ADR-057 § AOT-001).",
+        params: &[
+            Param {
+                name: "search_dirs",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Directories searched for file agents (default: Claude conventions).",
+            },
+            Param {
+                name: "name_source",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Where an agent's name comes from — `frontmatter` (default) or `filename` (opencode).",
+            },
+            Param {
+                name: "builtin_agents",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Allow-list of harness built-in agent names that have no file (empty by default).",
+            },
+        ],
     },
     BuiltinRule {
         code: "guide.frontmatter",
@@ -177,6 +384,29 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             reference, explanation). The binary enumerates no taxonomy — the allowlist is \
             config-only. File-level: a guide carries a title/type, not an `id`, so the filename \
             is the guide's slug (ADR-055).",
+        params: &[
+            Param {
+                name: "types",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Allowlist of valid `type` values (the `guide` pack ships the Diátaxis four).",
+            },
+            Param {
+                name: "title",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: false,
+                values: &[],
+                doc: "Guide title; must be present and non-empty.",
+            },
+            Param {
+                name: "diataxis.type",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: false,
+                values: &[],
+                doc: "Diátaxis type; must be present and within the `types` allowlist.",
+            },
+        ],
     },
     BuiltinRule {
         code: "c4.frontmatter",
@@ -192,6 +422,29 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             reserve (BUG-015). File-level: a diagram carries a title/level, not an `id`, so the \
             filename is the diagram's slug. ctxgrd lints the markdown envelope only, never the \
             embedded Mermaid/DOT graph (ADR-075).",
+        params: &[
+            Param {
+                name: "levels",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Allowlist of valid `c4.level` values (the `c4` pack ships the four C4 levels plus views).",
+            },
+            Param {
+                name: "title",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: false,
+                values: &[],
+                doc: "Diagram title; must be present and non-empty.",
+            },
+            Param {
+                name: "c4.level",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: false,
+                values: &[],
+                doc: "C4 level; must be present and within the `levels` allowlist.",
+            },
+        ],
     },
     BuiltinRule {
         code: "checklist.structure",
@@ -205,6 +458,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             carries a title/status, not an `id`, so the filename is its slug. The two-state \
             lifecycle keeps a `living` template or in-flight instance un-gated while `sealed` is \
             the signed-off state the completeness and pin rules enforce (ADR-078).",
+        params: &[],
     },
     BuiltinRule {
         code: "checklist.complete",
@@ -216,6 +470,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             is not a task item. This is the 'all boxes checked' half of an auditable sign-off — \
             the gate fires only at seal time, never on a living template or in-flight instance \
             (ADR-078).",
+        params: &[],
     },
     BuiltinRule {
         code: "checklist.pinned",
@@ -229,6 +484,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             No-op while `status: living`. This is the 'pinned to a commit' half of the sign-off: \
             'done' is anchored to a named integration commit that landed on this line of history \
             (ADR-078).",
+        params: &[],
     },
     BuiltinRule {
         code: "core.required-headings",
@@ -242,6 +498,13 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             headings are allowed. No-op when `headings` is unset. Generic and config-driven — the \
             binary enumerates no section names; a checklist supplies its phases, an ADR its \
             sections (ADR-078).",
+        params: &[Param {
+            name: "headings",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &[],
+            doc: "H2 headings the document must contain; no-op when unset.",
+        }],
     },
     BuiltinRule {
         code: "core.required-anchors",
@@ -254,6 +517,36 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             No-op when `anchors` is unset or empty. Generic and config-driven — the binary \
             enumerates no anchors; a stripe checklist supplies its `@stripe.*` markers, enabling \
             the vendor-specific structure rules ADR-078 deferred (ADR-078).",
+        params: &[Param {
+            name: "anchors",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &[],
+            doc: "Marker strings the document body must contain; no-op when unset or empty.",
+        }],
+    },
+    BuiltinRule {
+        // Dual-dispatch like the two generic rules above (ADR-109 § BDG-003):
+        // `Level::File` serves id-less path-claimed singletons (TODO.md), and
+        // `run.rs` step 6 calls the same `check_file_budget` for id-keyed
+        // documents. One function behind both paths — BUG-021 is the record of
+        // what a second implementation behind one code costs.
+        code: "core.file-budget",
+        level: Level::File,
+        check: crate::agent_guide::check_file_budget,
+        summary: "A document stays under its character budget.",
+        description: "Warns when the document's character count exceeds `max_chars` (default \
+            150000 — Claude Code's own read-time warning threshold), counted over the full \
+            document text including frontmatter. The help line names how many characters must \
+            go and which H2 section is the largest candidate to move out. Warning, never an \
+            error: an over-budget file is a cost, not a structural defect (ADR-109).",
+        params: &[Param {
+            name: "max_chars",
+            kind: ParamKind::ConfigParam,
+            optional: true,
+            values: &[],
+            doc: "Character budget before the file is flagged (default 150000).",
+        }],
     },
     BuiltinRule {
         // Document-level (ADR-039 § DAG-002/DAG-003). The configurable
@@ -278,6 +571,22 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             unmanaged namespaces are exempt. An absent or empty `requires` disables the presence \
             half; a future `count` long-form (DAG-008) is reserved. Replaces both \
             `spec.requires-prd` and `pipeline.conformance`.",
+        params: &[
+            Param {
+                name: "requires",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Upstream namespaces that must each appear in `depends_on`.",
+            },
+            Param {
+                name: "allows",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Additional managed namespaces an edge may admit beyond `requires`.",
+            },
+        ],
     },
     BuiltinRule {
         code: "todo.listed",
@@ -288,6 +597,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             (accepted, superseded, done, fixed, wontfix, invalid, duplicate, \
             closed, implemented, n/a) but the document ID does not appear in the \
             repo-root TODO.md. Opt-in — not in any pack default.",
+        params: &[],
     },
     BuiltinRule {
         // File-level: DESIGN.md is a path-claimed id-less singleton, so it
@@ -304,6 +614,56 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             heading appears more than once. Unrecognized sections are skipped. \
             Canonical order: Overview, Colors, Typography, Layout, \
             Elevation & Depth, Shapes, Components, Do's and Don'ts.",
+        params: &[],
+    },
+    BuiltinRule {
+        // File-level for the same reason as design.section-order (BUG-007):
+        // PRODUCT.md is a path-claimed id-less singleton.
+        code: "product.register",
+        level: Level::File,
+        check: crate::agent_guide::check_product_register,
+        summary: "PRODUCT.md's `## Register` and `## Platform` values are bare and recognized.",
+        description: "PRODUCT.md's register and platform are a wire contract, not prose: a \
+            reader parses the first non-empty line under each heading and branches on it \
+            (register picks the brand/product design reference, platform picks HIG, Material 3, \
+            or neither). Errors when `## Register` is missing, empty, or holds a value outside \
+            the `registers` allowlist. `## Platform` is optional — absent means `web` — and an \
+            empty or unrecognized value is a warning, matching the reader's own fall back to \
+            `web` rather than exceeding it. Trailing prose under either value is a warning. \
+            Finally, the section named by `conditional_section` is required when the register \
+            equals `conditional_on` and must be absent otherwise; that arm is skipped when the \
+            register does not resolve. Section presence for `Register` and `Platform` is owned \
+            here, not by `core.required-headings`, so no heading is checked twice (ADR-104).",
+        params: &[
+            Param {
+                name: "registers",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["brand", "product"],
+                doc: "Values `## Register` may hold; defaults to brand/product.",
+            },
+            Param {
+                name: "platforms",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["web", "ios", "android", "adaptive"],
+                doc: "Values `## Platform` may hold; defaults to web/ios/android/adaptive.",
+            },
+            Param {
+                name: "conditional_section",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "H2 section required by exactly one register; defaults to `Conversion & Proof`.",
+            },
+            Param {
+                name: "conditional_on",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Register value that requires `conditional_section`; defaults to `brand`.",
+            },
+        ],
     },
     BuiltinRule {
         code: "ears.clause-syntax",
@@ -317,6 +677,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             comma, lowercase keyword. Keywords are accepted in all-caps or title case. \
             Bullets without an EARS id are skipped. Default in the agents pack's [SPEC] \
             and the project-docs pack's [PRD] — fires in any namespace that lists it.",
+        params: &[],
     },
     BuiltinRule {
         // File-level for the same reason as design.section-order (BUG-007):
@@ -330,6 +691,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             frontmatter string values does not resolve to a defined scalar \
             in the same file's frontmatter. Mapping and array nodes do not \
             count as resolved. Body prose is not scanned.",
+        params: &[],
     },
     BuiltinRule {
         // File-level, NOT Document-level: STYLE.md is a path-claimed id-less
@@ -349,6 +711,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             Principles, Vocabulary, Punctuation & Formatting, Platform \
             Differences, Quick Reactions, Rhetorical Moves, Anti-Patterns, \
             Examples of Right Voice). Unrecognized sections are skipped.",
+        params: &[],
     },
     BuiltinRule {
         code: "style.soul-pair",
@@ -359,6 +722,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             directory — the spec's recommended persona pairing (identity + \
             voice). Warning only: the files may exist independently, so a \
             deliberately standalone STYLE.md is not blocked.",
+        params: &[],
     },
     BuiltinRule {
         // File-level (ADR-047 § PRF-001). The persona-side complement to the
@@ -376,6 +740,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             STYLE.md — by a markdown link or an `@import`, resolved file-relatively. A \
             persona file no guide loads is a dead file. Silent when no guide exists (a \
             persona may be loaded directly by a runtime). Warning only (ADR-047 § PRF-003).",
+        params: &[],
     },
     BuiltinRule {
         // File-level, NOT Document-level: SOUL.md is a path-claimed id-less
@@ -394,6 +759,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             Interests, Current Focus, Influences, Vocabulary, Tensions & \
             Contradictions, Pet Peeves) are optional and unrecognized headings \
             pass silently; v1 checks presence only, not order or empty bodies.",
+        params: &[],
     },
     BuiltinRule {
         // File-level (ADR-047 § PRF-001). Persona-side sibling of
@@ -408,6 +774,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             SOUL.md — by a markdown link or an `@import`, resolved file-relatively. A \
             persona file no guide loads is a dead file. Silent when no guide exists (a \
             persona may be loaded directly by a runtime). Warning only (ADR-047 § PRF-003).",
+        params: &[],
     },
     BuiltinRule {
         // Document-level (ADR-040). The `pin` data is parsed once at
@@ -429,6 +796,29 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             git, or a shallow clone — naming `fetch-depth: 0` as the remedy (PIN-004). Per-namespace \
             opt-in via `require-pin` (flag pin-less documents) and `severity` (warning vs error) \
             params (PIN-007).",
+        params: &[
+            Param {
+                name: "require-pin",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "When set, flag documents in this namespace that carry no `pin`.",
+            },
+            Param {
+                name: "severity",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["warning", "error"],
+                doc: "Diagnostic level for a stale pin (default error).",
+            },
+            Param {
+                name: "pin",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: true,
+                values: &[],
+                doc: "A green `commit` plus a `scope` of path globs the rule tracks.",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-040 § PIN-008). Pure date arithmetic, no
@@ -445,6 +835,40 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             generalization of `todo.freshness` (PIN-008): `core.commit-freshness` is the code \
             axis, this is the time axis. A missing or unparseable date is silent (presence is \
             `core.required-metadata`'s concern); only an aged date warns.",
+        params: &[
+            Param {
+                name: "field",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter date field to age (default `reviewed_date`).",
+            },
+            Param {
+                name: "stale_days",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Interval (days) after which the date warns as stale (default 30).",
+            },
+        ],
+    },
+    BuiltinRule {
+        // Document-level (ADR-091 § FNM-001). Compares the file's leading
+        // numeric prefix to the number in its `id`. Ships compiled — it
+        // reads `doc.location` (a path), which the pure `rules.rs` set does
+        // not touch — and is Document-level so it only ever sees id-keyed
+        // documents; id-less path-claim singletons never reach it (FNM-002).
+        code: "core.file-name",
+        level: Level::Document,
+        check: crate::agent_guide::check_file_name,
+        summary: "A document's filename number matches the number in its `id`.",
+        description: "Errors when the file's leading numeric prefix is absent, or when it does \
+            not equal the number in the document's `id` (e.g. `docs/adrs/091-x.md` must carry \
+            `id: ADR-91`). The prefix is compared as a parsed number, not a zero-padded string, \
+            so `88-x.md` and `088-x.md` both satisfy `id: NS-88` — padding width is not policed. \
+            Opt-in per namespace and Document-level, so it is silent on id-less path-claim \
+            singletons (README/CLAUDE/GUIDE) that carry no `id`.",
+        params: &[],
     },
     BuiltinRule {
         // File-level (ADR-046 § RRF-003). The generic "this file must
@@ -471,6 +895,22 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             check (ADR-020 § ACX-005); the completeness counterpart to core.cross-ref. Default \
             has no targets — opt-in per namespace (e.g. `[AGENTS]` with `targets = [\"SOUL.md\", \
             \"STYLE.md\"]` to lint that the agent guide loads its persona docs).",
+        params: &[
+            Param {
+                name: "targets",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Paths the linted file must reference; a missing target is skipped.",
+            },
+            Param {
+                name: "severity",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["error", "warning"],
+                doc: "Diagnostic level per unreferenced existing target (default error).",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-041 § SEC-004). The generic
@@ -488,6 +928,22 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             window, emits one diagnostic at the configurable level (`severity` param, default \
             `error`). A missing or unparseable `discovered_date` is silent — presence is \
             `core.required-metadata`'s concern (SEC-004).",
+        params: &[
+            Param {
+                name: "windows",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Map of severity name → SLA days (default `critical = 7`, `high = 30`).",
+            },
+            Param {
+                name: "severity",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["error", "warning"],
+                doc: "Diagnostic level for a past-SLA finding (default error).",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-041 § SEC-005). core.required-metadata
@@ -504,6 +960,22 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             `exempt-when-links` param names a namespace prefix (e.g. `RISK`) whose presence in \
             `depends_on` exempts the document, because the linked document carries the fields \
             canonically (SEC-005).",
+        params: &[
+            Param {
+                name: "require-when-status",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Status that scopes the rule to matching documents; absent, it applies unconditionally.",
+            },
+            Param {
+                name: "exempt-when-links",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespace prefix whose presence in `depends_on` exempts the document.",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-041 § SEC-006, mitigated-VULN case).
@@ -514,11 +986,37 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
         level: Level::Document,
         check: crate::agent_guide::check_remediation_link,
         summary: "A mitigated finding must cross-ref its remediation.",
-        description: "Errors when a document in scope carries neither a `depends_on` link nor a \
-            body cross-ref token — a mitigated finding must point at the implementing fix (an ADR \
-            or tracker id) so the remediation is falsifiable. The `require-when-status` param \
+        description: "Errors when a document in scope carries neither a cross-ref resolving to \
+            one of `accepted-namespaces` (default `ADR`) nor a non-empty value in one of \
+            `remediation-fields` (default `remediation_link`) — a mitigated finding must point at \
+            the implementing fix so the remediation is falsifiable. The link may be a \
+            `depends_on` entry or a body token, must resolve to a document present in the run, \
+            and may not be the document's own id (BUG-031). The `require-when-status` param \
             (e.g. `mitigated` on VULN) scopes the rule to matching documents; absent, it applies \
             unconditionally (SEC-006).",
+        params: &[
+            Param {
+                name: "require-when-status",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Status that scopes the rule to matching documents; absent, it applies unconditionally.",
+            },
+            Param {
+                name: "accepted-namespaces",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespaces a resolving cross-ref may cite as the remediation (default `ADR`).",
+            },
+            Param {
+                name: "remediation-fields",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter fields whose non-empty value counts as the remediation (default `remediation_link`), for a fix tracked outside the document graph.",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-066 § GDPR-002). A conditional cross-ref:
@@ -534,6 +1032,7 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             Errors when such a record carries no `depends_on` entry and no body cross-ref token \
             resolving to the `DPA` namespace — the Art. 28 processor agreement that governs the \
             processing. A controller or joint-controller record is out of scope (GDPR-002).",
+        params: &[],
     },
     BuiltinRule {
         // Document-level (ADR-066 § HIPAA-002). Encodes the Security Rule's
@@ -551,6 +1050,22 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             A Required safeguard (absent from `addressable`) has no justification escape. The \
             `addressable` list is emitted by the generator from the canonical extract's \
             Required/Addressable flag (HIPAA-002).",
+        params: &[
+            Param {
+                name: "addressable",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Addressable safeguard ids that may substitute a `justification` for evidence.",
+            },
+            Param {
+                name: "evidence-namespaces",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespaces a cross-ref may cite as evidence (default `POLICY`/`ADR`).",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-069 § SOC-002). The SOC 2 control-to-evidence
@@ -574,6 +1089,29 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             field (default `evidence_link`, via `evidence-fields`). Type II attests operating effectiveness \
             over a period, so an asserted-but-unevidenced control is the defect the register catches \
             (SOC-002).",
+        params: &[
+            Param {
+                name: "out-of-scope-status",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Statuses that exempt a control from the evidence requirement (default none).",
+            },
+            Param {
+                name: "evidence-namespaces",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespaces a cross-ref may cite as evidence (default `POLICY`/`ADR`).",
+            },
+            Param {
+                name: "evidence-fields",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter fields whose non-empty value counts as evidence (default `evidence_link`).",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-070 § ISO-002). The ISO 27001 control-to-evidence
@@ -595,6 +1133,29 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             in an evidence field (default `evidence_link`, via `evidence-fields`). A control marked \
             applicable with no implementing evidence is an unbacked claim — the highest-value register \
             check (ISO-002).",
+        params: &[
+            Param {
+                name: "out-of-scope-status",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Statuses that exempt a control from the evidence requirement (default none).",
+            },
+            Param {
+                name: "evidence-namespaces",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespaces a cross-ref may cite as evidence (default `POLICY`/`ADR`).",
+            },
+            Param {
+                name: "evidence-fields",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter fields whose non-empty value counts as evidence (default `evidence_link`).",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-071 § NIST-002). The NIST 800-53 control-to-
@@ -614,6 +1175,79 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             namespace (default `POLICY`/`ADR`, overridable via `evidence-namespaces`) nor a non-empty value \
             in an evidence field (default `evidence_link`, via `evidence-fields`). A control claimed in scope \
             with no implementing evidence is an unbacked assertion (NIST-002).",
+        params: &[
+            Param {
+                name: "out-of-scope-status",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Statuses that exempt a control from the evidence requirement (default none).",
+            },
+            Param {
+                name: "evidence-namespaces",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespaces a cross-ref may cite as evidence (default `POLICY`/`ADR`).",
+            },
+            Param {
+                name: "evidence-fields",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter fields whose non-empty value counts as evidence (default `evidence_link`).",
+            },
+        ],
+    },
+    BuiltinRule {
+        // Document-level (ADR-115 § REG-001). The regime-neutral member of the
+        // conditional-evidence family: one mechanism (evidence_gap), one code,
+        // the trigger field named by config rather than baked into the rule
+        // name. soc2/iso27001/nist each got their own code so the diagnostic
+        // could speak that framework's noun; three forks was affordable, one
+        // per regulation is not. New regulation packs bind this.
+        code: "core.evidence-link",
+        level: Level::Document,
+        check: crate::agent_guide::check_evidence_link,
+        summary: "An in-scope register entry must cite implementing evidence (a cross-ref or an evidence field).",
+        description: "Reads the obligation identifier named by the required `field` param. Errors \
+            when an in-scope entry (status not in `out-of-scope-status`, default none) has neither \
+            a cross-ref resolving to an evidence namespace (default `POLICY`/`ADR`, overridable \
+            via `evidence-namespaces`) nor a non-empty value in an evidence field (default \
+            `evidence_link`, via `evidence-fields`). The regime-neutral sibling of \
+            `soc2.control-evidence` / `iso27001.control-evidence` / `nist.control-evidence`, \
+            sharing their decision core; a namespace binding it without `field` errors rather \
+            than going silently inert (REG-001).",
+        params: &[
+            Param {
+                name: "field",
+                kind: ParamKind::ConfigParam,
+                optional: false,
+                values: &[],
+                doc: "The metadata key carrying the obligation identifier (e.g. `article`, `measure`). Required — the rule has no neutral default.",
+            },
+            Param {
+                name: "out-of-scope-status",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Statuses that exempt an entry from the evidence requirement (default none).",
+            },
+            Param {
+                name: "evidence-namespaces",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespaces a cross-ref may cite as evidence (default `POLICY`/`ADR`).",
+            },
+            Param {
+                name: "evidence-fields",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter fields whose non-empty value counts as evidence (default `evidence_link`).",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-056 § EARS-01). The completeness counterpart
@@ -632,8 +1266,41 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             under each configured acceptance heading (`headings` param, default `Acceptance`, \
             `Definition of Done`) — and only under those headings, so open items under `Out of \
             scope` / `Open Questions` / `Future work` (deferred work, not unmet criteria) never \
-            fire. Severity is the `severity` param (`error` | `warning`, default `error`). \
+            fire. With `require_checkboxes = true` (ADR-122 § ACC-006) the section's top-level \
+            items must also BE checkboxes, closing the case where prose bullets make a section \
+            unscannable and the document reports clean because nothing is checkable. Severity is \
+            the `severity` param (`error` | `warning`, default `error`). \
             Off by default, opt-in per namespace; never reads `[pipeline.gate]` (EARS-01.3).",
+        params: &[
+            Param {
+                name: "terminal",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Statuses that arm the check (default the shared terminal-status vocabulary).",
+            },
+            Param {
+                name: "headings",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Acceptance headings whose checkboxes must be checked (default `Acceptance`, `Definition of Done`).",
+            },
+            Param {
+                name: "require_checkboxes",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["true", "false"],
+                doc: "Also require the section's top-level items to BE checkboxes (default `false`). Without it a section written as prose bullets is invisible to the scan, so the document reports clean because nothing is checkable.",
+            },
+            Param {
+                name: "severity",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["error", "warning"],
+                doc: "Diagnostic level per unchecked item (default error).",
+            },
+        ],
     },
     BuiltinRule {
         // Document-level (ADR-082 § DDD-003). The one check the ddd pack's
@@ -656,8 +1323,242 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
             core.allowed-values cannot express (DDD-003). A doc with no `pattern` skips the \
             direction half; the field names are the `pattern-field`/`upstream-field`/\
             `downstream-field` params.",
+        params: &[
+            Param {
+                name: "exact_context_count",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Number of BOUNDEDCONTEXT ids a `depends_on` must resolve to (default 2).",
+            },
+            Param {
+                name: "context-namespace",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Namespace the edge's contexts must belong to (default `BOUNDEDCONTEXT`).",
+            },
+            Param {
+                name: "symmetric_patterns",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Patterns that omit upstream/downstream roles (default Partnership / Shared Kernel / Separate Ways).",
+            },
+            Param {
+                name: "pattern-field",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter field naming the strategic pattern (default `pattern`).",
+            },
+            Param {
+                name: "upstream-field",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter field naming the upstream role (default `upstream`).",
+            },
+            Param {
+                name: "downstream-field",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Frontmatter field naming the downstream role (default `downstream`).",
+            },
+        ],
+    },
+    BuiltinRule {
+        // File-level (ADR-093 § RSR-002). The `research` pack's RESEARCH
+        // namespace is id-less path-claim (docs/research/**), so — like
+        // GUIDE/C4/CHECKLIST — only file-level rules ever dispatch on it; a
+        // Level::Document registration would silently never run. A pure
+        // normalized-heading walk over the H2/H3 headings (no filesystem, no
+        // body re-parse, ADR-029). core.allowed-values cannot validate
+        // `research.type` (it is Document-level and never dispatches on an
+        // id-less file-level namespace), so the rule self-validates the field
+        // exactly like c4.frontmatter self-validates `c4.level`.
+        code: "research.evidence",
+        level: Level::File,
+        check: crate::agent_guide::check_research_evidence,
+        summary: "A deep-research report (docs/research/**) has an evidence/sources section and a limitations/data-gaps section.",
+        description: "Walks a RESEARCH report's normalized H2/H3 headings and checks two sections \
+            by `contains`-match against configurable synonym sets. The evidence/sources half is \
+            always an error when no heading contains any `evidence_headings` token (default \
+            evidence, sources, references, appendix) — a sources section is standard across the \
+            academic, market, and AI-report genres. The limitations/data-gaps half emits at the \
+            `severity` param level (default warning, promotable to error) when no heading contains \
+            any `gaps_headings` token (default data gap, limitation, assumption, caveat) — a \
+            dedicated gaps heading is good practice but not an industry convention. Setting either \
+            heading list to `[]` disables that half. The optional `research.type` frontmatter field \
+            (nested under a `research` object, not a top-level `type:` which SSGs reserve) is a \
+            monotonic opt-in: absent runs only the baseline; a value outside the closed vocabulary \
+            (academic, market, deep-research) is one error; a valid value additionally warns once \
+            per missing genre-skeleton heading (academic → method/result, market → methodology/\
+            recommendation, deep-research → summary/conclusion). The field only ever ADDS findings — \
+            it never unlocks a passing state — and, when the rule already fires without it, each \
+            diagnostic carries a note advertising it. File-level: a report carries no `id`, so the \
+            filename is its slug (ADR-093).",
+        params: &[
+            Param {
+                name: "evidence_headings",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Synonym tokens a heading must contain to satisfy the evidence/sources half (default evidence, sources, references, appendix); `[]` disables it.",
+            },
+            Param {
+                name: "gaps_headings",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Synonym tokens a heading must contain to satisfy the limitations/data-gaps half (default data gap, limitation, assumption, caveat); `[]` disables it.",
+            },
+            Param {
+                name: "severity",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["warning", "error"],
+                doc: "Diagnostic level for the missing data-gaps section (default warning); the evidence half is always an error.",
+            },
+            Param {
+                name: "research.type",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: true,
+                // Single-sourced from the enforcement vocabulary (ADR-095):
+                // the json metadata and the rule's own validation read one const.
+                values: crate::agent_guide::RESEARCH_TYPES,
+                doc: "Optional genre routing; a valid value monotonically adds that genre's skeleton-heading checks, an invalid value errors.",
+            },
+        ],
+    },
+    BuiltinRule {
+        // Document-level (ADR-098 § QA-003). The two sealed-record invariants a
+        // Test Completion Report carries that core presence rules cannot express:
+        // both are conditional cross-field checks (on `status`, on `result`),
+        // bundled in one rule the way c4.frontmatter / guide.frontmatter validate
+        // several frontmatter invariants at once. The commit-SHA-shape check is
+        // cloned from checklist.pinned (ADR-078); like it, v1 validates shape
+        // only and never shells out to git. Document-level: the [TEST] namespace
+        // is id-claimed (`id: TEST-<N>`), so it runs in the per-document loop.
+        code: "test.completion",
+        level: Level::Document,
+        check: crate::agent_guide::check_test_completion,
+        summary: "A sealed Test Completion Report carries commit-SHA-shaped tested_commit/spec_commit pins, and a conditional-pass names its outstanding defects.",
+        description: "Acts only on a `status: sealed` record; drafts are ignored. Errors when a \
+            sealed record is missing `tested_commit` (the tree the suite ran against) or \
+            `spec_commit` (the revision of the linked contract verified), or when either is not a \
+            40-character hex commit SHA (shape only — it does not resolve the SHA against git). \
+            Also errors when `result: conditional-pass` but the `## Outstanding Defects` section is \
+            absent or empty — a waiver must name what it waives, or the honest verdict is `pass`. \
+            Pin logic cloned from checklist.pinned (ADR-098).",
+        params: &[],
+    },
+    BuiltinRule {
+        // File-level, monotonic opt-in (the research.type shape, ADR-093 —
+        // NOT the frontmatter-mandatory guide/c4 rules). The one custom rule
+        // the `marketing` pack ships: a marketing-strategy doc MAY declare its
+        // genre with a nested `marketing.type`, which core.allowed-values (top-
+        // level keys only) cannot validate, and which must nest to avoid the
+        // SSG-reserved top-level `type:` (BUG-015). Reads the parsed metadata,
+        // so an absent/malformed frontmatter is simply "no type" — which is why
+        // the frontmatter-less CAMPAIGN placeholder binds it harmlessly.
+        code: "marketing.frontmatter",
+        level: Level::File,
+        check: crate::agent_guide::check_marketing_frontmatter,
+        summary: "A marketing-strategy doc that declares a nested `marketing.type` uses a value in the pack's `types` allowlist.",
+        description: "Monotonic opt-in: a CAMPAIGN/PERSONA/POSITIONING/ICP doc MAY set a nested \
+            `marketing.type` (under a `marketing` object, never a top-level `type:` which SSGs \
+            reserve, BUG-015). Absent → no finding. Present → the value must be one of the \
+            pack-supplied `types` allowlist (the `marketing` pack ships campaign, persona, \
+            positioning, icp), else one error; with no `types` pinned it is presence-only. The \
+            field only ever ADDS findings — it never unlocks a passing state — so a \
+            frontmatter-less doc (the live CAMPAIGN placeholder) passes untouched. The binary \
+            enumerates no vocabulary; the allowlist is config-only. File-level: these namespaces \
+            are id-less path-claims, so the filename is the slug (ADR-100).",
+        params: &[
+            Param {
+                name: "types",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Allowlist of valid `marketing.type` values (the `marketing` pack ships campaign, persona, positioning, icp); absent → presence-only.",
+            },
+            Param {
+                name: "marketing.type",
+                kind: ParamKind::FrontmatterAttribute,
+                optional: true,
+                values: &[],
+                doc: "Optional genre discriminator; when present it must be within the `types` allowlist.",
+            },
+        ],
+    },
+    BuiltinRule {
+        // File-level, warn-only, monotonic (ADR-102). The deterministic half of
+        // AI-writing detection: flags the *mechanical* fingerprints in an
+        // document whose presence is
+        // the signal — curly quotes, decorative emoji, em/en-dash density, and a
+        // small config list of exact chatbot-artifact phrases. Fingerprints inside
+        // fenced/inline code are masked. The semantic tells and the ambiguous
+        // technical words (`seam`, `load-bearing`) stay with `writing-humanizer`.
+        code: "writing.ai-fingerprints",
+        level: Level::File,
+        check: crate::agent_guide::check_ai_fingerprints,
+        summary: "A document's prose is free of mechanical AI-writing fingerprints (curly quotes, decorative emoji, em-dash overuse, chatbot-artifact phrases).",
+        description: "Warn-only, monotonic: scans prose (code spans masked) for four deterministic \
+            fingerprint classes and warns per hit — curly quotes/apostrophes (`flag_curly_quotes`, \
+            default on), decorative emoji (`flag_emoji`, default on), em/en-dash density above \
+            `max_em_dashes_per_kwords` (default 4, `0` disables — the one soft/heuristic class), and \
+            exact case-insensitive `phrases` (compiled default: \"you're absolutely right\", \"i hope \
+            this helps\"; `[]` disables). Never errors. It matches only fingerprints whose presence \
+            is the defect; the semantic tells and the ambiguous words `seam`/`load-bearing` stay with \
+            the `writing-humanizer` judgment pass (ADR-102).",
+        params: &[
+            Param {
+                name: "flag_curly_quotes",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Warn on curly quotes/apostrophes (default true).",
+            },
+            Param {
+                name: "flag_emoji",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Warn on decorative emoji (default true).",
+            },
+            Param {
+                name: "max_em_dashes_per_kwords",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Em/en-dash density (per 1000 prose words) above which the file is flagged (default 4; 0 disables — soft signal).",
+            },
+            Param {
+                name: "phrases",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Exact chatbot-artifact phrases, matched case-insensitively (compiled default is a two-item set; [] disables).",
+            },
+        ],
     },
 ];
+
+/// Read-only accessor for a builtin rule's configurable attributes, as
+/// `(name, is_config_param)` pairs — the minimal surface the dogfood
+/// self-lint (`tests/dogfood_param_docs.rs`) needs to assert that every
+/// config param used in a pack is documented (ADR-095 § PDOC-002).
+/// Returns `None` when `code` is not a builtin-compiled rule.
+pub fn builtin_param_names(code: &str) -> Option<Vec<(&'static str, bool)>> {
+    BUILTIN_RULES.iter().find(|r| r.code == code).map(|r| {
+        r.params
+            .iter()
+            .map(|p| (p.name, p.kind == ParamKind::ConfigParam))
+            .collect()
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -710,6 +1611,7 @@ mod tests {
             "todo.listed",
             "design.section-order",
             "design.token-ref",
+            "product.register",
             "ears.clause-syntax",
             "style.section-order",
             "style.soul-pair",
@@ -718,6 +1620,7 @@ mod tests {
             "soul.referenced",
             "core.commit-freshness",
             "core.calendar-freshness",
+            "core.file-name",
             "core.requires-link",
             "security.vuln-sla",
             "security.risk-expiry",
@@ -727,6 +1630,7 @@ mod tests {
             "soc2.control-evidence",
             "iso27001.control-evidence",
             "nist.control-evidence",
+            "core.evidence-link",
             "core.acceptance-complete",
             "agent.frontmatter",
             "agent.assigned",
@@ -738,14 +1642,57 @@ mod tests {
             "checklist.pinned",
             "core.required-headings",
             "core.required-anchors",
+            "core.file-budget",
             "ddd.context-map-shape",
+            "research.evidence",
+            "test.completion",
+            "marketing.frontmatter",
+            "writing.ai-fingerprints",
         ] {
             assert!(
                 codes.contains(&expected),
                 "BUILTIN_RULES missing '{expected}'"
             );
         }
-        assert_eq!(codes.len(), 41, "expected exactly 41 builtin rules");
+        assert_eq!(codes.len(), 49, "expected exactly 49 builtin rules");
+    }
+
+    /// Every conditional-link rule names a real `Level::Document` code, so
+    /// a typo in `RESOLUTION_AWARE_RULES` cannot silently thread nothing
+    /// (BUG-030/BUG-031). The reverse direction — a resolution-dependent
+    /// rule *missing* from the list — is covered by the fail-closed
+    /// behaviour plus the per-rule negative controls, not by this test:
+    /// nothing in the type system knows which rules read a cross-ref.
+    #[test]
+    fn resolution_aware_rules_are_registered() {
+        for code in RESOLUTION_AWARE_RULES {
+            let rule = BUILTIN_RULES
+                .iter()
+                .find(|r| &r.code == code)
+                .unwrap_or_else(|| panic!("RESOLUTION_AWARE_RULES names unknown rule '{code}'"));
+            assert_eq!(
+                rule.level,
+                Level::Document,
+                "'{code}' is threaded the resolved-refs param from the per-document loop, \
+                 so it must be Level::Document"
+            );
+        }
+    }
+
+    #[test]
+    fn id_keyed_file_level_rules_are_registered_file_level() {
+        for code in ID_KEYED_FILE_LEVEL_RULES {
+            let rule = BUILTIN_RULES.iter().find(|r| &r.code == code).unwrap_or_else(|| {
+                panic!("ID_KEYED_FILE_LEVEL_RULES names unknown rule '{code}'")
+            });
+            assert_eq!(
+                rule.level,
+                Level::File,
+                "'{code}' is only an exemption from `cfg.rule-inert` because it is \
+                 registered Level::File yet dual-dispatched by id; a Level::Document \
+                 rule was never inert and does not belong on this list"
+            );
+        }
     }
 
     #[test]

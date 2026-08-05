@@ -1,0 +1,69 @@
+# summary: TEST — a pinned Test Completion Report register (docs/tests/TEST-*.md): one id-keyed markdown record per release milestone, carrying the exit-gate verdict, the tree and contract revision it ran against, its outstanding defects, and sign-off. IEEE 829 / ISO-29119-3 completion report (ADR-098).
+#
+# One markdown record per milestone (docs/tests/TEST-NNN-*.md), id-keyed. The report
+# is the durable, human-authored artifact a program manager reads to answer "did
+# release N clear its exit gate, against which code and which contract, who signed,
+# and where is the evidence?". Generated test output (JUnit XML, coverage HTML,
+# per-run e2e video) is deliberately out of scope by the markdown-only principle:
+# the report CITES that evidence (the `evidence` frontmatter key), it never contains it.
+#
+# NAMESPACE NAME — the pack is `qa`, but its record namespace is [TEST], because
+# ctxgrd derives a document's namespace from its id prefix (`id: TEST-<N>` -> TEST),
+# not from the pack name. This mirrors the governance pack, whose namespace is [DEC].
+# The ADR-098 prose labels the record "[QA]"; on the wire it is a TEST record.
+#
+# Traceability that cannot silently rot (ADR-098 § Context): a test result is
+# meaningless without knowing (a) which code it ran against and (b) which revision of
+# the contract it verified. So a SEALED report must carry two commit-SHA pins,
+# `tested_commit` and `spec_commit` — the tree the suite ran against and the revision
+# of the linked SPEC/ADR it verified. These are validated shape-only (40-hex) by the
+# `test.completion` rule, cloned from the checklist pack's commit-pinned seal (ADR-078);
+# it does NOT shell out to git. Drafts are ignored — the pins are required only at seal.
+#
+# `depends_on` points at the SPEC the report verifies (falling back to the governing
+# ADR where no SPEC exists); core.dep-resolved/core.dep-cycle key off those ids. A
+# `conditional-pass` verdict is a waiver of open defects, so `test.completion` also
+# requires a non-empty `## Outstanding Defects` section when `result: conditional-pass`
+# — a waiver must name what it waives, or the honest verdict is `pass`.
+#
+# No core.min-docs: installing the pack never forces a report to exist, so it is safe
+# to install ahead of writing one. Point `paths` at your tests dir if it differs.
+
+[TEST]
+paths = ["docs/tests/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "test.completion",
+]
+
+# Scope:            what was under test (release, systems, test levels covered).
+# Test Environment: the environment the suite ran in (build, config, data set).
+# Results Summary:  pass/fail counts per suite — the summary rows, not the raw runs.
+# Outstanding Defects: open defects at seal time. Non-empty is mandatory for a
+#                   conditional-pass verdict (the waiver names what it waives).
+# Exit Criteria:    the release gate and whether each criterion was met.
+# Sign-off:         who accepted the result (links a sealed checklist where one exists).
+# References:       the SPEC/ADR verified and the CI/coverage/e2e evidence cited.
+[TEST."core.required-headings"]
+headings = ["Scope", "Test Environment", "Results Summary", "Outstanding Defects", "Exit Criteria", "Sign-off", "References"]
+
+# result:   the exit-gate verdict (constrained below).
+# release:  the release or milestone this report gates.
+# date:     the date the report was completed / last reviewed.
+# evidence: a URL or path to the CI/e2e/coverage artifact. Required so "it passed" is
+#           auditable; presence is checked, reachability is not (the artifact may be
+#           behind CI auth or offline).
+[TEST."core.required-metadata"]
+keys = ["result", "release", "date", "evidence"]
+
+# The exit-gate verdict: a clean pass, a fail, or a conditional-pass (a waiver of the
+# open defects the report names under Outstanding Defects).
+[TEST."core.allowed-values"]
+result = ["pass", "fail", "conditional-pass"]

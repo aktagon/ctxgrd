@@ -1,0 +1,5 @@
+# Fixture root: the workflow pack's [TASK] shape, reduced to what this
+# scenario exercises (ADR-122 § ACC-001).
+[TASK]
+owner = "developer"
+rules = ["core.acceptance-complete"]

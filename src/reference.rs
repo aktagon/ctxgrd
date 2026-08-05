@@ -118,6 +118,16 @@ pub(crate) fn scan(root: &Path, globs: &[String]) -> io::Result<ScanReport> {
                     return ignore::WalkState::Continue;
                 }
             };
+            if crate::source::markdown::is_nested_project_root(
+                &root,
+                entry.path(),
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            ) {
+                // BUG-017: the descendant has declared its own project
+                // contract, so none of its source references belong to this
+                // root's cross-reference corpus.
+                return ignore::WalkState::Skip;
+            }
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 return ignore::WalkState::Continue;
             }
@@ -406,6 +416,23 @@ mod tests {
         let tokens: Vec<&str> = refs.iter().map(|r| r.token.as_str()).collect();
         assert!(!tokens.contains(&"ADR-9999"), "target/ must be ignored");
         assert!(tokens.contains(&"ADR-7777"));
+    }
+
+    #[test]
+    fn scan_prunes_nested_ctxgrd_project_roots() {
+        // BUG-017: references in a child project must not be checked by an
+        // ancestor project's configured reference scanner.
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "src/main.rs", "// ADR-001 belongs here\n");
+        write(root.path(), "child/ctxgrd.toml", "[ADR]\n");
+        write(root.path(), "child/src/lib.rs", "// ADR-999 belongs to child\n");
+
+        let refs = scan(root.path(), &["**/*.rs".to_owned()])
+            .unwrap()
+            .references;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].file_path, PathBuf::from("src/main.rs"));
+        assert_eq!(refs[0].token, "ADR-001");
     }
 
     #[test]

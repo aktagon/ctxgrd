@@ -1,4 +1,6 @@
 {
+  "_note": "Catalog verified against the official Official Journal text of Regulation (EU) 2016/679 (GDPR, OJ L 119, 4.5.2016, p. 1), retrieved 2026-07-30 from the Publications Office CELLAR (http://publications.europa.eu/resource/celex/32016R0679, Accept-Language: eng). Art. 6(1) 'Lawfulness of processing' enumerates exactly six bases, points (a) to (f), in the order encoded here: consent (a), contract (b), legal obligation (c), vital interests (d), public task (e), legitimate interests (f). Note Art. 6(1) second subparagraph: point (f) does not apply to processing by public authorities in the performance of their tasks -- a conditional ctxgrd does NOT check, because whether the controller is a public authority is not in the frontmatter. Roles are the Art. 4(7)/(8) definitions plus the Art. 26 joint-controller arrangement. This provenance note was added 2026-07-30 by ADR-115's test gate, which found this extract was the only one carrying no source record at all; the values themselves were unchanged by the verification.",
+  "edition": "Regulation (EU) 2016/679 (GDPR), OJ L 119, 4.5.2016, p. 1",
   "summary": "GDPR documentary artifacts (ROPA/DPIA/DPA) over the security base — Regulation (EU) 2016/679 Arts. 28/30/35. Paperwork existence/metadata/freshness only, never legal adequacy.",
   "depends": ["security"],
   "vocabularies": {
@@ -31,6 +33,7 @@
         "core.frontmatter",
         "core.id",
         "core.id-unique",
+        "core.dep-resolved",
         "core.cross-ref",
         "core.required-metadata",
         "core.allowed-values",
@@ -58,6 +61,7 @@
         "core.frontmatter",
         "core.id",
         "core.id-unique",
+        "core.dep-resolved",
         "core.cross-ref",
         "core.required-metadata",
         "core.calendar-freshness"
@@ -81,6 +85,7 @@
         "core.frontmatter",
         "core.id",
         "core.id-unique",
+        "core.dep-resolved",
         "core.cross-ref",
         "core.required-metadata"
       ],

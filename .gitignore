@@ -6,6 +6,10 @@
 # insta snapshot scratch files
 *.pending-snap
 
+# Python bytecode cache (from scripts/ validators)
+__pycache__/
+*.pyc
+
 # Local agent / assistant directories
 .antigravitycli/
 .copilot/

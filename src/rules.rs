@@ -13,12 +13,14 @@
 //! so on. The brief's "Sources parse, rules check" rule is enforced
 //! structurally: these functions never see the raw body string.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
 use serde_json::Value;
 
+use crate::config::Config;
 use crate::dag::{self, Cycle};
 use crate::diagnostic::Diagnostic;
 use crate::document::{self, Document};
@@ -89,6 +91,17 @@ pub(crate) fn parse_diagnostic_to_diagnostic(p: &ParseDiagnostic) -> Diagnostic 
         .with_help(
             "re-save the file as UTF-8 — it is likely Latin-1 / Windows-1252; \
              ctxgrd reads documents as UTF-8.",
+        ),
+        ParseDiagnosticKind::Unreadable { message } => Diagnostic::error(
+            "src.markdown-read",
+            p.location.clone(),
+            0,
+            0,
+            format!("file could not be read: {message}"),
+        )
+        .with_help(
+            "check the file's permissions — a path-claimed record ctxgrd \
+             cannot read is excluded from every check until it is readable.",
         ),
     }
 }
@@ -423,6 +436,117 @@ pub(crate) fn dep_cycle(graph: &dag::DepGraph<'_>) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// `core.dep-status` (ADR-106 § DPS-001) — WHERE a document's `status`
+/// is terminal, every document it `depends_on` must also be at a terminal
+/// status. One diagnostic per offending edge, anchored on the **source**
+/// document's `depends_on` line: the source is the one making the false
+/// claim, asserting settledness its dependency does not support.
+///
+/// The graph's first *state* assertion — `core.dep-resolved` /
+/// `core.dep-cycle` / `core.dep-shape` all check shape only.
+///
+/// Silent (DPS-002) when the source's `status` is absent or non-terminal,
+/// when the target's `status` is absent, and for any `depends_on` entry
+/// that did not resolve — a dangling entry is `core.dep-resolved`'s
+/// diagnostic, and reporting it under two codes would be noise.
+///
+/// Params (both optional, DPS-003), read from the **source** document's
+/// namespace because the claim under test is the source's:
+/// - `terminal` (string list, default [`DEFAULT_TERMINAL_STATUSES`]): the
+///   statuses that count as settled, on both endpoints.
+/// - `severity` (`error` | `warning`, default `error`).
+///
+/// Opt-in (DPS-004): bound in no pack default, so a namespace activates
+/// it by listing the code. The `config` argument is what makes this the
+/// first graph rule to take one — the per-namespace `retain` in `run.rs`
+/// filters by location after the fact, but the params must be resolved
+/// per source namespace while the edge is in hand.
+pub(crate) fn dep_status(graph: &dag::DepGraph<'_>, config: &Config) -> Vec<Diagnostic> {
+    const CODE: &str = "core.dep-status";
+
+    let docs = graph.docs();
+    let mut out = Vec::new();
+    for (idx, source) in docs.iter().enumerate() {
+        let ns_cfg = config.namespace_config(&source.id.namespace);
+        if !ns_cfg.enables(CODE) {
+            continue;
+        }
+        let Some(source_status) = source.metadata.get("status").and_then(Value::as_str) else {
+            continue;
+        };
+        let params = ns_cfg.params.get(CODE);
+        let terminal: Vec<String> = params
+            .and_then(|p| p.get("terminal"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_else(|| {
+                crate::agent_guide::DEFAULT_TERMINAL_STATUSES
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            });
+        let is_terminal =
+            |status: &str| terminal.iter().any(|t| t.eq_ignore_ascii_case(status));
+        if !is_terminal(source_status) {
+            continue;
+        }
+        let severity = if params
+            .and_then(|p| p.get("severity"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("warning"))
+        {
+            crate::diagnostic::Severity::Warning
+        } else {
+            crate::diagnostic::Severity::Error
+        };
+        let line = source
+            .frontmatter_lines
+            .get("depends_on")
+            .copied()
+            .unwrap_or(0);
+
+        for target_idx in graph.dependencies(idx) {
+            let target = &docs[target_idx];
+            let Some(target_status) = target.metadata.get("status").and_then(Value::as_str) else {
+                continue;
+            };
+            if is_terminal(target_status) {
+                continue;
+            }
+            // State only what the check established — that the target's
+            // status is outside the terminal set. Claiming it is "still in
+            // progress" would infer what the status *means*, which the
+            // linter cannot know: it misdescribes `rejected` (ADR-106
+            // Consequences) and equally `dropped`, `deferred`,
+            // `deprecated`, or any vocabulary a project invents. An
+            // exception list for those is unmaintainable by construction;
+            // the uniform factual wording needs none.
+            let mut diag = Diagnostic::error(
+                CODE,
+                source.location.clone(),
+                line,
+                0,
+                // `raw_id`, not `id`: `DocumentId`'s Display normalizes the
+                // number, so a zero-padded `ADR-001` would echo back as
+                // `ADR-1` and stop matching what the author wrote — the
+                // same verbatim-echo reason `dep_resolved` uses `raw_entry`.
+                format!(
+                    "{} is `{source_status}` but depends on {}, whose status \
+                     `{target_status}` is not terminal",
+                    source.raw_id, target.raw_id
+                ),
+            )
+            .with_help(format!(
+                "move {} to a terminal status, or reopen {} until its dependency settles",
+                target.raw_id, source.raw_id
+            ));
+            diag.severity = severity;
+            out.push(diag);
+        }
+    }
+    out
+}
+
 /// `core.cross-ref` — tokens in the body that don't resolve to any
 /// known document, unless suppressed via `in_code` or
 /// `in_strikethrough`. Silently no-ops for documents with no AST
@@ -498,8 +622,11 @@ pub(crate) fn cross_ref(
     }
     // ADR-001 § REF-001: scanner-emitted References are anonymous
     // pointer mentions in non-markdown files. Same dangling-token
-    // semantics, separate dedup scope (each (file, line, col, token)
-    // is unique by construction in the scanner's output already).
+    // semantics and — since BUG-025 — the same dedup shape as the
+    // markdown side: one diagnostic per (file, target), anchored at the
+    // first occurrence, with the total mention count in the note.
+    let mut mention_counts: BTreeMap<(&Path, DocumentId), usize> = BTreeMap::new();
+    let mut dangling: Vec<(&crate::reference::Reference, DocumentId)> = Vec::new();
     for r in references {
         if !allowed_namespaces.contains(token_namespace(&r.token)) {
             continue;
@@ -511,24 +638,38 @@ pub(crate) fn cross_ref(
         if known_ids.contains(&id) {
             continue;
         }
-        out.push(
-            Diagnostic::error(
-                "core.cross-ref",
-                r.file_path.to_string_lossy().into_owned(),
-                r.line,
-                r.col,
-                format!(
-                    "cross-reference '{}' does not resolve to a known document",
-                    r.token
-                ),
-            )
-            .with_help(
-                "use an existing ID, or add `ctxgrd: ignore-line` / `ctxgrd: ignore-next`\n\
-                 to suppress this match without disabling the rule"
-                    .to_string(),
-            )
-            .with_span_len(r.token.len() as u32),
-        );
+        let count = mention_counts
+            .entry((r.file_path.as_path(), id.clone()))
+            .or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            dangling.push((r, id));
+        }
+    }
+    for (r, id) in dangling {
+        let count = mention_counts[&(r.file_path.as_path(), id)];
+        let mut diag = Diagnostic::error(
+            "core.cross-ref",
+            r.file_path.to_string_lossy().into_owned(),
+            r.line,
+            r.col,
+            format!(
+                "cross-reference '{}' does not resolve to a known document",
+                r.token
+            ),
+        )
+        .with_help(
+            "use an existing ID, or add `ctxgrd: ignore-line` / `ctxgrd: ignore-next`\n\
+             to suppress this match without disabling the rule"
+                .to_string(),
+        )
+        .with_span_len(r.token.len() as u32);
+        if count > 1 {
+            diag = diag.with_note(format!(
+                "{count} mentions of this target in this file; first occurrence shown"
+            ));
+        }
+        out.push(diag);
     }
     out
 }
@@ -650,8 +791,11 @@ pub(crate) fn requirement_ref(docs: &[Document]) -> Vec<Diagnostic> {
 // -- parameterised rules ----------------------------------------------
 
 /// `core.required-headings` — every configured H2 heading string MUST
-/// appear somewhere in the document's headings list. The match is
-/// exact and case-sensitive. Missing headings produce a
+/// appear somewhere in the document's headings list. Matching is
+/// normalized — leading enumerator stripped, trailing colon dropped,
+/// case-insensitive — via the same helper the file-level dispatch uses,
+/// so both paths of this dual-use rule agree with the registry
+/// description (ADR-078, BUG-021). Missing headings produce a
 /// line-0 / col-0 diagnostic (there's no anchor for something that
 /// isn't there). Only H2 (`level == 2`) counts, per the rule's name.
 ///
@@ -664,11 +808,11 @@ pub(crate) fn required_headings(doc: &Document, params: &Value) -> Vec<Diagnosti
         return Vec::new();
     };
 
-    let present: BTreeSet<&str> = ast
+    let present: BTreeSet<String> = ast
         .headings
         .iter()
         .filter(|h| h.level == 2)
-        .map(|h| h.text.as_str())
+        .map(|h| crate::agent_guide::normalize_required_heading(&h.text))
         .collect();
 
     let required_list: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
@@ -676,7 +820,7 @@ pub(crate) fn required_headings(doc: &Document, params: &Value) -> Vec<Diagnosti
 
     let mut out = Vec::new();
     for text in &required_list {
-        if !present.contains(text) {
+        if !present.contains(&crate::agent_guide::normalize_required_heading(text)) {
             out.push(
                 Diagnostic::error(
                     "core.required-headings",
@@ -850,7 +994,7 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.dep-resolved");
         assert_eq!(diags[0].location, "ADR-099.md");
-        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[0].line, Some(5));
         assert_eq!(
             diags[0].message,
             "depends_on entry 'PRD-999' does not resolve to a document in the run"
@@ -922,7 +1066,7 @@ mod tests {
         let diags = successor_link(&docs[0], &empty_params(), &graph);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.successor-link");
-        assert_eq!(diags[0].line, 4);
+        assert_eq!(diags[0].line, Some(4));
         assert_eq!(
             diags[0].message,
             "ADR-044: a `superseded` document must record its successor in `superseded_by`"
@@ -936,7 +1080,7 @@ mod tests {
         let diags = successor_link(&docs[0], &empty_params(), &graph);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.successor-link");
-        assert_eq!(diags[0].line, 4);
+        assert_eq!(diags[0].line, Some(4));
         assert_eq!(
             diags[0].message,
             "ADR-044: `superseded_by` entry 'ADR-999' does not resolve to a document in the run"
@@ -1025,8 +1169,8 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.cross-ref");
         assert_eq!(diags[0].location, "ADR-099.md");
-        assert_eq!(diags[0].line, 18);
-        assert_eq!(diags[0].col, 5);
+        assert_eq!(diags[0].line, Some(18));
+        assert_eq!(diags[0].col, Some(5));
         assert_eq!(
             diags[0].message,
             "cross-reference 'ADR-042' does not resolve to a known document"
@@ -1154,7 +1298,7 @@ mod tests {
         )];
         let diags = cross_ref(&docs, &BTreeSet::new(), &[]);
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].col, 5, "should anchor at first occurrence");
+        assert_eq!(diags[0].col, Some(5), "should anchor at first occurrence");
     }
 
     #[test]
@@ -1174,6 +1318,49 @@ mod tests {
         ];
         let diags = cross_ref(&docs, &BTreeSet::new(), &[]);
         assert_eq!(diags.len(), 2);
+    }
+
+    fn scan_ref(file: &str, line: u32, col: u32, token: &str) -> crate::reference::Reference {
+        crate::reference::Reference {
+            file_path: std::path::PathBuf::from(file),
+            line,
+            col,
+            token: token.to_owned(),
+        }
+    }
+
+    #[test]
+    fn cross_ref_scanner_dedupes_per_file_and_target() {
+        // BUG-025: a stale ID mentioned three times in one code file is
+        // one diagnostic — anchored at the first occurrence, with the
+        // total mention count in the note — mirroring the markdown
+        // side's per-(document, target) dedup.
+        let refs = vec![
+            scan_ref("src/main.rs", 1, 8, "ADR-999"),
+            scan_ref("src/main.rs", 1, 26, "ADR-999"),
+            scan_ref("src/main.rs", 2, 18, "ADR-999"),
+        ];
+        let declared: BTreeSet<&str> = ["ADR"].into_iter().collect();
+        let diags = cross_ref(&[], &declared, &refs);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!((diags[0].line, diags[0].col), (Some(1), Some(8)), "first occurrence");
+        assert!(
+            diags[0].note.as_deref().unwrap_or("").contains("3 mentions"),
+            "the note must carry the mention count: {:?}",
+            diags[0].note
+        );
+    }
+
+    #[test]
+    fn cross_ref_scanner_does_not_dedupe_across_files_or_targets() {
+        let refs = vec![
+            scan_ref("src/main.rs", 1, 8, "ADR-999"),
+            scan_ref("src/lib.rs", 3, 1, "ADR-999"),
+            scan_ref("src/main.rs", 4, 2, "ADR-998"),
+        ];
+        let declared: BTreeSet<&str> = ["ADR"].into_iter().collect();
+        let diags = cross_ref(&[], &declared, &refs);
+        assert_eq!(diags.len(), 3, "{diags:?}");
     }
 
     #[test]
@@ -1312,7 +1499,7 @@ mod tests {
         let d = parse_diagnostic_to_diagnostic(&p);
         assert_eq!(d.code, "core.frontmatter");
         assert_eq!(d.location, "x.md");
-        assert_eq!(d.line, 0);
+        assert_eq!(d.line, None);
     }
 
     #[test]
@@ -1377,7 +1564,7 @@ mod tests {
         let diags = required_headings(&doc, &params);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.required-headings");
-        assert_eq!(diags[0].line, 0);
+        assert_eq!(diags[0].line, None);
         assert_eq!(diags[0].message, "missing required H2 heading 'Decision'");
     }
 
@@ -1392,11 +1579,17 @@ mod tests {
     }
 
     #[test]
-    fn required_headings_case_sensitive() {
-        let doc = doc_with_headings("ADR-001", vec![(2, "status")]);
-        let params = serde_json::json!({"headings": ["Status"]});
+    fn required_headings_normalized_match() {
+        // BUG-021 semantics unification: the id pipeline uses the same
+        // normalized matching as the file-level pass — case-insensitive,
+        // leading enumerator stripped, trailing colon dropped.
+        let doc = doc_with_headings(
+            "ADR-001",
+            vec![(2, "1. status"), (2, "CONTEXT:")],
+        );
+        let params = serde_json::json!({"headings": ["Status", "Context"]});
         let diags = required_headings(&doc, &params);
-        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.len(), 0);
     }
 
     #[test]
@@ -1457,7 +1650,7 @@ mod tests {
         let diags = allowed_values(&doc, &params);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.allowed-values");
-        assert_eq!(diags[0].line, 4);
+        assert_eq!(diags[0].line, Some(4));
         assert_eq!(
             diags[0].message,
             "metadata key 'status' has value 'cooking' not in allowed set [draft, accepted, rejected, superseded]"
@@ -1633,5 +1826,200 @@ mod tests {
         let doc =
             make_doc_with_headings("ADR-001", vec![], vec![req_token("SEC-001", 2, 18, false)]);
         assert!(requirement_ref(&[doc]).is_empty());
+    }
+
+    // -- core.dep-status (ADR-106 § DPS-001..003) ----------------------
+
+    /// A document with a `status` and a `depends_on` list. `status: None`
+    /// omits the key entirely — the DPS-002 silence case.
+    fn dep_status_doc(raw_id: &str, status: Option<&str>, depends_on: Vec<&str>) -> Document {
+        let mut doc = make_doc(raw_id, depends_on, vec![]);
+        if let Some(s) = status {
+            doc.metadata
+                .insert("status".to_string(), Value::String(s.to_string()));
+        }
+        doc
+    }
+
+    /// A config activating `core.dep-status` on `namespace` with the
+    /// given params object. `params` of `Value::Null` means "listed with
+    /// no block", the documented-defaults path.
+    fn dep_status_config(namespace: &str, params: Value) -> crate::config::Config {
+        let mut ns = crate::config::NamespaceConfig::zero_config();
+        ns.rules.push("core.dep-status".to_string());
+        ns.params.insert("core.dep-status".to_string(), params);
+        let mut config = crate::config::Config::default();
+        config.namespaces.insert(namespace.to_string(), ns);
+        config
+    }
+
+    #[test]
+    fn dep_status_flags_terminal_source_on_nonterminal_target() {
+        let spec = dep_status_doc("SPEC-001", Some("accepted"), vec!["ADR-001"]);
+        let adr = dep_status_doc("ADR-001", Some("draft"), vec![]);
+        let docs = vec![spec, adr];
+        let graph = dag::DepGraph::new(&docs);
+        let config = dep_status_config("SPEC", Value::Null);
+
+        let diags = dep_status(&graph, &config);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.dep-status");
+        // DPS-001: anchored on the SOURCE document's depends_on line.
+        assert_eq!(diags[0].location, "SPEC-001.md");
+        assert_eq!(diags[0].line, Some(5));
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+        assert_eq!(
+            diags[0].message,
+            "SPEC-001 is `accepted` but depends on ADR-001, whose status `draft` is not terminal"
+        );
+    }
+
+    #[test]
+    fn dep_status_silent_when_target_reaches_terminal() {
+        let spec = dep_status_doc("SPEC-001", Some("accepted"), vec!["ADR-001"]);
+        let adr = dep_status_doc("ADR-001", Some("accepted"), vec![]);
+        let docs = vec![spec, adr];
+        let graph = dag::DepGraph::new(&docs);
+        let config = dep_status_config("SPEC", Value::Null);
+
+        assert_eq!(dep_status(&graph, &config), Vec::new());
+    }
+
+    #[test]
+    fn dep_status_reports_one_diagnostic_per_offending_edge() {
+        let spec = dep_status_doc("SPEC-001", Some("accepted"), vec!["ADR-001", "ADR-002"]);
+        let first = dep_status_doc("ADR-001", Some("draft"), vec![]);
+        let second = dep_status_doc("ADR-002", Some("proposed"), vec![]);
+        let docs = vec![spec, first, second];
+        let graph = dag::DepGraph::new(&docs);
+        let config = dep_status_config("SPEC", Value::Null);
+
+        let diags = dep_status(&graph, &config);
+        assert_eq!(diags.len(), 2);
+        assert!(diags[0].message.contains("ADR-001"));
+        assert!(diags[1].message.contains("ADR-002"));
+    }
+
+    #[test]
+    fn dep_status_silent_when_source_status_absent_or_nonterminal() {
+        let adr = dep_status_doc("ADR-001", Some("draft"), vec![]);
+
+        let idless = dep_status_doc("SPEC-001", None, vec!["ADR-001"]);
+        let docs = vec![idless, adr.clone()];
+        let graph = dag::DepGraph::new(&docs);
+        let config = dep_status_config("SPEC", Value::Null);
+        assert_eq!(dep_status(&graph, &config), Vec::new());
+
+        let in_flight = dep_status_doc("SPEC-001", Some("draft"), vec!["ADR-001"]);
+        let docs = vec![in_flight, adr];
+        let graph = dag::DepGraph::new(&docs);
+        assert_eq!(dep_status(&graph, &config), Vec::new());
+    }
+
+    #[test]
+    fn dep_status_silent_when_target_declares_no_status() {
+        // DPS-002: a document that never declares a status makes no
+        // settledness claim, so there is nothing to contradict.
+        let spec = dep_status_doc("SPEC-001", Some("accepted"), vec!["ADR-001"]);
+        let adr = dep_status_doc("ADR-001", None, vec![]);
+        let docs = vec![spec, adr];
+        let graph = dag::DepGraph::new(&docs);
+        let config = dep_status_config("SPEC", Value::Null);
+
+        assert_eq!(dep_status(&graph, &config), Vec::new());
+    }
+
+    #[test]
+    fn dep_status_leaves_dangling_edges_to_dep_resolved() {
+        // DPS-002: an unresolved entry is core.dep-resolved's diagnostic;
+        // reporting it under two codes would be noise.
+        let spec = dep_status_doc("SPEC-001", Some("accepted"), vec!["ADR-999"]);
+        let docs = vec![spec];
+        let graph = dag::DepGraph::new(&docs);
+        let config = dep_status_config("SPEC", Value::Null);
+
+        assert_eq!(dep_status(&graph, &config), Vec::new());
+        assert_eq!(dep_resolved(&graph).len(), 1);
+    }
+
+    #[test]
+    fn dep_status_honors_terminal_and_severity_params() {
+        let shipped = dep_status_doc("SPEC-001", Some("shipped"), vec!["ADR-001"]);
+        let accepted = dep_status_doc("SPEC-002", Some("accepted"), vec!["ADR-001"]);
+        let adr = dep_status_doc("ADR-001", Some("draft"), vec![]);
+        let docs = vec![shipped, accepted, adr];
+        let graph = dag::DepGraph::new(&docs);
+        let config = dep_status_config(
+            "SPEC",
+            serde_json::json!({ "terminal": ["shipped"], "severity": "warning" }),
+        );
+
+        let diags = dep_status(&graph, &config);
+        // DPS-003: `terminal = ["shipped"]` fires on the shipped source
+        // and stays silent on the accepted one.
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].location, "SPEC-001.md");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
+    }
+
+    #[test]
+    fn dep_status_resolves_params_from_the_source_namespace() {
+        // DPS-003: the claim under test is the SOURCE's, so its namespace
+        // owns the params — the target's config must not apply.
+        let spec = dep_status_doc("SPEC-001", Some("shipped"), vec!["ADR-001"]);
+        let adr = dep_status_doc("ADR-001", Some("draft"), vec![]);
+        let docs = vec![spec, adr];
+        let graph = dag::DepGraph::new(&docs);
+        // Only ADR declares `terminal = ["shipped"]`; SPEC keeps defaults,
+        // under which `shipped` is not terminal, so nothing fires.
+        let config = dep_status_config("ADR", serde_json::json!({ "terminal": ["shipped"] }));
+
+        assert_eq!(dep_status(&graph, &config), Vec::new());
+    }
+
+    #[test]
+    fn dep_status_wording_never_infers_what_a_status_means() {
+        // The message states only what the check established — that the
+        // status is outside the terminal set. `rejected` and `dropped` have
+        // stopped moving but settle nothing, and `deferred` is paused, not
+        // in flight: claiming any of them is "still in progress" would be
+        // false (ADR-106 Consequences, generalized). The linter cannot know
+        // what a project's vocabulary means, so it does not guess.
+        //
+        // Load-bearing for `ADR-121`: `rejected` and `deferred` became
+        // *settled* for the census there, and this asserts they did not also
+        // become arming. `BUG-037` names widening the shared vocabulary as
+        // the wrong way to close it — that mutation fails here, and only
+        // here. Do not relax this to accommodate a census change.
+        for status in ["rejected", "dropped", "deferred", "deprecated", "wip"] {
+            let spec = dep_status_doc("SPEC-001", Some("accepted"), vec!["ADR-001"]);
+            let adr = dep_status_doc("ADR-001", Some(status), vec![]);
+            let docs = vec![spec, adr];
+            let graph = dag::DepGraph::new(&docs);
+            let config = dep_status_config("SPEC", Value::Null);
+
+            let diags = dep_status(&graph, &config);
+            assert_eq!(diags.len(), 1, "status `{status}` should fire");
+            assert_eq!(
+                diags[0].message,
+                format!(
+                    "SPEC-001 is `accepted` but depends on ADR-001, \
+                     whose status `{status}` is not terminal"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn dep_status_silent_when_namespace_does_not_enable_it() {
+        // The per-namespace `retain` in run.rs filters by location, but the
+        // rule itself must not walk a namespace that never asked for it.
+        let spec = dep_status_doc("SPEC-001", Some("accepted"), vec!["ADR-001"]);
+        let adr = dep_status_doc("ADR-001", Some("draft"), vec![]);
+        let docs = vec![spec, adr];
+        let graph = dag::DepGraph::new(&docs);
+        let config = crate::config::Config::default();
+
+        assert_eq!(dep_status(&graph, &config), Vec::new());
     }
 }

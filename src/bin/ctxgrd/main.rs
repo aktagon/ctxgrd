@@ -26,12 +26,16 @@ use ctxgrd::reporter;
 use ctxgrd::run;
 
 mod changelog;
+mod command;
 mod hooks;
 mod introspect;
 mod lint;
 mod pack;
 mod pin;
 mod scaffold;
+mod serve;
+
+use command::{emit, Ctx};
 
 /// Render a synthetic diagnostic to stderr — used for every
 /// kernel / config / IO / usage error so failures speak the same
@@ -65,10 +69,12 @@ Examples:
   ctxgrd refs ADR-001          # list every pointer to a document
   ctxgrd status                # show pipeline position: stages, blockers, next action
   ctxgrd status --format json  # same, as a JSON object for agent routers
+  ctxgrd serve                 # browse the governed docs + pipeline at a localhost URL
   ctxgrd docs rules            # learn how to write your own rules
 
 Exit codes:  0 clean · 1 diagnostics · 2 kernel/config error
-Config:      reads `ctxgrd.toml` from --root (run `ctxgrd init` to create one).";
+Config:      finds `ctxgrd.toml` in the nearest parent directory, like git or cargo
+             (run `ctxgrd init` to create one, or --root <dir> to pin it exactly).";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -96,9 +102,15 @@ struct Cli {
     #[command(flatten)]
     lint: LintArgs,
 
-    /// Project root for all commands.
-    #[arg(long, default_value = ".", global = true)]
-    root: PathBuf,
+    /// Project root for all commands. Defaults to the nearest ancestor
+    /// directory containing a `ctxgrd.toml`, or the working directory
+    /// when no ancestor has one.
+    ///
+    /// Deliberately not `default_value = "."`: the absence of the flag
+    /// is what licenses the upward search (BUG-048), and a clap default
+    /// is indistinguishable from the user typing `--root .`.
+    #[arg(long, global = true)]
+    root: Option<PathBuf>,
 }
 
 /// Output format for `lint`, `rules`, `refs`, and `pack` — the diagnostic
@@ -119,6 +131,10 @@ struct Cli {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "lowercase")]
 pub(crate) enum Format {
+    /// The default human rendering. `text` is accepted as an alias so a
+    /// family-wide caller can pass the shared `--format text` value
+    /// (ADR-086 § WIRE-006); it renders byte-identically to `rich`.
+    #[value(alias = "text")]
     Rich,
     Simple,
     Json,
@@ -154,6 +170,25 @@ pub(crate) enum StatusFormat {
     Dot,
 }
 
+/// Which graph the `status` diagram formats draw (ADR-108 § GRN-001).
+///
+/// `namespace` (the default) is the resolved namespace DAG the renderers
+/// have always drawn; `doc` is the document `depends_on` graph, one node
+/// per counted document. The axis is explicit at the call site because
+/// `--lineage` scopes documents while the renderers drew namespaces —
+/// two features that silently disagreed about which graph was meant.
+///
+/// ADR-118 § STG-005 left `Doc` as the only real value. `Namespace` is
+/// kept in the enum on purpose: removing the variant would make
+/// `--granularity namespace` a generic clap parse error, where keeping it
+/// lets the command answer with a diagnostic that names the ADR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub(crate) enum Granularity {
+    Namespace,
+    Doc,
+}
+
 /// Flags for the default `lint` action. Flattened into both the
 /// top-level [`Cli`] (so `ctxgrd -r --format json` works with no
 /// subcommand) and the explicit [`Cmd::Lint`] variant (so `ctxgrd lint
@@ -183,6 +218,33 @@ struct LintArgs {
     /// roots:[…]}` object attributing each finding to its config.
     #[arg(long, short)]
     recursive: bool,
+
+    /// Scope the run to the namespaces this project stamped `# pack:
+    /// <name>` in its own ctxgrd.toml (ADR-080). Repeatable and
+    /// comma-separable; intersects with `--namespace`. Resolves through
+    /// the config's provenance, not the built-in pack definition, so it
+    /// never scopes to a namespace the project never adopted. A name
+    /// matching nothing exits 2; a hand-written block carries no stamp
+    /// and is reachable only with `--namespace`.
+    #[arg(long, value_delimiter = ',', value_name = "NAME")]
+    pack: Vec<String>,
+
+    /// Scope the run to one or more namespaces of the resolved config
+    /// (ADR-080), e.g. `--namespace ADR`. Repeatable and comma-separable;
+    /// intersects with `--pack`. Files outside the scope are skipped, not
+    /// errored; a name the config does not declare exits 2.
+    #[arg(long, value_delimiter = ',', value_name = "NS")]
+    namespace: Vec<String>,
+}
+
+impl LintArgs {
+    /// The ADR-080 scope selectors as the library sees them.
+    fn scope(&self) -> ctxgrd::run::ScopeSelector {
+        ctxgrd::run::ScopeSelector {
+            packs: self.pack.clone(),
+            namespaces: self.namespace.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -207,6 +269,11 @@ enum Cmd {
         /// for `init` then `pack add <name>` for each (ADR-013 § PACK-006).
         #[arg(long, value_delimiter = ',')]
         pack: Vec<String>,
+        /// Output format. `json` emits `{"status":"created|exists","path":…}`
+        /// on a clean stdout (ADR-086 § WIRE-001); the default renders the
+        /// human summary with hints on stderr.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
     },
     /// Scaffold a new document, or a new external rule when namespace is `rule`.
     New {
@@ -229,6 +296,11 @@ enum Cmd {
         /// Explicit document number (documents only); defaults to `max(existing) + 1`.
         #[arg(long)]
         id: Option<u32>,
+        /// Output format. `json` emits `{"status":"created|exists","id":…,"path":…}`
+        /// on a clean stdout (ADR-096 § CMD-001, mirroring init's WIRE-001 shape);
+        /// the default prints the created path with hints on stderr.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
     },
     /// List ingested documents grouped by namespace (ADR-015).
     List {
@@ -273,15 +345,25 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Rich)]
         format: Format,
     },
-    /// Report the project's pipeline position (SPEC-002): the resolved
-    /// namespace DAG, per-stage verdicts, the current position, any
-    /// open-BUG blockers, and the next action.
+    /// Report the work queue (ADR-118): per-document readiness over the
+    /// `depends_on` graph — what can be picked up now, what is waiting on
+    /// what, and what is finished.
     Status {
-        /// Output format. `text` is the human table; `json` emits the
-        /// SPEC-002 § Data model object for agent routers; `mermaid` and
-        /// `dot` emit DAG diagram source (output only, not rendered).
+        /// Output format. `text` is the census plus the ready/blocked
+        /// lists; `json` emits one row per document for agent routers;
+        /// `mermaid` and `dot` emit graph source (output only, not
+        /// rendered).
         #[arg(long, value_enum, default_value_t = StatusFormat::Text)]
         format: StatusFormat,
+        /// Which graph the `mermaid` and `dot` formats draw (ADR-108).
+        /// Since ADR-118 there is only one: `doc`, the document
+        /// `depends_on` graph, one node per counted document coloured by
+        /// readiness. The flag is retained as a no-op so existing
+        /// `--granularity doc` invocations keep working; `namespace` is
+        /// rejected (exit 2) rather than silently redirected, because it
+        /// named the deleted stage DAG.
+        #[arg(long, value_enum, default_value_t = Granularity::Doc)]
+        granularity: Granularity,
         /// Scope to one feature's lineage: the transitive dependents of
         /// `<ID>` over the `depends_on` graph (every document that
         /// transitively depends on `<ID>`, plus `<ID>` itself). A graph
@@ -289,16 +371,31 @@ enum Cmd {
         /// global view is reported (SPEC-003 ADR-059).
         #[arg(long, value_name = "ID")]
         lineage: Option<String>,
-        /// Project the done-signal onto the process exit (ADR-056): exit
-        /// `0` only when the selected frontier is empty and there are no
-        /// blockers, `1` otherwise, `2` on config/cycle error. The report
-        /// body is still printed; no file is modified. Composes with
-        /// `--lineage` for a per-feature done-gate.
+        /// Project the done-signal onto the process exit (ADR-056, redefined
+        /// by ADR-118 § STG-004): exit `0` when no document in scope is
+        /// blocked by a non-terminal dependency, `1` otherwise, `2` on
+        /// config error. The report body is still printed; no file is
+        /// modified. Composes with `--lineage` for a per-feature gate —
+        /// which under the removed stage layer could not pass at all
+        /// (`BUG-036` R2).
         #[arg(long)]
         exit_code: bool,
     },
     /// Start the Language Server Protocol (LSP) server over stdio.
     Lsp,
+    /// Serve a read-only, graph-aware web view of the governed docs (ADR-097).
+    ///
+    /// Starts a localhost HTTP server rendering the namespace index,
+    /// per-doc pages (server-side markdown), clickable `depends_on`
+    /// edges, and the `status` pipeline. Read-only, loopback only. Prints
+    /// one `{"url":…}` line to stdout (SRV-006) so an agent can discover
+    /// the bound port; logs go to stderr.
+    Serve {
+        /// TCP port to bind on `127.0.0.1`. The default `0` lets the OS
+        /// assign a free port, reported in the stdout `{"url":…}` line.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
     /// Manage git hooks that gate commits on ctxgrd (ADR-014).
     Hooks {
         #[command(subcommand)]
@@ -338,26 +435,47 @@ enum Cmd {
         /// this the bless refuses, since HEAD would exclude those edits.
         #[arg(long)]
         force: bool,
+        /// Output format. `json` emits `{"status":"blessed","id":…,"pin":…}`
+        /// on a clean stdout (ADR-096 § CMD-001); the default prints the
+        /// human summary.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum HooksAction {
     /// Install a pre-commit hook that runs `ctxgrd` before each commit.
+    ///
+    /// Installs a composable `.githooks/pre-commit.d/10-ctxgrd` fragment and
+    /// sets `core.hooksPath .githooks` (ADR-014 § HOOK-010), composing with a
+    /// sibling `*grd` tool's gate rather than claiming the single hook slot.
     Install {
-        /// Overwrite an existing `.git/hooks/pre-commit`.
+        /// Retained for back-compat; the composable drop-in never clobbers a
+        /// foreign fragment, so this is a no-op.
         #[arg(long)]
         force: bool,
-        /// Print the hook script instead of writing it.
+        /// Print what would be installed instead of writing it.
         #[arg(long)]
         dry_run: bool,
+        /// Output format. `json` emits `{"status":"installed|exists|would-install",
+        /// "path":…}` on a clean stdout (ADR-096 § CMD-001); the default prints
+        /// the human summary.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
     },
     /// Print the Claude Code `Stop`-hook wiring (turn-end lint gate,
     /// ADR-062) and report whether it is already installed. Print-and-
     /// detect only: it never writes settings.json — that file is shared,
     /// user-global agent config, and clobbering it could drop unrelated
     /// hooks (STOP-004).
-    Claude,
+    Claude {
+        /// Output format. `json` emits `{"installed":bool,"wiring":…}` on a
+        /// clean stdout (ADR-096 § CMD-003); the default prints the wiring
+        /// block and detect result for a human.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -368,11 +486,21 @@ enum PackAction {
         /// advertises instead of the discoverable free ones (ADR-045).
         #[arg(long)]
         paid: bool,
+        /// Output format. `json` emits the pack catalog as an array of
+        /// `{"name":…,"namespaces":[…]}` objects (ADR-086 § WIRE-001);
+        /// the default is the human table.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
     },
     /// Show the namespaces, rules, and scripts a pack defines.
     Show {
         /// Pack name, e.g. `project-docs`.
         name: String,
+        /// Output format. `json` emits the pack detail object — namespaces,
+        /// per-namespace rules, and the aggregate `rules` array of every bound
+        /// code (ADR-096 § CMD-002); the default is the human view.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
     },
     /// Apply a pack: append its blocks to ctxgrd.toml, never clobbering
     /// an existing namespace. Copies any bundled rule scripts.
@@ -382,6 +510,11 @@ enum PackAction {
         /// Print the config that would be written and exit, touching no file.
         #[arg(long)]
         dry_run: bool,
+        /// Output format. `json` emits `{"status":…,"namespaces_added":[…],
+        /// "path":…}` on a clean stdout (ADR-096 § CMD-001); the default prints
+        /// the human receipt.
+        #[arg(long, value_enum, default_value_t = Format::Rich)]
+        format: Format,
     },
     /// Report pack-definition drift: blocks whose pack shape has evolved
     /// since they were generated (ADR-053 § PKM-004). Read-only; exit 1
@@ -424,58 +557,64 @@ fn main() -> ExitCode {
     }
 }
 
+/// Resolve the root every command runs against (BUG-048).
+///
+/// `--root <dir>` means exactly that directory and never searches. With
+/// no flag, walk up from the working directory to the nearest
+/// `ctxgrd.toml`; with none anywhere above, fall back to the working
+/// directory, where the zero-config path takes over and announces itself.
+///
+/// `init` is exempt and always gets the working directory. It *writes*
+/// `<root>/ctxgrd.toml` and `--force` overwrites without prompting, so an
+/// upward search would turn `ctxgrd init --force` in `docs/adrs/` into a
+/// silent overwrite of the repository's config. Every other command reads
+/// the config, where finding the real one is the whole point.
+///
+/// `--recursive` composes on top rather than against: the upward search
+/// picks the root, then `-r` descends from there. So `ctxgrd -r` in a
+/// monorepo subdirectory now lints the monorepo, not the subtree.
+fn resolve_root(explicit: Option<PathBuf>, is_init: bool) -> PathBuf {
+    let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match explicit {
+        Some(dir) => dir,
+        None if is_init => cwd(),
+        None => {
+            let here = cwd();
+            ctxgrd::config::find_project_root(&here).unwrap_or(here)
+        }
+    }
+}
+
 fn dispatch() -> Result<ExitCode> {
     let cli = Cli::parse();
-    // No subcommand → the top-level flattened lint flags ARE the
-    // command (clap's `args_conflicts_with_subcommands` default).
-    match cli.command.unwrap_or(Cmd::Lint { args: cli.lint }) {
-        Cmd::Lint { args } => {
-            if let Some(name) = args.harness.as_deref() {
-                // The `--harness` axis: resolve the name to a known harness,
-                // then emit its turn-end decision. An unknown name is misuse
-                // (exit 2), not a silent fallback to serialising.
-                let Some(harness) = lint::Harness::from_name(name) else {
-                    let d = Diagnostic::error(
-                        "cli.bad-harness",
-                        "",
-                        0,
-                        0,
-                        format!("unknown harness '{name}'"),
-                    )
-                    .with_help("the only harness is `claude` — see `ctxgrd hooks claude`");
-                    emit_error(&d, &cli.root);
-                    return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
-                };
-                // STOP-001/003: the Stop gate lints a single root. Pairing it
-                // with --recursive (multi-config) has no meaning, so reject
-                // rather than silently lint only one.
-                if args.recursive {
-                    let d = Diagnostic::error(
-                        "cli.bad-harness",
-                        "",
-                        0,
-                        0,
-                        "`--harness` cannot combine with --recursive".to_string(),
-                    )
-                    .with_help("the harness gate lints a single root — drop --recursive");
-                    emit_error(&d, &cli.root);
-                    return Ok(ExitCode::from(run::ExitStatus::KernelError.code()));
-                }
-                match harness {
-                    lint::Harness::Claude => lint::lint_claude_stop_cmd(&cli.root),
-                }
-            } else if args.recursive {
-                lint::lint_recursive_cmd(&cli.root, args.format)
-            } else {
-                lint::lint_cmd(&cli.root, args.format)
-            }
-        }
+    let is_init = matches!(cli.command, Some(Cmd::Init { .. }));
+    let ctx = Ctx {
+        root: resolve_root(cli.root, is_init),
+    };
+    // No subcommand → the top-level flattened lint flags ARE the command.
+    //
+    // Every arm builds its command type and routes through the single
+    // `command::emit`, which owns the machine-stream JSON render (ENF-004) and
+    // the one `Outcome`/`KernelError` → exit-code map (ENF-003). No arm returns
+    // a bare exit code.
+    let exit = match cli.command.unwrap_or(Cmd::Lint { args: cli.lint }) {
+        Cmd::Lint { args } => emit(lint::LintCmd { args }, &ctx),
         Cmd::Init {
             namespaces,
             force,
             stdout,
             pack,
-        } => scaffold::init_cmd(&cli.root, &namespaces, force, stdout, &pack),
+            format,
+        } => emit(
+            scaffold::InitCmd {
+                namespaces,
+                force,
+                to_stdout: stdout,
+                packs: pack,
+                format,
+            },
+            &ctx,
+        ),
         Cmd::New {
             namespace,
             title,
@@ -483,60 +622,124 @@ fn dispatch() -> Result<ExitCode> {
             out,
             stdout,
             id,
+            format,
         } => {
             if namespace.eq_ignore_ascii_case("rule") {
-                scaffold::new_rule_cmd(
-                    &cli.root,
-                    &title,
-                    description.as_deref(),
-                    out.as_deref(),
-                    stdout,
+                emit(
+                    scaffold::NewRuleCmd {
+                        code: title,
+                        description,
+                        out,
+                        to_stdout: stdout,
+                    },
+                    &ctx,
                 )
             } else {
-                scaffold::new_cmd(&cli.root, &namespace, &title, out.as_deref(), stdout, id)
+                emit(
+                    scaffold::NewDocCmd {
+                        namespace,
+                        title,
+                        out,
+                        to_stdout: stdout,
+                        id_override: id,
+                        format,
+                    },
+                    &ctx,
+                )
             }
         }
         Cmd::Rules {
             namespace,
             format,
             rule_code,
-        } => introspect::rules_cmd(
-            &cli.root,
-            namespace.as_deref(),
-            rule_code.as_deref(),
-            format,
+        } => emit(
+            introspect::RulesCmd {
+                namespace,
+                rule_code,
+                format,
+            },
+            &ctx,
         ),
         Cmd::List { namespace, format } => {
-            introspect::list_cmd(&cli.root, namespace.as_deref(), format)
+            emit(introspect::ListCmd { namespace, format }, &ctx)
         }
-        Cmd::Docs { topic } => introspect::docs_cmd(topic.as_deref()),
-        Cmd::Refs { id, format } => introspect::refs_cmd(&cli.root, &id, format),
+        Cmd::Docs { topic } => emit(introspect::DocsCmd { topic }, &ctx),
+        Cmd::Refs { id, format } => emit(introspect::RefsCmd { id, format }, &ctx),
         Cmd::Status {
             format,
+            granularity,
             lineage,
             exit_code,
-        } => introspect::status_cmd(&cli.root, format, lineage.as_deref(), exit_code),
-        Cmd::Lsp => pin::lsp_cmd(),
+        } => emit(
+            introspect::StatusCmd {
+                format,
+                granularity,
+                lineage,
+                exit_code,
+            },
+            &ctx,
+        ),
+        Cmd::Lsp => emit(pin::LspCmd, &ctx),
+        Cmd::Serve { port } => emit(serve::ServeCmd { port }, &ctx),
         Cmd::Hooks { action } => match action {
-            HooksAction::Install { force, dry_run } => {
-                hooks::hooks_install_cmd(&cli.root, force, dry_run)
-            }
-            HooksAction::Claude => hooks::hooks_claude_cmd(&cli.root),
+            HooksAction::Install {
+                force,
+                dry_run,
+                format,
+            } => emit(
+                hooks::HooksInstallCmd {
+                    force,
+                    dry_run,
+                    format,
+                },
+                &ctx,
+            ),
+            HooksAction::Claude { format } => emit(hooks::HooksClaudeCmd { format }, &ctx),
         },
         Cmd::Pack { action } => match action {
-            PackAction::List { paid } => pack::pack_list_cmd(&cli.root, paid),
-            PackAction::Show { name } => pack::pack_show_cmd(&cli.root, &name),
-            PackAction::Add { name, dry_run } => pack::pack_add_cmd(&cli.root, &name, dry_run),
-            PackAction::Outdated { format } => pack::pack_outdated_cmd(&cli.root, format),
+            PackAction::List { paid, format } => emit(pack::PackListCmd { paid, format }, &ctx),
+            PackAction::Show { name, format } => emit(pack::PackShowCmd { name, format }, &ctx),
+            PackAction::Add {
+                name,
+                dry_run,
+                format,
+            } => emit(
+                pack::PackAddCmd {
+                    name,
+                    dry_run,
+                    format,
+                },
+                &ctx,
+            ),
+            PackAction::Outdated { format } => emit(pack::PackOutdatedCmd { format }, &ctx),
             PackAction::Migrate { dry_run, format } => {
-                pack::pack_migrate_cmd(&cli.root, dry_run, format)
+                emit(pack::PackMigrateCmd { dry_run, format }, &ctx)
             }
         },
         Cmd::Changelog {
             write,
             check,
             format,
-        } => changelog::changelog_cmd(&cli.root, write, check, format),
-        Cmd::Pin { bless, force } => pin::pin_bless_cmd(&cli.root, &bless, force),
-    }
+        } => emit(
+            changelog::ChangelogCmd {
+                write,
+                check,
+                format,
+            },
+            &ctx,
+        ),
+        Cmd::Pin {
+            bless,
+            force,
+            format,
+        } => emit(
+            pin::PinCmd {
+                target_id: bless,
+                force,
+                format,
+            },
+            &ctx,
+        ),
+    };
+    Ok(exit)
 }

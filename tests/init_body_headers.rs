@@ -175,19 +175,21 @@ fn init_lists_available_packs_with_add_instruction() {
         .output()
         .expect("ctxgrd executes");
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    // ADR-086 § WIRE-007: the adoption on-ramp is guidance, so it now
+    // rides stderr — stdout carries only the `Created  <path>` line.
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
     assert_eq!(output.status.code(), Some(0));
     assert!(
-        stdout.contains("Available packs:"),
-        "init shows available-packs header; stdout was:\n{stdout}"
+        stderr.contains("Available packs:"),
+        "init shows available-packs header on stderr; stderr was:\n{stderr}"
     );
     assert!(
-        stdout.contains("ctxgrd pack add <name>"),
-        "init shows pack-add instruction in Next steps; stdout was:\n{stdout}"
+        stderr.contains("ctxgrd pack add <name>"),
+        "init shows pack-add instruction in Next steps on stderr; stderr was:\n{stderr}"
     );
     assert!(
-        stdout.contains("project-docs") && stdout.contains("agents"),
-        "init lists both built-in packs; stdout was:\n{stdout}"
+        stderr.contains("project-docs") && stderr.contains("agents"),
+        "init lists both built-in packs on stderr; stderr was:\n{stderr}"
     );
 }
 

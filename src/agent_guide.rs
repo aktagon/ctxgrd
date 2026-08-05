@@ -35,6 +35,7 @@
 //!   order, with no other H2s. Now/Next/Later each require ≥1 open
 //!   `- [ ]` item; Done must contain only completed `- [x]` items.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -68,14 +69,21 @@ const CHECKLIST_COMPLETE: &str = "checklist.complete";
 const CHECKLIST_PINNED: &str = "checklist.pinned";
 const REQUIRED_HEADINGS: &str = "core.required-headings";
 const REQUIRED_ANCHORS: &str = "core.required-anchors";
+const FILE_BUDGET: &str = "core.file-budget";
+/// Default `core.file-budget` ceiling (ADR-109 § BDG-002) — Claude Code's
+/// own read-time warning threshold, so a bare binding reproduces the
+/// warning the reader already gives rather than inventing a number.
+const DEFAULT_MAX_CHARS: u64 = 150_000;
 /// Below this many characters, an agent `description` is unlikely to carry
 /// enough signal for reliable auto-delegation (warning). Shared default for
 /// `agent.frontmatter` and `opencode.frontmatter`.
 const AGENT_DESC_MIN_CHARS: usize = 40;
 const DEP_SHAPE: &str = "core.dep-shape";
+const FILE_NAME: &str = "core.file-name";
 const TODO_LISTED: &str = "todo.listed";
 const DESIGN_SECTION_ORDER: &str = "design.section-order";
 const DESIGN_TOKEN_REF: &str = "design.token-ref";
+const PRODUCT_REGISTER: &str = "product.register";
 const EARS_SYNTAX: &str = "ears.clause-syntax";
 const STYLE_SECTION_ORDER: &str = "style.section-order";
 const STYLE_SOUL_PAIR: &str = "style.soul-pair";
@@ -93,13 +101,31 @@ const SAFEGUARD_EVIDENCE: &str = "hipaa.safeguard-evidence";
 const CONTROL_EVIDENCE: &str = "soc2.control-evidence";
 const ISO_CONTROL_EVIDENCE: &str = "iso27001.control-evidence";
 const NIST_CONTROL_EVIDENCE: &str = "nist.control-evidence";
+const EVIDENCE_LINK: &str = "core.evidence-link";
 const ACCEPTANCE_COMPLETE: &str = "core.acceptance-complete";
 const CONTEXT_MAP_SHAPE: &str = "ddd.context-map-shape";
+const RESEARCH_EVIDENCE: &str = "research.evidence";
+const TEST_COMPLETION: &str = "test.completion";
+const MARKETING_FM: &str = "marketing.frontmatter";
+const AI_FINGERPRINTS: &str = "writing.ai-fingerprints";
 
 /// Default acceptance heading names the `core.acceptance-complete` scan
 /// covers when the `headings` param is absent (ADR-056 § EARS-02). Matched
 /// case-insensitively via [`normalize_heading`].
 const DEFAULT_ACCEPTANCE_HEADINGS: &[&str] = &["acceptance", "definition of done"];
+
+/// Default evidence/sources synonym set for `research.evidence` (ADR-093
+/// § RSR-002). A section "exists" when some H2/H3 heading's normalized text
+/// *contains* any of these tokens. Overridable via the `evidence_headings`
+/// config param; `[]` disables the evidence half.
+const DEFAULT_EVIDENCE_HEADINGS: &[&str] = &["evidence", "sources", "references", "appendix"];
+/// Default limitations/data-gaps synonym set for `research.evidence`
+/// (RSR-002). Overridable via `gaps_headings`; `[]` disables the gaps half.
+const DEFAULT_GAPS_HEADINGS: &[&str] = &["data gap", "limitation", "assumption", "caveat"];
+/// The closed `research.type` genre vocabulary (RSR-005) — a fixed taxonomy
+/// tied to the field (like Diátaxis), not a volatile allowlist, so it is a
+/// compiled `const` rather than a config param.
+pub(crate) const RESEARCH_TYPES: &[&str] = &["academic", "market", "deep-research"];
 
 const DEFAULT_STALE_DAYS: i64 = 30;
 /// Generous default word budget for an always-loaded instruction file
@@ -141,7 +167,12 @@ pub(crate) fn scan_file_level(
         else {
             continue;
         };
-        let body = std::fs::read_to_string(&path)?;
+        // A file we cannot read (or decode) is skipped here, not an
+        // abort: the markdown scan already anchored a per-file
+        // `src.markdown-read` diagnostic on it (BUG-024).
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let doc = synthetic_document(&ns, location, body);
         let ns_cfg = config.namespace_config(&ns);
         for code in &ns_cfg.rules {
@@ -155,6 +186,10 @@ pub(crate) fn scan_file_level(
         // summary counts (finding #3).
         scan.files_linted += 1;
         scan.namespaces.insert(ns);
+        // Retain the synthetic document itself (ADR-103 § SRF-001):
+        // `serve` renders these files from the exact set the scan linted,
+        // keyed by `location`. `lint` ignores the field.
+        scan.documents.push(doc);
     }
     Ok(scan)
 }
@@ -171,6 +206,12 @@ pub(crate) struct FileLevelScan {
     /// Namespaces those singletons were claimed under — folded into the
     /// `rules_active` sum so their rules show in the summary.
     pub(crate) namespaces: std::collections::BTreeSet<String>,
+    /// The synthetic [`Document`] built for each linted singleton, in
+    /// walk order (ADR-103 § SRF-001). `serve` renders file-level pages
+    /// from this set, keyed by `location` — the same inventory the rules
+    /// above just linted, with no second walk or re-parse. Their `id` is
+    /// the `<NS>-0` placeholder and `raw_id` is empty.
+    pub(crate) documents: Vec<Document>,
 }
 
 /// Dispatch for *file-level* builtin-compiled rules. Derived from
@@ -268,7 +309,7 @@ pub(crate) fn check_context_headings(
                 .with_help(format!(
                     "replace the import with a lazy link, e.g. `{}` — the file is read on \
                      demand instead of being pulled into the always-loaded prefix",
-                    suggested_todo_link(doc)
+                    suggested_link(doc, "TODO.md")
                 ))
                 .with_note(
                     "an `@import` pays TODO.md's full token cost every session, used or not; \
@@ -291,7 +332,7 @@ pub(crate) fn check_context_headings(
                 .with_help(format!(
                     "add a lazy link on its own line, e.g. `{}`, so the state stays \
                      discoverable without inflating the per-session prefix",
-                    suggested_todo_link(doc)
+                    suggested_link(doc, "TODO.md")
                 ))
                 .with_note(
                     "use a plain link (read on demand), not an `@TODO.md` import (eager — \
@@ -309,8 +350,16 @@ pub(crate) fn check_context_headings(
 /// rule) to the root `TODO.md` at `todo`. This is the *eager* form the
 /// rule now warns on (ADR-036): the import pulls TODO.md into the
 /// session prefix on every turn.
+///
+/// Scans the *wide* grammar ([`wide_import_paths`]), not the own-line
+/// [`import_paths`] (BUG-029). The question this check asks is "does the
+/// reader load TODO.md", so it must model what Claude Code resolves — and
+/// Claude Code resolves a mid-sentence `@TODO.md` exactly as it resolves an
+/// own-line one. Under the narrow grammar an inline import was invisible
+/// here and the caller fell through to the "does not link to it" error,
+/// reporting an unreachable file that was in fact loaded every turn.
 fn references_root_todo_import(doc: &Document, root: &Path, todo: &Path) -> bool {
-    import_resolves_to(doc, root, todo)
+    any_path_resolves_to(wide_import_paths(doc), doc, root, todo)
 }
 
 /// True when a markdown link in `doc` resolves (file-relatively, like the
@@ -330,13 +379,26 @@ fn references_root_todo_link(doc: &Document, root: &Path, todo: &Path) -> bool {
 /// check `is_file()`), so an import that fails to canonicalize is dangling
 /// and cannot match — the budget rule reports that separately.
 fn import_resolves_to(doc: &Document, root: &Path, target: &Path) -> bool {
+    any_path_resolves_to(import_paths(doc), doc, root, target)
+}
+
+/// True when any of `paths` — read from `doc` and resolved relative to
+/// `doc`'s own directory — canonicalizes to `target`. The shared tail of
+/// the import and link checks: they differ only in which token set they
+/// hand in, never in how a path is resolved.
+fn any_path_resolves_to<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    doc: &Document,
+    root: &Path,
+    target: &Path,
+) -> bool {
     let dir = root.join(&doc.location);
     let dir = dir.parent().unwrap_or(root);
     let Ok(target) = std::fs::canonicalize(target) else {
         return false;
     };
-    import_paths(doc)
-        .iter()
+    paths
+        .into_iter()
         .filter_map(|p| std::fs::canonicalize(dir.join(p)).ok())
         .any(|resolved| resolved == target)
 }
@@ -350,20 +412,15 @@ fn import_resolves_to(doc: &Document, root: &Path, target: &Path) -> bool {
 /// strictness `import_paths` applies to the eager form. A `#fragment` or
 /// `?query` suffix is stripped before resolving.
 fn link_resolves_to(doc: &Document, root: &Path, target: &Path) -> bool {
-    let dir = root.join(&doc.location);
-    let dir = dir.parent().unwrap_or(root);
-    let Ok(target) = std::fs::canonicalize(target) else {
-        return false;
-    };
     let Some(ast) = doc.ast.as_ref() else {
         return false;
     };
-    ast.links
+    let hrefs = ast
+        .links
         .iter()
         .map(|link| link.href.split(['#', '?']).next().unwrap_or(&link.href))
-        .filter(|href| !href.is_empty())
-        .filter_map(|href| std::fs::canonicalize(dir.join(href)).ok())
-        .any(|resolved| resolved == target)
+        .filter(|href| !href.is_empty());
+    any_path_resolves_to(hrefs, doc, root, target)
 }
 
 /// `core.requires-link` (ADR-046 § RRF-001): a generic, namespace-agnostic
@@ -407,9 +464,15 @@ pub(crate) fn check_requires_link(
         }
         let message =
             format!("a {target} exists but this file does not reference it");
+        // `target` is root-relative; the reference forms below are resolved
+        // relative to this document, so both are rendered at the document's
+        // depth. Interpolating the raw `target` suggests a link that cannot
+        // satisfy the rule for any document below the root (BUG-035).
+        let relative = target_relative_to_doc(doc, target);
         let help = format!(
-            "add a reference to {target} — a markdown link `[{target}]({target})` or an \
-             `@{target}` import; the path resolves relative to this file"
+            "add a reference to {target} — a markdown link `{}` or an \
+             `@{relative}` import; the path resolves relative to this file",
+            suggested_link(doc, target)
         );
         let diag = if as_error {
             Diagnostic::error(REQUIRES_LINK, doc.location.clone(), 0, 0, message)
@@ -421,17 +484,31 @@ pub(crate) fn check_requires_link(
     out
 }
 
-/// The lazy markdown link a given instruction file should carry to the
-/// root `TODO.md`, with `../` segments for its directory depth below the
-/// root. A root-level `CLAUDE.md` yields `[TODO.md](TODO.md)`; a nested
-/// `cli/CLAUDE.md` yields `[TODO.md](../TODO.md)`.
-fn suggested_todo_link(doc: &Document) -> String {
+/// The lazy markdown link a given document should carry to a
+/// root-relative `target`. A root-level `CLAUDE.md` yields
+/// `[TODO.md](TODO.md)`; a nested `cli/CLAUDE.md` yields
+/// `[TODO.md](../TODO.md)`.
+///
+/// Shared by the `TODO.md` check (ADR-020 § ACX-005) and by
+/// `core.requires-link`, the rule generalised out of it: both compare
+/// targets resolved against the root against references resolved against
+/// the *document*, so any suggestion they render must be re-based for the
+/// document's depth or it cannot satisfy the check it is suggested for
+/// (BUG-035).
+fn suggested_link(doc: &Document, target: &str) -> String {
+    format!("[{target}]({})", target_relative_to_doc(doc, target))
+}
+
+/// A root-relative `target` re-expressed relative to `doc`'s own
+/// directory, by prefixing one `../` per directory level `doc` sits below
+/// the root. Depth 0 returns `target` unchanged, so a root-level document's
+/// suggestion is exactly what it was before this was depth-aware.
+fn target_relative_to_doc(doc: &Document, target: &str) -> String {
     let depth = Path::new(&doc.location)
         .parent()
         .map(|p| p.components().count())
         .unwrap_or(0);
-    let prefix = "../".repeat(depth);
-    format!("[TODO.md]({prefix}TODO.md)")
+    format!("{}{target}", "../".repeat(depth))
 }
 
 /// Import paths declared on their own line — the first non-whitespace
@@ -440,11 +517,17 @@ fn suggested_todo_link(doc: &Document) -> String {
 /// import and must not satisfy `agents.context-headings` (finding #1).
 /// Lines inside fenced/indented code blocks are excluded (BUG-006).
 ///
-/// Token grammar note (BUG-004): this is deliberately a *subset* of the
-/// grammar `dangling_import_diags` scans. Claude Code resolves any
-/// word-starting `@path` token outside code, so the budget rule warns on
-/// dangling *inline* imports too; this rule enforces the canonical
-/// own-line form as a convention (visible, greppable, diff-friendly).
+/// Token grammar note (BUG-004, revised by BUG-029): this is deliberately
+/// a *subset* of [`wide_import_paths`], the grammar Claude Code actually
+/// resolves. Two grammars, two jobs — pick by the question being asked:
+///
+/// - "does the reader load this file?" → [`wide_import_paths`]. Anything
+///   that models the token cost or the reader's behaviour must use it.
+/// - "is this written in the canonical form?" → this one. Only a
+///   convention check, where own-line (visible, greppable, diff-friendly)
+///   is the point, may narrow to it.
+///
+/// `core.requires-link` is the remaining caller, via [`import_resolves_to`].
 fn import_paths(doc: &Document) -> Vec<&str> {
     doc.body
         .lines()
@@ -516,6 +599,57 @@ pub(crate) fn check_context_cache(
 fn dangling_import_diags(doc: &Document, root: &Path) -> Vec<Diagnostic> {
     let base = root.join(&doc.location);
     let dir = base.parent().unwrap_or(root);
+    wide_import_paths(doc)
+        .into_iter()
+        .filter(|path| !dir.join(path).exists())
+        .map(|path| {
+            Diagnostic::warning(
+                BUDGET,
+                doc.location.clone(),
+                0,
+                0,
+                format!("`@{path}` import points to a file that does not exist"),
+            )
+            .with_help(format!(
+                "create `{path}` or remove the `@{path}` import — a dangling import drops that context"
+            ))
+        })
+        .collect()
+}
+
+/// Every `@<path>` token in `doc` that Claude Code would resolve as an
+/// import, deduplicated, in first-appearance order.
+///
+/// This is the grammar of the *reader*, and the one any rule reasoning
+/// about loaded context must use (BUG-029). A token counts when it
+/// (a) starts a word, so an email like `a@b.com` is skipped, (b) contains
+/// a `.`, so it is file-like, and (c) is repo-relative — `~/…` and `/…`
+/// are unresolvable from here. Position on the line is irrelevant: an
+/// inline `see @TODO.md` is as eager as an own-line `@TODO.md`.
+///
+/// Fenced/indented code blocks are excluded: a fence is how documentation
+/// shows a literal example, and a markdown fence containing `@TODO.md` is
+/// demonstrating the syntax, not importing (BUG-006).
+///
+/// Inline code spans are **not** excluded (BUG-029 follow-up). BUG-006
+/// masked them on the premise that Claude Code skips backticked tokens,
+/// but its observed evidence was a fenced Python decorator (`@mcp.tool(`)
+/// — the inline half was asserted alongside it, never measured. Treating a
+/// backticked `@TODO.md` as inert is the same false negative this scanner
+/// was widened to kill: if the reader loads it, the linter must see it.
+/// Measured cost of unmasking, over every `CLAUDE.md` / `AGENTS.md` /
+/// `GEMINI.md` in the ~90-repo fleet: one hit,
+/// `` `Contributed by @username` ``, which the file-like filter drops
+/// anyway for having no `.`.
+///
+/// Prose *about* an import stays clean through the token grammar instead:
+/// a backtick sitting directly against the `@` is not whitespace, so
+/// `` `@TODO.md` `` — the form real documentation writes, including this
+/// repo's own `CLAUDE.md` — never matches to begin with.
+///
+/// Extracted from `dangling_import_diags` so the dangling-import warning
+/// and the eager-import warning can never drift apart again.
+fn wide_import_paths(doc: &Document) -> Vec<&str> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for (idx, line_text) in doc.body.lines().enumerate() {
@@ -525,38 +659,25 @@ fn dangling_import_diags(doc: &Document, root: &Path) -> Vec<Diagnostic> {
         }
         for caps in import_regex().captures_iter(line_text) {
             let m = caps.get(1).expect("import_regex has one capture group");
-            let col = u32::try_from(m.start() + 1).unwrap_or(u32::MAX);
-            if in_inline_code(doc, line_no, col) {
-                continue;
-            }
             // Strip trailing sentence punctuation that the token grabbed
             // (`@x.md.` / `@x.md,` / `(@x.md)`), so it neither corrupts the
             // path nor makes a dotless word like `@internal.` look file-like.
+            //
+            // The backtick is in the set because inline code spans are no
+            // longer masked (BUG-029 follow-up): a token ending a span
+            // arrives as `x.md\``, which resolves to nothing and would have
+            // made the unmasking silently inert.
             let path = m.as_str().trim_end_matches(|c: char| {
                 matches!(
                     c,
-                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'' | '>'
+                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'' | '>' | '`'
                 )
             });
             if path.starts_with('~') || path.starts_with('/') || !path.contains('.') {
                 continue;
             }
-            if !seen.insert(path.to_string()) {
-                continue;
-            }
-            if !dir.join(path).exists() {
-                out.push(
-                    Diagnostic::warning(
-                        BUDGET,
-                        doc.location.clone(),
-                        0,
-                        0,
-                        format!("`@{path}` import points to a file that does not exist"),
-                    )
-                    .with_help(format!(
-                        "create `{path}` or remove the `@{path}` import — a dangling import drops that context"
-                    )),
-                );
+            if seen.insert(path) {
+                out.push(path);
             }
         }
     }
@@ -1095,8 +1216,96 @@ pub(crate) fn check_acceptance_complete(
             diag.severity = severity;
             out.push(diag);
         }
+
+        // `require_checkboxes` (ADR-122 § ACC-006). The scan above can only
+        // see GFM task items, so a section written as prose bullets is
+        // invisible to it — the document reports clean because nothing is
+        // *checkable*, not because everything is done. That is the ADR-119
+        // invariant at the item level, and it is the dominant case: 94 of this
+        // repo's 119 terminal ADRs write Open Questions as prose.
+        //
+        // Off by default, so no existing config tightens. Where a namespace
+        // turns it on, an unchecked box is still the error above; this adds
+        // "and the items must be boxes in the first place".
+        if !require_checkboxes(params) {
+            continue;
+        }
+        for (i, line) in lines.iter().enumerate().take(end).skip(start) {
+            let line_no = (i + 1) as u32;
+            // A `- ` inside a fenced example is YAML, TOML or shell — not a
+            // question anyone can answer with a checkbox. Without this the
+            // diagnostic is unfixable: the author's only remedy is to delete
+            // their example, and the rule ships ON by default in the
+            // project-docs pack, so every consumer inherits it.
+            if in_code_block(doc, line_no) {
+                continue;
+            }
+            // Top-level list items only (no leading indentation). A nested
+            // bullet under a task item is elaboration on that item, not a
+            // separate question, and flagging it would punish detail.
+            if !top_level_list_item_regex().is_match(line) || checklist_regex().is_match(line) {
+                continue;
+            }
+            // `- - -` and `* * *` are CommonMark thematic breaks, not list
+            // items, but they satisfy the bullet pattern. (`---` / `***` have
+            // no whitespace and never matched.)
+            if thematic_break_regex().is_match(line) {
+                continue;
+            }
+            let mut diag = Diagnostic::error(
+                ACCEPTANCE_COMPLETE,
+                doc.location.clone(),
+                (i + 1) as u32,
+                0,
+                format!(
+                    "{}: item under `{display}` is a prose bullet, not a checkbox — a \
+                     `{status}` document cannot be shown to have resolved it",
+                    doc.raw_id
+                ),
+            )
+            .with_help(
+                "write the item as `- [ ]` while it is open and `- [x]` once it is resolved, \
+                 so completeness is checkable rather than asserted",
+            );
+            diag.severity = severity;
+            out.push(diag);
+        }
     }
     out
+}
+
+/// The `require_checkboxes` param (ADR-122 § ACC-006), default `false`.
+fn require_checkboxes(params: Option<&Value>) -> bool {
+    params
+        .and_then(|p| p.get("require_checkboxes"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// A list item at column 0 — no leading whitespace, so nested elaboration
+/// under a task item is excluded.
+///
+/// Deliberately narrow: `-` and `*` only, not `+` or `1.`. Widening it
+/// would make previously-clean documents fail, which the versioning policy
+/// calls a MAJOR change — see BUG-055 for the hole this leaves.
+fn top_level_list_item_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[-*]\s+\S").expect("valid regex"))
+}
+
+/// `- - -` / `* * *` — CommonMark thematic breaks that satisfy the
+/// bullet pattern above. Three or more of the same marker separated by
+/// whitespace, and nothing else on the line.
+///
+/// Spelled as three alternations rather than one backreferenced group:
+/// the `regex` crate has no backreferences, so `([-*_])(\s*\1){2,}` is a
+/// *runtime* `Regex::new` failure, not a compile error — it panicked
+/// through `.expect()` on the first document that reached this scan.
+fn thematic_break_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$").expect("valid regex")
+    })
 }
 
 // -- agent.assigned (TASK ownership resolution, ADR-057) --------------
@@ -1865,6 +2074,559 @@ pub(crate) fn check_c4_frontmatter(
     out
 }
 
+// -- MARKETING namespaces (docs/marketing/** by default) -------------------
+
+/// `marketing.frontmatter`: a marketing-strategy doc (CAMPAIGN / PERSONA /
+/// POSITIONING / ICP, path-claimed by the `marketing` pack) MAY declare its
+/// genre with a nested `marketing.type` field; when it does, that value MUST be
+/// one of the pack-supplied `types` allowlist.
+///
+/// Monotonic opt-in (the `research.type` shape, ADR-093, not the frontmatter-
+/// mandatory guide/c4 rules): the field is read from the already-parsed
+/// `doc.metadata` (ingest runs once, ADR-029), so an absent or malformed
+/// frontmatter is simply "no type" — no finding. This is what lets the one
+/// live CAMPAIGN brief, a frontmatter-less placeholder, bind the rule
+/// harmlessly. The field lives under a `marketing` object rather than a
+/// top-level `type:` because `type` is a reserved layout selector in
+/// Hugo/Jekyll/Eleventy (BUG-015) — a nested field a core primitive
+/// (`core.allowed-values`, top-level keys only) cannot validate, which is the
+/// rule's sole reason to exist.
+///
+/// Params (optional):
+/// - `types`: array of accepted `marketing.type` values. Absent → presence-only
+///   (any non-empty value passes). The binary enumerates no vocabulary — the
+///   allowlist is config-driven (the `marketing` pack ships the four genres),
+///   so it never goes stale against a different doc model.
+pub(crate) fn check_marketing_frontmatter(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    // Read the nested discriminator from the parsed metadata (never re-parse).
+    // Absent, empty, or non-string → no type declared → monotonic no-op.
+    let Some(genre) = doc
+        .metadata
+        .get("marketing")
+        .and_then(|m| m.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    // Value check only when the pack pins a non-empty `types` allowlist.
+    let Some(allowed) = params.and_then(|p| p.get("types")).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+    if allowed.is_empty() || allowed.contains(&genre) {
+        return Vec::new();
+    }
+
+    vec![Diagnostic::error(
+        MARKETING_FM,
+        doc.location.clone(),
+        0,
+        0,
+        format!("marketing `marketing.type: {genre}` is not one of the allowed types"),
+    )
+    .with_help(format!(
+        "set `marketing.type` to one of: {}",
+        allowed.join(", ")
+    ))]
+}
+
+// -- writing.ai-fingerprints (AGENTS/CLAUDE/GEMINI instruction files) --------
+//
+// The deterministic half of AI-writing detection (ADR-102). Scans an
+// document's prose for the *mechanically detectable*
+// tells whose presence is the signal — curly quotes/apostrophes, decorative
+// emoji, em/en-dash density, and a small config list of exact chatbot-artifact
+// phrases — and warns (never errors, AIF-001). The semantic tells (tone,
+// significance inflation) and the ambiguous technical words (`seam`,
+// `load-bearing`) stay with the `writing-humanizer` judgment pass (AIF-002).
+//
+// Fingerprints inside code are masked: a curly quote in a shell example or an
+// emoji in a sample is code, not prose (AIF-001). Masking is a per-hit interval
+// test against the parsed AST's code ranges — fenced/indented `code_blocks` mask
+// whole lines, `inline_code_spans` mask byte-column ranges — not a precomputed
+// flag. Columns are 1-indexed byte offsets, matching `byte_to_line_col` and the
+// rest of the reporter. When the AST is absent the maskable classes are skipped
+// (skip-don't-scan) so masking is never silently dropped; phrase matching still
+// runs over the raw body.
+
+const CURLY_DEFAULT: bool = true;
+const EMOJI_DEFAULT: bool = true;
+const DASH_DENSITY_DEFAULT: u64 = 4;
+/// Compiled default phrase list (AIF-005): small and unambiguous — the two
+/// clearest chatbot artifacts. Overridable via the `phrases` config param; an
+/// explicit `[]` disables the phrase class. Deliberately excludes `seam` /
+/// `load-bearing` (AIF-002) and borderline strings like "let me know if".
+const PHRASES_DEFAULT: &[&str] = &["you're absolutely right", "i hope this helps"];
+
+fn is_curly_quote(c: char) -> bool {
+    matches!(c, '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}')
+}
+
+/// True for the clearly-decorative pictograph blocks (emoji). Conservative by
+/// design: excludes the arrow zones that legitimately appear in prose (dingbat
+/// arrows U+2794..=U+27BF and the arrows/stars block U+2B00..=U+2BFF — so `⭐`
+/// and `➕` are not flagged either, an accepted cost of dropping the arrows),
+/// and never matches the dash/quote scalars handled by their own classes.
+fn is_decorative_emoji(c: char) -> bool {
+    matches!(c as u32,
+        0x1F300..=0x1FAFF   // pictographs, emoticons, transport, supplemental, extended-A
+        | 0x1F1E6..=0x1F1FF // regional-indicator flags
+        | 0x2600..=0x2793)  // misc symbols + dingbats (checkmark, cross, sun), below the arrows
+}
+
+/// Zero-width joiner / emoji variation selector — the scalars that stitch a
+/// single visible emoji out of several code points (flags, ZWJ sequences,
+/// skin-tone/VS16 forms). Used only to coalesce an emoji run into one finding.
+fn is_emoji_joiner(c: char) -> bool {
+    matches!(c, '\u{200D}' | '\u{FE0F}')
+}
+
+pub(crate) fn check_ai_fingerprints(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    // Curly/emoji/dash are maskable classes: they need the parsed AST to mask
+    // code spans. Without it, skip them (AIF-001 fallback — skip, don't scan
+    // unmasked); phrases still run over the raw body below.
+    let ast = doc.ast.as_ref();
+    let flag_curly = ast.is_some() && bool_param(params, "flag_curly_quotes", CURLY_DEFAULT);
+    let flag_emoji = ast.is_some() && bool_param(params, "flag_emoji", EMOJI_DEFAULT);
+    let dash_threshold = if ast.is_some() {
+        u64_param(params, "max_em_dashes_per_kwords", DASH_DENSITY_DEFAULT)
+    } else {
+        0
+    };
+    let phrases = phrases_param(params);
+    // YAML frontmatter is metadata, not prose, and the AST does not model it —
+    // skip its lines so a curly apostrophe or em-dash in a title is not flagged
+    // and does not pad the density denominator.
+    let frontmatter_end = frontmatter_end_line(&doc.body);
+
+    let mut out = Vec::new();
+    let mut dash_count: u64 = 0;
+    let mut word_count: u64 = 0;
+    let mut first_dash: Option<(u32, u32)> = None;
+
+    for (line_idx, raw_line) in doc.body.lines().enumerate() {
+        let line_no = u32::try_from(line_idx + 1).unwrap_or(u32::MAX);
+        if line_no <= frontmatter_end || in_code_block(doc, line_no) {
+            continue; // frontmatter or a fenced/indented code line — not prose
+        }
+        // Mask inline `code` by replacing its bytes with spaces (length-
+        // preserving → columns stay exact) via the shared `in_inline_code`
+        // predicate — a per-char test, never a byte-slice, so a multiline
+        // backtick span can never invert a range and panic.
+        let masked = mask_inline_code(doc, line_no, raw_line);
+        let line: &str = &masked;
+        // Density word count splits on whitespace *and* dashes so a no-space
+        // em-dash (`word—word`, standard typography) counts as two words rather
+        // than collapsing into one and inflating the density (AIF-004).
+        word_count += line
+            .split(|c: char| c.is_whitespace() || is_dash(c))
+            .filter(|s| !s.is_empty())
+            .count() as u64;
+        for phrase in &phrases {
+            for byte_off in find_all_ci(line, phrase) {
+                let col = u32::try_from(byte_off + 1).unwrap_or(u32::MAX);
+                out.push(Diagnostic::warning(
+                    AI_FINGERPRINTS,
+                    doc.location.clone(),
+                    line_no,
+                    col,
+                    format!("chatbot-artifact phrase \"{phrase}\" — an AI-writing fingerprint"),
+                ));
+            }
+        }
+        // `in_emoji_run` coalesces a multi-scalar glyph (flag, ZWJ sequence,
+        // skin-tone form) into one finding instead of one per code point.
+        let mut in_emoji_run = false;
+        for (byte_off, c) in line.char_indices() {
+            let col = u32::try_from(byte_off + 1).unwrap_or(u32::MAX);
+            if flag_curly && is_curly_quote(c) {
+                in_emoji_run = false;
+                out.push(
+                    Diagnostic::warning(
+                        AI_FINGERPRINTS,
+                        doc.location.clone(),
+                        line_no,
+                        col,
+                        format!(
+                            "curly '{c}' (U+{:04X}) — an AI-writing fingerprint",
+                            c as u32
+                        ),
+                    )
+                    .with_help("use the straight ASCII quote/apostrophe"),
+                );
+            } else if flag_emoji && is_decorative_emoji(c) {
+                if !in_emoji_run {
+                    out.push(
+                        Diagnostic::warning(
+                            AI_FINGERPRINTS,
+                            doc.location.clone(),
+                            line_no,
+                            col,
+                            format!(
+                                "decorative emoji '{c}' (U+{:04X}) — an AI-writing fingerprint",
+                                c as u32
+                            ),
+                        )
+                        .with_help("remove the emoji from prose"),
+                    );
+                }
+                in_emoji_run = true;
+            } else if in_emoji_run && is_emoji_joiner(c) {
+                // ZWJ / VS16 between emoji scalars — stay in the run, emit nothing.
+            } else {
+                in_emoji_run = false;
+                if dash_threshold > 0 && is_dash(c) {
+                    dash_count += 1;
+                    first_dash.get_or_insert((line_no, col));
+                }
+            }
+        }
+    }
+
+    // Density is a whole-file metric (AIF-004, the one soft/heuristic class):
+    // dashes per 1000 prose words, anchored at the first offending dash.
+    if let Some((line_no, col)) = first_dash {
+        let density = dash_count.saturating_mul(1000) / word_count.max(1);
+        if density > dash_threshold {
+            out.push(Diagnostic::warning(
+                AI_FINGERPRINTS,
+                doc.location.clone(),
+                line_no,
+                col,
+                format!(
+                    "em/en-dash density {density} per 1000 words exceeds {dash_threshold} \
+                     — an AI-writing fingerprint (soft signal; set \
+                     max_em_dashes_per_kwords=0 to disable)"
+                ),
+            ));
+        }
+    }
+    out
+}
+
+fn is_dash(c: char) -> bool {
+    matches!(c, '\u{2014}' | '\u{2013}')
+}
+
+/// Return `line` with every character that `in_inline_code` reports as inside a
+/// backtick span replaced by ASCII spaces. Each character is tested at its own
+/// 1-indexed byte column and replaced by `len_utf8()` spaces, so byte length
+/// (and therefore every column) is preserved and the result is always valid
+/// UTF-8. This is a per-character test rather than a byte-slice, so a multiline
+/// inline span whose `col_end` lands on a later line can never invert a range
+/// and panic — it simply masks whatever this line's columns fall in range.
+fn mask_inline_code(doc: &Document, line_no: u32, line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for (byte_off, c) in line.char_indices() {
+        let col = u32::try_from(byte_off + 1).unwrap_or(u32::MAX);
+        if in_inline_code(doc, line_no, col) {
+            for _ in 0..c.len_utf8() {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The 1-indexed line number of the closing `---` of a leading YAML frontmatter
+/// block, or `0` when the body has no frontmatter (or an unterminated one).
+/// Lines `1..=frontmatter_end` are metadata, not prose.
+fn frontmatter_end_line(body: &str) -> u32 {
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return 0;
+    }
+    for (idx, line) in lines.enumerate() {
+        if line.trim() == "---" {
+            // idx is 0-based from the *second* line, so the closing fence is at
+            // line number idx + 2.
+            return u32::try_from(idx + 2).unwrap_or(u32::MAX);
+        }
+    }
+    0
+}
+
+/// Read a boolean config param, falling back to `default` when unset or the
+/// wrong type.
+fn bool_param(params: Option<&Value>, key: &str, default: bool) -> bool {
+    params
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// Read a non-negative integer config param, falling back to `default` when
+/// unset or the wrong type.
+fn u64_param(params: Option<&Value>, key: &str, default: u64) -> u64 {
+    params
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(default)
+}
+
+/// The lowercased phrase list: the config `phrases` array when set (an explicit
+/// `[]` disables the class), else the compiled minimal default (AIF-005).
+fn phrases_param(params: Option<&Value>) -> Vec<String> {
+    match params.and_then(|p| p.get("phrases")).and_then(Value::as_array) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => PHRASES_DEFAULT.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Byte offsets of every ASCII-case-insensitive occurrence of `needle` (already
+/// lowercased) in `haystack`. Byte-exact, so the reported column stays correct
+/// even when the line contains multibyte text before the match — an ASCII byte
+/// never appears as a UTF-8 continuation byte, so a match can't start mid-char.
+fn find_all_ci(haystack: &str, needle: &str) -> Vec<usize> {
+    let (hb, nb) = (haystack.as_bytes(), needle.as_bytes());
+    let mut hits = Vec::new();
+    if nb.is_empty() || nb.len() > hb.len() {
+        return hits;
+    }
+    let mut i = 0;
+    while i + nb.len() <= hb.len() {
+        if hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+            hits.push(i);
+            i += nb.len();
+        } else {
+            i += 1;
+        }
+    }
+    hits
+}
+
+// -- RESEARCH namespace (docs/research/**) ---------------------------------
+//
+// A deep-research report is an id-less, path-claimed synthesis document. The
+// genre's trust signal is not link density (the surveyed corpus has zero
+// markdown links — citations are deep-research cite-tokens) but disclosed
+// provenance and, secondarily, disclosed uncertainty. `research.evidence` is a
+// pure normalized-heading walk over the H2/H3 headings (no filesystem, no body
+// re-parse, ADR-029): an evidence/sources section is standard across academic /
+// market / AI-report genres so its absence is an error, while a dedicated
+// limitations/data-gaps section is good practice but not an industry convention
+// so its absence is a configurable warning. The optional `research.type`
+// frontmatter field routes a report into its genre's IMRaD/market/AI skeleton —
+// but only ever *adds* warnings (monotonic opt-in, RSR-005). ADR-093.
+
+/// True when some entry in `headings` (already normalized: lowercase, trimmed,
+/// trailing colon dropped) *contains* any token in `tokens` (compared
+/// case-insensitively). Empty tokens are ignored, so a whitespace-only synonym
+/// never matches everything.
+fn heading_matches_any(headings: &[String], tokens: &[String]) -> bool {
+    tokens.iter().any(|tok| {
+        let t = tok.trim().to_lowercase();
+        !t.is_empty() && headings.iter().any(|h| h.contains(&t))
+    })
+}
+
+/// The configured synonym list for a `research.evidence` heading param, or the
+/// supplied default when the param is unset. An explicit `[]` disables that
+/// half (returns an empty list — never the default), per RSR-002.
+fn research_headings_param(params: Option<&Value>, key: &str, default: &[&str]) -> Vec<String> {
+    match params.and_then(|p| p.get(key)).and_then(Value::as_array) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.to_string())
+            .collect(),
+        None => default.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// The skeleton heading-token groups a valid `research.type` genre additionally
+/// requires (RSR-005). Each inner group is satisfied when some heading contains
+/// any of its tokens; a missing group is one warning. An unknown genre yields no
+/// groups (its invalidity is reported separately as an error).
+fn research_genre_skeleton(genre: &str) -> &'static [&'static [&'static str]] {
+    match genre {
+        // IMRaD.
+        "academic" => &[&["method"], &["result"]],
+        "market" => &[&["methodology"], &["recommendation"]],
+        "deep-research" => &[&["summary"], &["conclusion"]],
+        _ => &[],
+    }
+}
+
+/// `research.evidence` (ADR-093 § RSR-002/RSR-005): a `RESEARCH`-claimed report
+/// (`docs/research/**`, id-less path-claim) must carry an evidence/sources
+/// section (missing → error) and, by default, a limitations/data-gaps section
+/// (missing → warning, promotable via `severity`). Both halves are a `contains`
+/// walk over the normalized H2/H3 headings against a configurable synonym set
+/// (`evidence_headings` / `gaps_headings`; `[]` disables a half). File-level: a
+/// report carries no `id`, so the filename is its slug.
+///
+/// An optional `research.type` frontmatter field (nested under a `research`
+/// object, not a top-level `type:` which SSGs reserve, BUG-015) is a monotonic
+/// opt-in: absent → the baseline only; present-and-invalid → one error; present
+/// and valid → the baseline *plus* one warning per missing genre-skeleton
+/// heading. It only ever adds findings — it never unlocks a passing state. When
+/// the rule fires and no type is set, each diagnostic carries a note advertising
+/// the field (discovery only at the moment attention exists).
+pub(crate) fn check_research_evidence(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(ast) = doc.ast.as_ref() else {
+        return Vec::new();
+    };
+
+    // The section corpus: normalized H2 *and* H3 heading texts (RSR-002).
+    let headings: Vec<String> = ast
+        .headings
+        .iter()
+        .filter(|h| h.level == 2 || h.level == 3)
+        .map(|h| normalize_heading(&h.text))
+        .collect();
+
+    // Anchor every diagnostic at the report's title (first H1), falling back to
+    // an unanchored (0,0) position when the report has no H1 — the same
+    // (0,0)-fallback convention `core.required-headings` uses.
+    let title_line = ast
+        .headings
+        .iter()
+        .find(|h| h.level == 1)
+        .map(|h| h.line)
+        .unwrap_or(0);
+
+    let evidence_tokens = research_headings_param(params, "evidence_headings", DEFAULT_EVIDENCE_HEADINGS);
+    let gaps_tokens = research_headings_param(params, "gaps_headings", DEFAULT_GAPS_HEADINGS);
+    // `severity` governs the gaps half only; the evidence half is always an
+    // error. Default warning; only `error` promotes it.
+    let gaps_is_error = params
+        .and_then(|p| p.get("severity"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        == Some("error");
+
+    let mut out = Vec::new();
+
+    // Evidence half — always an error when enabled and no heading matches.
+    if !evidence_tokens.is_empty() && !heading_matches_any(&headings, &evidence_tokens) {
+        out.push(
+            Diagnostic::error(
+                RESEARCH_EVIDENCE,
+                doc.location.clone(),
+                title_line,
+                0,
+                "research report has no evidence/sources section",
+            )
+            .with_help("add an evidence/sources section, e.g. `## Evidence appendix`"),
+        );
+    }
+
+    // Gaps half — default warning, promotable to error via `severity`.
+    if !gaps_tokens.is_empty() && !heading_matches_any(&headings, &gaps_tokens) {
+        let ctor = if gaps_is_error {
+            Diagnostic::error
+        } else {
+            Diagnostic::warning
+        };
+        out.push(
+            ctor(
+                RESEARCH_EVIDENCE,
+                doc.location.clone(),
+                title_line,
+                0,
+                "research report has no limitations/data-gaps section",
+            )
+            .with_help("add a limitations/data-gaps section, or set severity/gaps_headings to tune"),
+        );
+    }
+
+    // Optional per-genre routing (RSR-005). Nested under a `research` object,
+    // never a top-level `type:` (BUG-015). Read from the parsed metadata, so an
+    // absent or malformed frontmatter is simply "no type" — no error, unlike the
+    // frontmatter-mandatory guide/c4 rules.
+    let research_type = doc
+        .metadata
+        .get("research")
+        .and_then(|r| r.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match research_type {
+        Some(genre) if RESEARCH_TYPES.contains(&genre) => {
+            // Valid genre: additionally require its skeleton headings. Each
+            // missing group is one warning — monotonic (only ever adds).
+            for group in research_genre_skeleton(genre) {
+                let group: Vec<String> = group.iter().map(|s| s.to_string()).collect();
+                if !heading_matches_any(&headings, &group) {
+                    let label = group.join("/");
+                    out.push(
+                        Diagnostic::warning(
+                            RESEARCH_EVIDENCE,
+                            doc.location.clone(),
+                            title_line,
+                            0,
+                            format!(
+                                "`research.type: {genre}` report is missing a `{label}` skeleton section"
+                            ),
+                        )
+                        .with_help(format!(
+                            "add a heading containing `{label}` (the {genre} report skeleton)"
+                        )),
+                    );
+                }
+            }
+        }
+        Some(genre) => {
+            // Present but outside the closed vocabulary → one error.
+            out.push(
+                Diagnostic::error(
+                    RESEARCH_EVIDENCE,
+                    doc.location.clone(),
+                    title_line,
+                    0,
+                    format!("`research.type: {genre}` is not a valid research genre"),
+                )
+                .with_help(format!(
+                    "set `research.type` to one of: {}",
+                    RESEARCH_TYPES.join(", ")
+                )),
+            );
+        }
+        None => {}
+    }
+
+    // On-fire discovery (RSR-005 hook 2): when the rule fires and no type is
+    // set, advertise the optional field on every emitted diagnostic — teaching
+    // at the moment attention exists, never on a clean report.
+    if research_type.is_none() && !out.is_empty() {
+        out = out
+            .into_iter()
+            .map(|d| {
+                d.with_note(
+                    "Optionally set `research.type: academic|market|deep-research` in \
+                     frontmatter to also check that genre's skeleton — adding it only adds checks.",
+                )
+            })
+            .collect();
+    }
+
+    out
+}
+
 // -- CHECKLIST namespace (docs/checklists/**) + core.required-headings -----
 //
 // A checklist is an id-less, path-claimed doc with a two-state lifecycle
@@ -2131,6 +2893,132 @@ pub(crate) fn check_checklist_pinned(
     }
 }
 
+// -- test.completion (TEST completion report, ADR-098 § QA-003) --------
+
+/// A commit-SHA *shape*: exactly 40 hex digits (a full SHA-1), the same shape
+/// `checklist.pinned` requires — ADR-098 clones its pin logic. Shape only;
+/// reachability against git is out of scope in v1.
+fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Whether the H2 section named `heading` exists and holds at least one
+/// non-blank content line before the next H2. Reuses the shared
+/// `h2_section_window` idiom (the acceptance-complete / tasks / ears
+/// rule-of-three). A missing section counts as empty.
+fn section_is_nonempty(doc: &Document, heading: &str) -> bool {
+    let Some(ast) = doc.ast.as_ref() else {
+        return false;
+    };
+    let name = normalize_heading(heading);
+    let lines: Vec<&str> = doc.body.lines().collect();
+    let Some((start, end)) = h2_section_window(ast, lines.len(), &name) else {
+        return false;
+    };
+    lines[start..end].iter().any(|l| !l.trim().is_empty())
+}
+
+/// `test.completion` (ADR-098 § QA-003): the two invariants a *sealed* Test
+/// Completion Report must satisfy that the core presence rules cannot express.
+/// Acts only on `status: sealed`; a draft carries no pins yet and is silent.
+///
+/// 1. A sealed record carries `tested_commit` (the tree the suite ran against)
+///    and `spec_commit` (the revision of the linked contract verified), each a
+///    40-hex commit SHA. Shape only — like `checklist.pinned` it does not
+///    resolve the SHA against git (ADR-098 rejects git-verified pins in v1).
+/// 2. When `result: conditional-pass`, the `## Outstanding Defects` section
+///    must be non-empty — a waiver of open defects must name what it waives, or
+///    the honest verdict is `pass`.
+///
+/// Document-level: the `[TEST]` namespace is id-claimed (`id: TEST-<N>`), so
+/// the report is an id-keyed [`Document`] linted in the per-document loop.
+pub(crate) fn check_test_completion(
+    doc: &Document,
+    _params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    // Only a sealed report is gated; a draft is still being written and carries
+    // no pins by design (ADR-098 § QA-003).
+    if doc.metadata.get("status").and_then(Value::as_str).map(str::trim) != Some("sealed") {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+
+    // (1) The two commit-SHA pins — presence AND shape, per pin.
+    for key in ["tested_commit", "spec_commit"] {
+        let line = doc
+            .frontmatter_lines
+            .get(key)
+            .or_else(|| doc.frontmatter_lines.get("status"))
+            .copied()
+            .unwrap_or(0);
+        match doc.metadata.get(key).and_then(Value::as_str).map(str::trim) {
+            Some(sha) if !sha.is_empty() => {
+                if !is_commit_sha(sha) {
+                    out.push(
+                        Diagnostic::error(
+                            TEST_COMPLETION,
+                            doc.location.clone(),
+                            line,
+                            0,
+                            format!(
+                                "{}: `{key}: {sha}` is not a 40-character hex commit SHA",
+                                doc.raw_id
+                            ),
+                        )
+                        .with_help(format!(
+                            "pin `{key}` to the full 40-character SHA the sealed report was taken at"
+                        )),
+                    );
+                }
+            }
+            _ => out.push(
+                Diagnostic::error(
+                    TEST_COMPLETION,
+                    doc.location.clone(),
+                    line,
+                    0,
+                    format!(
+                        "{}: a sealed completion report must set `{key}` to a commit SHA",
+                        doc.raw_id
+                    ),
+                )
+                .with_help(if key == "tested_commit" {
+                    "add `tested_commit: <40-hex SHA>` — the tree the suite ran against"
+                } else {
+                    "add `spec_commit: <40-hex SHA>` — the revision of the contract it verified"
+                }),
+            ),
+        }
+    }
+
+    // (2) A conditional-pass verdict is a waiver — it must name its defects.
+    let result = doc.metadata.get("result").and_then(Value::as_str).map(str::trim);
+    if result == Some("conditional-pass") && !section_is_nonempty(doc, "Outstanding Defects") {
+        let line = doc.frontmatter_lines.get("result").copied().unwrap_or(0);
+        out.push(
+            Diagnostic::error(
+                TEST_COMPLETION,
+                doc.location.clone(),
+                line,
+                0,
+                format!(
+                    "{}: `result: conditional-pass` but the `Outstanding Defects` section is \
+                     empty — a waiver must name what it waives",
+                    doc.raw_id
+                ),
+            )
+            .with_help(
+                "list the waived defects under `## Outstanding Defects`, or set `result: pass` \
+                 if there are none",
+            ),
+        );
+    }
+
+    out
+}
+
 /// `core.required-headings`: each heading named in the `headings` config param
 /// must appear as an H2. Matching is normalized — a leading enumerator (`1.`,
 /// `1)`, `A.`) is stripped and comparison is case-insensitive — so config
@@ -2218,6 +3106,140 @@ pub(crate) fn check_required_anchors(
     out
 }
 
+/// `core.file-budget` (ADR-109 § BDG-001): the document stays under its
+/// character budget.
+///
+/// Generic and namespace-agnostic — a TODO.md, an ADR, a runbook. The unit
+/// is characters because that is the unit the readers imposing a ceiling
+/// report in (Claude Code warns at 150 000 characters on a file it loads).
+/// Counted over the full document text the source handed the kernel,
+/// frontmatter included: the rule measures the file a reader loads, not the
+/// prose that survives parsing.
+///
+/// Warning, never an error — an over-budget file is a cost, not a
+/// structural defect.
+///
+/// Dual-dispatch (BDG-003): registered `Level::File` so it runs on id-less
+/// path-claimed singletons, and dispatched again from `run.rs` step 6 for
+/// id-keyed documents. Both paths call *this* function, so one rule code
+/// never means two semantics — the defect BUG-021 records.
+pub(crate) fn check_file_budget(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let max_chars = params
+        .and_then(|p| p.get("max_chars"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_CHARS);
+    let chars = doc.body.chars().count() as u64;
+    if chars <= max_chars {
+        return Vec::new();
+    }
+    vec![
+        Diagnostic::warning(
+            FILE_BUDGET,
+            doc.location.clone(),
+            0,
+            0,
+            format!("file is {chars} characters (budget {max_chars})"),
+        )
+        .with_help(budget_help(doc, chars - max_chars, chars))
+        .with_note(format!(
+            "raise the ceiling with `[{}.\"{FILE_BUDGET}\"] max_chars = <n>` if this size is intended",
+            doc.id.namespace
+        )),
+    ]
+}
+
+/// The `help:` line for an over-budget file: how much has to go, and where
+/// the bulk is. The candidate is whichever weighs more — the largest H2
+/// section, or the preamble above the first H2 — so the suggestion names
+/// the actual bulk rather than the biggest *named* thing. Naming it turns
+/// "this file is too big" into one concrete edit, which is the whole point
+/// of the diagnostic.
+fn budget_help(doc: &Document, over: u64, total: u64) -> String {
+    let pct = |n: u64| n.saturating_mul(100) / total.max(1);
+    let preamble = chars_before_first_h2(doc);
+    let section = largest_section(doc);
+
+    // The preamble wins when it outweighs every section (a state file whose
+    // bulk is dated narrative above the first `##`). It has no heading to
+    // move, so the advice is structural, not "move this section".
+    if section.is_none_or(|(_, size)| preamble > size) && preamble > 0 {
+        return format!(
+            "trim {over} characters — {preamble} characters ({pct}% of the file) sit above the \
+             first `## ` heading, where no section owns them: give that text sections and split \
+             the settled parts out, or archive it",
+            pct = pct(preamble),
+        );
+    }
+    match section {
+        Some((title, size)) => format!(
+            "trim {over} characters — the largest section is `## {title}` ({size} characters, \
+             {pct}% of the file): move it into a linked file, or archive it if it is settled",
+            pct = pct(size),
+        ),
+        None => format!(
+            "trim {over} characters — move settled detail into a linked file and reference it, \
+             or archive the parts that are done"
+        ),
+    }
+}
+
+/// Characters from the top of the document to its first H2 (the preamble
+/// no `## ` section owns). `0` when the document has no AST or opens on an
+/// H2. Line-summed the same way [`largest_section`] measures a section, so
+/// the two figures are comparable.
+fn chars_before_first_h2(doc: &Document) -> u64 {
+    let Some(ast) = doc.ast.as_ref() else {
+        return 0;
+    };
+    let Some(first) = ast.headings.iter().find(|h| h.level == 2) else {
+        return 0;
+    };
+    doc.body
+        .lines()
+        .take((first.line as usize).saturating_sub(1))
+        .map(|line| line.chars().count() as u64 + 1)
+        .sum()
+}
+
+/// The largest H2 section of `doc` as `(heading text, characters)`.
+///
+/// A section runs from its own `## ` line to the next H2 (nested H3s count
+/// inside it, which is what makes the answer useful — the fix is to move
+/// the whole subtree). `None` when the document has no AST or no H2, in
+/// which case the caller falls back to generic advice.
+fn largest_section(doc: &Document) -> Option<(&str, u64)> {
+    let ast = doc.ast.as_ref()?;
+    let lines: Vec<&str> = doc.body.lines().collect();
+    let sections: Vec<(usize, &str)> = ast
+        .headings
+        .iter()
+        .filter(|h| h.level == 2)
+        .map(|h| (h.line as usize, h.text.trim()))
+        .collect();
+    let mut best: Option<(&str, u64)> = None;
+    for (idx, (start, text)) in sections.iter().enumerate() {
+        let end = sections
+            .get(idx + 1)
+            .map_or(lines.len() + 1, |(next, _)| *next);
+        // `+ 1` per line for the newline the `lines()` split dropped, so
+        // the section sizes sum to roughly the file's own character count.
+        let size: u64 = lines
+            .iter()
+            .skip(start.saturating_sub(1))
+            .take(end.saturating_sub(*start))
+            .map(|line| line.chars().count() as u64 + 1)
+            .sum();
+        if best.is_none_or(|(_, largest)| size > largest) {
+            best = Some((text, size));
+        }
+    }
+    best
+}
+
 /// A leading heading enumerator (`1.`, `1)`, `A.`) to strip before comparing a
 /// config heading against a document heading, so authors can number their
 /// sections without the config mirroring the numbers.
@@ -2228,8 +3250,9 @@ fn required_enumerator_regex() -> &'static Regex {
 
 /// Normalize a heading for `core.required-headings`: strip a leading enumerator,
 /// then trim, drop a trailing colon, and case-fold (matching `normalize_heading`
-/// plus the enumerator strip).
-fn normalize_required_heading(text: &str) -> String {
+/// plus the enumerator strip). Shared with the id-pipeline dispatch in
+/// `rules.rs` so both paths of the dual-use rule agree (BUG-021).
+pub(crate) fn normalize_required_heading(text: &str) -> String {
     let stripped = required_enumerator_regex().replace(text.trim(), "");
     normalize_heading(&stripped)
 }
@@ -3072,6 +4095,68 @@ pub(crate) fn check_calendar_freshness(
     ))]
 }
 
+// -- core.file-name (document-level, ADR-091 § FNM-001) --------------
+
+/// `core.file-name` — the file's leading numeric prefix must equal the
+/// number carried in its `id` (FNM-001). Opt-in and Document-level, so it
+/// is only ever dispatched on id-keyed documents; id-less path-claim
+/// singletons (README/CLAUDE/GUIDE) are `Level::File` and never reach it
+/// (FNM-002). The prefix is compared as a parsed `u32`, not as a
+/// zero-padded string, so both `88-slug.md` and `088-slug.md` satisfy
+/// `id: NS-88` (FNM-003) — padding width is a cosmetic convention this
+/// rule deliberately does not police.
+pub(crate) fn check_file_name(
+    doc: &Document,
+    _params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    // `doc.location` is the root-relative path (e.g. `docs/adrs/091-x.md`);
+    // the convention constrains the final path component only.
+    let file_name = Path::new(&doc.location)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(doc.location.as_str());
+    let digits: String = file_name
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let line = doc.frontmatter_lines.get("id").copied().unwrap_or(0);
+    let want = doc.id.number;
+
+    if digits.is_empty() {
+        return vec![Diagnostic::error(
+            FILE_NAME,
+            doc.location.clone(),
+            line,
+            0,
+            format!(
+                "{}: filename `{file_name}` has no numeric prefix — expected it to start with `{want}` to match the id",
+                doc.raw_id
+            ),
+        )
+        .with_help(format!(
+            "rename the file so it starts with the id number, e.g. `{want:03}-<slug>.md` (any padding width is accepted)"
+        ))];
+    }
+
+    // `u32::from_str` collapses leading zeros exactly like `core.id`
+    // parses its number; an overflowing prefix can never equal a valid id
+    // number, so it falls through to the mismatch arm.
+    match digits.parse::<u32>() {
+        Ok(n) if n == want => Vec::new(),
+        _ => vec![Diagnostic::error(
+            FILE_NAME,
+            doc.location.clone(),
+            line,
+            0,
+            format!("{}: filename prefix `{digits}` does not match the id number {want}", doc.raw_id),
+        )
+        .with_help(format!(
+            "rename the file to start with `{want}` (e.g. `{want:03}-<slug>.md`), or change `id:` to match the filename"
+        ))],
+    }
+}
+
 // -- security.vuln-sla (document-level, ADR-041 § SEC-004) -----------
 
 /// Map the `severity` param to a diagnostic [`Severity`], mirroring
@@ -3218,17 +4303,16 @@ pub(crate) fn check_risk_expiry(
     }
 
     // Exemption: a linked document in the configured namespace is
-    // canonical, so the fields are not required inline.
+    // canonical, so the fields are not required inline. The link must
+    // *resolve* — this is the one place in the family where a phantom
+    // reference did not merely satisfy a requirement but granted an
+    // exemption, so an unsigned, un-time-boxed acceptance passed by citing
+    // a RISK nobody wrote (BUG-030).
     if let Some(prefix) = params
         .and_then(|p| p.get("exempt-when-links"))
         .and_then(Value::as_str)
     {
-        let linked = doc.depends_on.iter().any(|dep| {
-            dep.split_once('-')
-                .map(|(ns, _)| ns.eq_ignore_ascii_case(prefix))
-                .unwrap_or(false)
-        });
-        if linked {
+        if links_namespace(params, prefix) {
             return Vec::new();
         }
     }
@@ -3341,16 +4425,33 @@ pub(crate) fn check_risk_expiry(
 // -- security.remediation-link (document-level, ADR-041 § SEC-006) ---
 
 /// `security.remediation-link` (ADR-041 § SEC-006, mitigated-VULN case):
-/// a finding in scope must cross-ref its remediation — an ADR or tracker
-/// id — so the fix is falsifiable, not "trust me".
+/// a finding in scope must cross-ref its remediation — the implementing
+/// decision — so the fix is falsifiable, not "trust me".
 ///
 /// Params:
 /// - `require-when-status` (string, optional): when set, the rule acts
 ///   only on documents whose `status` matches it (case-insensitive) —
 ///   `"mitigated"` on `VULN`. When absent, the rule always acts.
+/// - `accepted-namespaces` (string list, optional, default `["ADR"]`): the
+///   namespaces a resolving cross-ref may cite as the remediation.
+/// - `remediation-fields` (string list, optional, default
+///   `["remediation_link"]`): metadata fields whose non-empty value counts
+///   as the remediation, for a fix tracked outside the document graph.
 ///
-/// The document satisfies the rule if it carries any `depends_on` link OR
-/// any body cross-ref token. Otherwise one `error` is emitted.
+/// The document satisfies the rule when it carries a **resolving**
+/// cross-ref (`depends_on` or body token, own id excluded — see
+/// [`resolved_refs`]) into one of `accepted-namespaces`, or a non-empty
+/// value in one of `remediation-fields`. Otherwise one `error`.
+///
+/// Both halves are BUG-031's fix, and both are contract breaks by design
+/// (MAJOR). Previously *any* token satisfied the rule, including the
+/// document's own id — which `ctxgrd new VULN` scaffolds into the body H1,
+/// so every scaffolded finding self-satisfied from birth and marking one
+/// `mitigated` was enough to pass. The `accepted-namespaces` /
+/// `remediation-fields` split is the same shape `soc2.control-evidence`
+/// already uses for `evidence-namespaces` / `evidence-fields`: a resolvable
+/// cross-ref, or an explicit opaque external pointer — never an
+/// unconstrained token that cannot be told apart from a typo.
 pub(crate) fn check_remediation_link(
     doc: &Document,
     params: Option<&Value>,
@@ -3370,12 +4471,32 @@ pub(crate) fn check_remediation_link(
         }
     }
 
-    let has_dep = !doc.depends_on.is_empty();
-    let has_cross_ref = doc
-        .ast
-        .as_ref()
-        .is_some_and(|ast| !ast.cross_ref_tokens.is_empty());
-    if has_dep || has_cross_ref {
+    let accepted: Vec<String> = params
+        .and_then(|p| p.get("accepted-namespaces"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["ADR".to_owned()]);
+    if accepted.iter().any(|ns| links_namespace(params, ns)) {
+        return Vec::new();
+    }
+
+    let fields: Vec<&str> = params
+        .and_then(|p| p.get("remediation-fields"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_else(|| vec!["remediation_link"]);
+    let field_satisfied = fields.iter().any(|f| {
+        doc.metadata
+            .get(*f)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    if field_satisfied {
         return Vec::new();
     }
 
@@ -3385,44 +4506,140 @@ pub(crate) fn check_remediation_link(
         .or_else(|| doc.frontmatter_lines.get("id"))
         .copied()
         .unwrap_or(0);
+    let accepted_list = accepted.join("/");
+    let field = fields.first().copied().unwrap_or("remediation_link");
     vec![Diagnostic::error(
         REMEDIATION_LINK,
         doc.location.clone(),
         line,
         0,
         format!(
-            "{}: mitigated finding must cross-ref its remediation (an ADR or tracker id) — \
-             add a `depends_on` entry or a body cross-ref",
+            "{}: mitigated finding must cross-ref its remediation — a resolving \
+             {accepted_list} link or a `{field}`",
             doc.raw_id
         ),
     )
-    .with_help(
-        "link the implementing change: add the fixing ADR or tracker id to `depends_on`, \
-         or reference it in the body",
-    )]
+    .with_help(format!(
+        "add the id of the implementing {accepted_list} to `depends_on` (or cite it in the \
+         body), or add a `{field}:` pointing at the fix in an external tracker — the \
+         document's own id does not count"
+    ))]
 }
 
-// -- shared: does a document link a namespace? -----------------------
+// -- shared conditional-link matcher (BUG-030 / BUG-031) -------------
 
-/// Whether `doc` links a document in `namespace` — via a `depends_on`
-/// entry or a body cross-ref token (excluding tokens inside code spans or
-/// strikethrough, which are not real references). Namespace match is
-/// case-insensitive. Shared by the conditional cross-ref rules
-/// (`gdpr.processor-dpa`, `hipaa.safeguard-evidence`).
-fn links_namespace(doc: &Document, namespace: &str) -> bool {
-    let in_deps = doc.depends_on.iter().any(|dep| {
-        dep.split_once('-')
+/// The synthesized param carrying a document's *resolved* outbound
+/// references. Threaded by [`crate::run`] for every code in
+/// [`crate::builtin_rules::RESOLUTION_AWARE_RULES`]; never a config key,
+/// so it is absent from those rules' declared `params` (the same channel
+/// `core.dep-shape` uses for `managed`, ADR-039 § DAG-003).
+pub(crate) const RESOLVED_REFS_PARAM: &str = "resolved-refs";
+
+/// Every reference `doc` carries that **resolves** to a document present
+/// in the run, as canonical `NS-<n>` strings — the candidate set the
+/// conditional link rules are allowed to count as evidence (BUG-030).
+///
+/// Sources, matching what the rules previously scanned by prefix alone:
+/// `depends_on` entries, and body cross-ref tokens outside code spans and
+/// strikethrough (a token in backticks is a literal example, not a
+/// reference).
+///
+/// Two exclusions, both load-bearing:
+///
+/// 1. **Unresolvable targets are dropped** (BUG-030). A well-formed id for
+///    a document nobody wrote is not evidence; before this, it satisfied
+///    every conditional evidence rule exactly as a real one did, and
+///    `security.risk-expiry` went further and granted an *exemption* on
+///    one.
+/// 2. **The host's own id is dropped** (BUG-031). `ctxgrd new VULN`
+///    scaffolds `# VULN-001: <title>` as the body H1, so an open-target
+///    rule like `security.remediation-link` self-satisfied from birth.
+///    The exclusion lives here rather than in that one rule because the
+///    sibling rules are immune only by coincidence — each happens to
+///    demand a foreign namespace — so the next open-target rule would
+///    reproduce the defect.
+pub(crate) fn resolved_refs(doc: &Document, known: &BTreeSet<DocumentId>) -> Vec<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut admit = |id: DocumentId| {
+        if id != doc.id && known.contains(&id) {
+            out.insert(id.to_string());
+        }
+    };
+    for entry in &doc.depends_on {
+        if let Ok(id) = entry.parse::<DocumentId>() {
+            admit(id);
+        }
+    }
+    if let Some(ast) = doc.ast.as_ref() {
+        for t in &ast.cross_ref_tokens {
+            if t.in_code || t.in_strikethrough {
+                continue;
+            }
+            admit(DocumentId::new(t.namespace.clone(), t.number));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The resolved-reference candidate set for the document under check, read
+/// from the synthesized [`RESOLVED_REFS_PARAM`].
+///
+/// **Fails closed.** An absent param yields an empty set, so a rule sees
+/// "no evidence" rather than "evidence unverified". Every one of these
+/// rules is a false-green defect in its unfixed form, so the failure mode
+/// of a dropped threading must be a loud diagnostic, not silence — a
+/// permissive fallback here would restore BUG-030 the moment the dispatch
+/// changed, and nothing would say so.
+fn resolved_candidates(params: Option<&Value>) -> Vec<&str> {
+    params
+        .and_then(|p| p.get(RESOLVED_REFS_PARAM))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the document under check links a **resolvable** document in
+/// `namespace`. Namespace match is case-insensitive. Shared by the
+/// conditional cross-ref rules (`gdpr.processor-dpa`,
+/// `hipaa.safeguard-evidence`, the three `*.control-evidence` rules, and
+/// `security.risk-expiry`'s exemption).
+fn links_namespace(params: Option<&Value>, namespace: &str) -> bool {
+    resolved_candidates(params).iter().any(|id| {
+        id.split_once('-')
             .map(|(ns, _)| ns.eq_ignore_ascii_case(namespace))
             .unwrap_or(false)
-    });
-    if in_deps {
-        return true;
-    }
-    doc.ast.as_ref().is_some_and(|ast| {
-        ast.cross_ref_tokens
-            .iter()
-            .any(|t| !t.in_code && !t.in_strikethrough && t.namespace.eq_ignore_ascii_case(namespace))
     })
+}
+
+/// The configured evidence namespaces, rendered for a diagnostic.
+///
+/// The default **must** stay in step with [`evidence_gap`]'s own default,
+/// which is what the rules actually enforce: a message naming `POLICY`/`ADR`
+/// while the pack accepts only `ADR` tells the author to do something the
+/// rule will reject. Every `evidence_gap` caller renders its namespaces
+/// through here rather than hardcoding the pair, so narrowing
+/// `evidence-namespaces` in a pack narrows the diagnostic with it.
+/// Returns `(list, article)` — the rendered namespaces and the indefinite
+/// article that fits the first one, so a narrowed list reads "an ADR
+/// cross-ref" rather than "a ADR cross-ref". Namespaces are acronyms, so the
+/// written-letter test is the right one here.
+fn evidence_namespace_list(params: Option<&Value>) -> (String, &'static str) {
+    let ns = product_list_param(params, "evidence-namespaces", &["POLICY", "ADR"]);
+    let article = match ns.first().and_then(|n| n.chars().next()) {
+        Some(c) if "AEIOU".contains(c.to_ascii_uppercase()) => "an",
+        _ => "a",
+    };
+    (ns.join(" or "), article)
+}
+
+/// The first configured evidence field — the one a diagnostic names when it
+/// tells an author which key to add. Shared by all five [`evidence_gap`]
+/// callers, which otherwise repeated this read verbatim.
+fn first_evidence_field(params: Option<&Value>) -> &str {
+    product_list_param(params, "evidence-fields", &["evidence_link"])
+        .first()
+        .copied()
+        .unwrap_or("evidence_link")
 }
 
 // -- gdpr.processor-dpa (document-level, ADR-066 § GDPR-002) ---------
@@ -3432,15 +4649,17 @@ fn links_namespace(doc: &Document, namespace: &str) -> bool {
 /// governing `DPA` (the Art. 28 agreement). A controller or
 /// joint-controller record is out of scope.
 ///
-/// Parameterless: the GDPR semantics are statutory, not configuration —
-/// the trigger field (`controller_or_processor`), the trigger value
+/// No *config* params: the GDPR semantics are statutory, not configuration
+/// — the trigger field (`controller_or_processor`), the trigger value
 /// (`processor`), and the target namespace (`DPA`) are fixed. The link may
-/// be a `depends_on` entry or a body cross-ref token resolving to `DPA`.
+/// be a `depends_on` entry or a body cross-ref token, and must resolve to a
+/// `DPA` document present in the run ([`resolved_refs`], BUG-030); the
+/// candidate set arrives through the synthesized [`RESOLVED_REFS_PARAM`].
 /// `core.cross-ref` only checks that links which *are* present resolve; it
 /// never requires a processor record to carry one. Emits one `error`.
 pub(crate) fn check_processor_dpa(
     doc: &Document,
-    _params: Option<&Value>,
+    params: Option<&Value>,
     _root: &Path,
 ) -> Vec<Diagnostic> {
     let role = doc
@@ -3452,7 +4671,7 @@ pub(crate) fn check_processor_dpa(
         return Vec::new();
     }
 
-    if links_namespace(doc, "DPA") {
+    if links_namespace(params, "DPA") {
         return Vec::new();
     }
 
@@ -3499,7 +4718,9 @@ struct EvidenceGap {
 /// - its `status` is in `out-of-scope-status` (e.g. `not-applicable`) — an
 ///   out-of-scope control owes no operating-effectiveness evidence;
 /// - it cross-refs an evidence namespace (`evidence-namespaces`, default
-///   `POLICY`/`ADR`) — a `depends_on` entry or a body token;
+///   `POLICY`/`ADR`) — a `depends_on` entry or a body token, which must
+///   *resolve* to a document present in the run ([`resolved_refs`],
+///   BUG-030): evidence that does not exist is not evidence;
 /// - a metadata field named in `evidence-fields` carries a non-empty value
 ///   (SOC 2's `evidence_link`); or
 /// - the asserted value is in `addressable` AND a `justification-field`
@@ -3556,7 +4777,7 @@ fn evidence_gap(doc: &Document, params: Option<&Value>, default_field: &str) -> 
                 .collect()
         })
         .unwrap_or_else(|| vec!["POLICY".to_owned(), "ADR".to_owned()]);
-    if evidence_ns.iter().any(|ns| links_namespace(doc, ns)) {
+    if evidence_ns.iter().any(|ns| links_namespace(params, ns)) {
         return None;
     }
 
@@ -3635,15 +4856,16 @@ pub(crate) fn check_safeguard_evidence(
         .and_then(|p| p.get("justification-field"))
         .and_then(Value::as_str)
         .unwrap_or("justification");
+    let (ns_list, ns_article) = evidence_namespace_list(params);
     let (message, help) = if gap.addressable {
         (
             format!(
                 "{}: addressable safeguard `{safeguard}` needs implementing evidence \
-                 (a POLICY or ADR cross-ref) or a `{just_field}` field",
+                 ({ns_article} {ns_list} cross-ref) or a `{just_field}` field",
                 doc.raw_id
             ),
             format!(
-                "cross-ref the implementing POLICY/ADR, or add a `{just_field}:` field \
+                "cross-ref the implementing {ns_list}, or add a `{just_field}:` field \
                  recording why an equivalent (or no) control is reasonable"
             ),
         )
@@ -3651,12 +4873,13 @@ pub(crate) fn check_safeguard_evidence(
         (
             format!(
                 "{}: required safeguard `{safeguard}` needs implementing evidence \
-                 (a POLICY or ADR cross-ref)",
+                 ({ns_article} {ns_list} cross-ref)",
                 doc.raw_id
             ),
-            "cross-ref the implementing POLICY or ADR — a required safeguard has no \
-             justification escape"
-                .to_owned(),
+            format!(
+                "cross-ref the implementing {ns_list} — a required safeguard has no \
+                 justification escape"
+            ),
         )
     };
     vec![
@@ -3688,18 +4911,15 @@ pub(crate) fn check_control_evidence(
         return Vec::new();
     };
     let criterion = &gap.value;
-    let evidence_field = params
-        .and_then(|p| p.get("evidence-fields"))
-        .and_then(Value::as_array)
-        .and_then(|a| a.iter().filter_map(Value::as_str).next())
-        .unwrap_or("evidence_link");
+    let evidence_field = first_evidence_field(params);
+    let (ns_list, ns_article) = evidence_namespace_list(params);
     let message = format!(
         "{}: in-scope control for criterion `{criterion}` needs operating-effectiveness evidence \
-         (a POLICY or ADR cross-ref) or an `{evidence_field}`",
+         ({ns_article} {ns_list} cross-ref) or an `{evidence_field}`",
         doc.raw_id
     );
     let help = format!(
-        "cross-ref the implementing POLICY or ADR, or add an `{evidence_field}:` pointing at the \
+        "cross-ref the implementing {ns_list}, or add an `{evidence_field}:` pointing at the \
          operating-effectiveness evidence (an access-review log, change ticket, or config export)"
     );
     vec![
@@ -3732,18 +4952,15 @@ pub(crate) fn check_iso_control_evidence(
         return Vec::new();
     };
     let control = &gap.value;
-    let evidence_field = params
-        .and_then(|p| p.get("evidence-fields"))
-        .and_then(Value::as_array)
-        .and_then(|a| a.iter().filter_map(Value::as_str).next())
-        .unwrap_or("evidence_link");
+    let evidence_field = first_evidence_field(params);
+    let (ns_list, ns_article) = evidence_namespace_list(params);
     let message = format!(
         "{}: in-scope control `{control}` needs implementing evidence \
-         (a POLICY or ADR cross-ref) or an `{evidence_field}`",
+         ({ns_article} {ns_list} cross-ref) or an `{evidence_field}`",
         doc.raw_id
     );
     let help = format!(
-        "cross-ref the implementing POLICY or ADR, or add an `{evidence_field}:` pointing at the \
+        "cross-ref the implementing {ns_list}, or add an `{evidence_field}:` pointing at the \
          implementing evidence — or mark the control `not-applicable` if it is out of scope"
     );
     vec![
@@ -3774,18 +4991,15 @@ pub(crate) fn check_nist_control_evidence(
         return Vec::new();
     };
     let control = &gap.value;
-    let evidence_field = params
-        .and_then(|p| p.get("evidence-fields"))
-        .and_then(Value::as_array)
-        .and_then(|a| a.iter().filter_map(Value::as_str).next())
-        .unwrap_or("evidence_link");
+    let evidence_field = first_evidence_field(params);
+    let (ns_list, ns_article) = evidence_namespace_list(params);
     let message = format!(
         "{}: in-scope control for family `{control}` needs implementing evidence \
-         (a POLICY or ADR cross-ref) or an `{evidence_field}`",
+         ({ns_article} {ns_list} cross-ref) or an `{evidence_field}`",
         doc.raw_id
     );
     let help = format!(
-        "cross-ref the implementing POLICY or ADR, or add an `{evidence_field}:` pointing at the \
+        "cross-ref the implementing {ns_list}, or add an `{evidence_field}:` pointing at the \
          implementing evidence (an SSP narrative, assessment record, or config export) — or mark \
          the control `not-applicable` if it is out of scope"
     );
@@ -3793,6 +5007,77 @@ pub(crate) fn check_nist_control_evidence(
         Diagnostic::error(NIST_CONTROL_EVIDENCE, doc.location.clone(), gap.line, 0, message)
             .with_help(help),
     ]
+}
+
+// -- core.evidence-link (document-level, ADR-115 § REG-001) ----------
+
+/// `core.evidence-link` (ADR-115 § REG-001): the **regime-neutral**
+/// conditional-evidence rule. An in-scope register entry asserting an
+/// obligation identifier MUST point at implementing evidence — a resolving
+/// cross-ref into an evidence namespace, or a non-empty evidence field.
+///
+/// The fifth caller of the shared [`evidence_gap`] core, and the first that
+/// is not named after one regime. `soc2.control-evidence`,
+/// `iso27001.control-evidence` and `nist.control-evidence` are three codes
+/// over one mechanism, forked purely so each diagnostic speaks its
+/// framework's noun ("criterion", "Annex A control", "family"). That was
+/// affordable for three; it does not scale to every regulation with a
+/// register, so the packs added by ADR-115/116/117 share this code and name
+/// their own trigger field through `field` instead.
+///
+/// Params: `field` (the trigger metadata key — no default, since there is no
+/// neutral one), plus everything [`evidence_gap`] documents
+/// (`evidence-namespaces`, `evidence-fields`, `out-of-scope-status`,
+/// `addressable`, `justification-field`). Emits one `error`.
+pub(crate) fn check_evidence_link(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    // No default trigger field: a namespace binding this rule must say what
+    // its obligation identifier is called. `evidence_gap` returns None when
+    // the field is absent from the document, so a missing `field` param makes
+    // the rule inert — silence for a misconfiguration is the wrong failure,
+    // so the sentinel below cannot match a real key.
+    let Some(field) = params.and_then(|p| p.get("field")).and_then(Value::as_str) else {
+        let line = doc.frontmatter_lines.get("id").copied().unwrap_or(0);
+        return vec![Diagnostic::error(
+            EVIDENCE_LINK,
+            doc.location.clone(),
+            line,
+            0,
+            format!(
+                "{}: [{}.\"core.evidence-link\"] must declare `field` — the metadata key \
+                 carrying the obligation identifier",
+                doc.raw_id, doc.id.namespace
+            ),
+        )
+        .with_help(
+            "add `field = \"<key>\"` (e.g. `article`, `measure`, `purpose`) to the rule's \
+             params block — the rule cannot guess which key is the obligation id",
+        )];
+    };
+    let Some(gap) = evidence_gap(doc, params, field) else {
+        return Vec::new();
+    };
+    let value = &gap.value;
+    let evidence_field = first_evidence_field(params);
+    let (ns_list, ns_article) = evidence_namespace_list(params);
+    vec![Diagnostic::error(
+        EVIDENCE_LINK,
+        doc.location.clone(),
+        gap.line,
+        0,
+        format!(
+            "{}: in-scope entry for `{field}` `{value}` needs implementing evidence \
+             ({ns_article} {ns_list} cross-ref) or an `{evidence_field}`",
+            doc.raw_id
+        ),
+    )
+    .with_help(format!(
+        "cross-ref the implementing {ns_list}, or add an `{evidence_field}:` pointing at \
+         the evidence — or mark the entry out of scope if it does not apply"
+    ))]
 }
 
 // -- ddd.context-map-shape (document-level, ADR-082 § DDD-003) --------
@@ -3810,8 +5095,9 @@ pub(crate) fn check_nist_control_evidence(
 /// Params (all optional; defaults encode the Evans vocabulary the pack ships):
 /// - `exact_context_count` (int, default 2): the number of `BOUNDEDCONTEXT`
 ///   endpoints one relationship edge connects.
-/// - `context-namespace` (string, default `BOUNDEDCONTEXT`): the namespace a
-///   `depends_on` endpoint must resolve to, to count as a context.
+/// - `context-namespace` (string, default `BOUNDEDCONTEXT`): the namespace an
+///   endpoint's `depends_on` entry must be **prefixed with** to count as a
+///   context.
 /// - `symmetric_patterns` (string list, default `Partnership` / `Shared Kernel`
 ///   / `Separate Ways`): patterns that forbid the direction fields; every other
 ///   pattern is asymmetric and requires them.
@@ -3820,6 +5106,15 @@ pub(crate) fn check_nist_control_evidence(
 ///
 /// A doc with no `pattern` field skips the direction half (presence of
 /// `pattern` is `core.allowed-values`/`core.required-metadata`'s concern).
+///
+/// **This counts namespace prefixes; it does not resolve endpoints** (BUG-032,
+/// wontfix). An edge naming `BOUNDEDCONTEXT-999` counts as a context whether or
+/// not that document exists — the cardinality question ("exactly two contexts")
+/// and the existence question are separate, and existence is
+/// `core.dep-resolved`'s, which the `ddd` pack binds on the same namespace.
+/// A consumer who materialises the pack and then prunes `core.dep-resolved` from
+/// `[CONTEXTMAP].rules` restores a silent false green; nothing warns about that
+/// today.
 pub(crate) fn check_context_map_shape(
     doc: &Document,
     params: Option<&Value>,
@@ -3949,9 +5244,43 @@ pub(crate) fn check_context_map_shape(
 
 // -- todo.listed (document-level) ------------------------------------
 
-/// Default statuses that exempt a document from the `todo.listed` check.
-/// Compared case-insensitively against the document's `status` field.
-const DEFAULT_TERMINAL_STATUSES: &[&str] = &[
+/// The shared **arming** vocabulary: the statuses that mean a document has
+/// stopped moving *and settles what rests on it*. Compared case-insensitively
+/// against the document's `status` field, and the default of every rule that
+/// takes a `terminal` param — `todo.listed` (the exemption set), and
+/// `core.acceptance-complete` / `core.dep-status` (the arming set) — so a
+/// project declaring its terminal vocabulary once does not redeclare it
+/// differently per rule (ADR-106 § DPS-003).
+///
+/// This is **not** the set that answers "does this document still have work
+/// left?". That is [`is_settled_status`], which is strictly wider. The two
+/// questions were unified by DPS-003 and split by `ADR-121` once `BUG-037`
+/// measured the cost; see [`SETTLED_ONLY_STATUSES`] for the statuses where
+/// the answers differ. Reading this list for a census question is the defect
+/// `BUG-037` records.
+///
+/// `rejected` is deliberately absent: a rejected document has stopped
+/// moving but settles nothing, so nothing may rest on it. Widening the set
+/// to cover it would make it legal to depend on a decision the project
+/// declined — the one edge this vocabulary exists to keep visible.
+///
+/// `consumed` was added 2026-08-02 (`HANDOFF-037` § A3) for the `[HANDOFF]`
+/// claim protocol (`ADR-105`): a consumed handoff has been *executed*, so
+/// it has stopped moving and resting on it is safe. Until then, 29 finished
+/// handoffs sat in `ctxgrd status`'s ready queue.
+///
+/// `deferred` was proposed alongside it and **declined**, for `rejected`'s
+/// reason. `ADR-105` calls it an "unexecuted terminal", and it is terminal
+/// for the claim protocol — no agent should pick a deferred handoff up. But
+/// this set answers a second question too, which DPS-003 deliberately
+/// unified with the first: *may a finished document rest on this one?* A
+/// deferred document is paused, not done; the work has not happened, and a
+/// terminal document depending on it is exactly what `core.dep-status`
+/// exists to surface. `rules::tests::dep_status_wording_never_infers_what_a_status_means`
+/// pins that. That split shipped in `ADR-121`: `deferred` now sits in
+/// [`SETTLED_ONLY_STATUSES`], settled for the census and non-arming here —
+/// which is what TRM-003 predicted and why it stays out of this list.
+pub(crate) const DEFAULT_TERMINAL_STATUSES: &[&str] = &[
     "accepted",
     "superseded",
     "done",
@@ -3961,8 +5290,53 @@ const DEFAULT_TERMINAL_STATUSES: &[&str] = &[
     "duplicate",
     "closed",
     "implemented",
+    "consumed",
     "n/a",
 ];
+
+/// The statuses that are **settled but not arming**: a document carrying one
+/// has stopped moving and needs no further work, yet nothing may rest on it.
+///
+/// This is the second half of the split `ADR-120` § TRM-003 named and `ADR-121`
+/// executed. The list above answers *may a document rest on this one?* — the
+/// question `core.dep-status` and `core.acceptance-complete` ask. The census in
+/// [`crate::status`] asks a different one: *does this still have work left?*
+/// The two answers diverge on exactly the statuses here.
+///
+/// `rejected` is the motivating case (`BUG-037`). A rejected decision is
+/// finished — there is nothing left to do and it does not belong in a work
+/// queue — but it settles nothing, so an edge into it must stay reportable.
+/// Adding it to `DEFAULT_TERMINAL_STATUSES` would have silenced the one edge
+/// that vocabulary exists to keep visible (`ADR-106` § DPS-003).
+///
+/// `deferred` is the same shape, arriving from the other direction: `ADR-105`
+/// calls it an "unexecuted terminal", so no agent should pick a deferred
+/// handoff up (settled), but the work has not happened, so a finished document
+/// depending on one is exactly what `core.dep-status` should surface (not
+/// arming). It was declined from the list above in `ADR-120` § TRM-002 for
+/// precisely this reason, with the split recorded as the real fix.
+///
+/// Never read this alone — read [`is_settled_status`], which is defined as the
+/// union with `DEFAULT_TERMINAL_STATUSES` so the settled set cannot drift from
+/// the arming set it extends.
+pub(crate) const SETTLED_ONLY_STATUSES: &[&str] = &["rejected", "deferred"];
+
+/// Is `status` **settled** — finished, with no work left — for the readiness
+/// census? True for every arming status ([`DEFAULT_TERMINAL_STATUSES`]) plus
+/// the settled-but-not-arming ones ([`SETTLED_ONLY_STATUSES`]).
+///
+/// The union is computed, never transcribed: a status added to the arming
+/// vocabulary is settled by construction, which is the drift `BUG-037`'s fix
+/// (a) warned about. Compared case-insensitively, like every other read of a
+/// `status` field.
+///
+/// Callers wanting *may a document rest on this one?* must ask
+/// `DEFAULT_TERMINAL_STATUSES` directly — this predicate is deliberately wider
+/// and answers only the census question.
+pub(crate) fn is_settled_status(status: &str) -> bool {
+    let s = status.to_lowercase();
+    DEFAULT_TERMINAL_STATUSES.contains(&s.as_str()) || SETTLED_ONLY_STATUSES.contains(&s.as_str())
+}
 
 /// `todo.listed`: a document with a non-terminal `status` MUST be mentioned
 /// in the repo-root `TODO.md`. Opt-in — not in any pack default.
@@ -4196,6 +5570,259 @@ pub(crate) fn check_design_token_ref(
                     );
                 }
             }
+        }
+    }
+
+    out
+}
+
+// -- PRODUCT namespace (product.register) -----------------------------
+
+/// Default `registers` allowlist: the two design registers PRODUCT.md may
+/// declare (ADR-104 § PMD-001).
+const DEFAULT_PRODUCT_REGISTERS: &[&str] = &["brand", "product"];
+/// Default `platforms` allowlist. An absent `## Platform` section means
+/// `web`, so the value set is only consulted when the section is present.
+const DEFAULT_PRODUCT_PLATFORMS: &[&str] = &["web", "ios", "android", "adaptive"];
+/// Default section required by (and only by) the `brand` register.
+const DEFAULT_CONDITIONAL_SECTION: &str = "Conversion & Proof";
+/// Default register value that turns the conditional section on.
+const DEFAULT_CONDITIONAL_ON: &str = "brand";
+
+/// Read a string config param, falling back to `default`.
+fn product_str_param<'a>(params: Option<&'a Value>, key: &str, default: &'a str) -> &'a str {
+    params
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+}
+
+/// Read a string-array config param, falling back to `default`.
+fn product_list_param<'a>(params: Option<&'a Value>, key: &str, default: &[&'a str]) -> Vec<&'a str> {
+    params
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_else(|| default.to_vec())
+}
+
+/// The 1-indexed line of the first H2 whose normalized text equals `name`.
+fn h2_heading_line(ast: &crate::ast::Ast, name: &str) -> u32 {
+    ast.headings
+        .iter()
+        .filter(|h| h.level == 2)
+        .find(|h| normalize_heading(&h.text) == name)
+        .map(|h| h.line)
+        .unwrap_or(0)
+}
+
+/// The non-empty content lines of an H2 section, trimmed.
+fn h2_section_values<'a>(body_lines: &[&'a str], start: usize, end: usize) -> Vec<&'a str> {
+    body_lines[start.min(body_lines.len())..end.min(body_lines.len())]
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `product.register` (ADR-104): PRODUCT.md's machine-read fields.
+///
+/// `## Register` and `## Platform` are not prose — the impeccable skill's
+/// `context.mjs` parses the first non-empty line under each and branches the
+/// whole run on it (register picks the `brand.md` / `product.md` reference,
+/// platform picks HIG / Material 3 / neither). This rule guards that wire
+/// contract and the one structural consequence of it: `Conversion & Proof` is
+/// required by the `brand` register and must be absent under `product`.
+///
+/// Severity tracks the consumer, never exceeding it. A value outside the
+/// allowlist is an error (the consumer cannot resolve it), but trailing prose
+/// under an otherwise-valid value is a warning — the spec says "no prose, no
+/// commentary", yet the extractor reads the first line and carries on.
+/// An absent `## Platform` is legal and means `web`.
+///
+/// File-level, for the same reason as `design.section-order`: PRODUCT.md is a
+/// path-claimed id-less singleton and never becomes an id-keyed `Document`
+/// (BUG-007). Section presence for `Register` and `Platform` is owned here
+/// rather than by `core.required-headings`, so no heading is checked twice.
+pub(crate) fn check_product_register(
+    doc: &Document,
+    params: Option<&Value>,
+    _root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(ast) = doc.ast.as_ref() else {
+        return Vec::new();
+    };
+    let body_lines: Vec<&str> = doc.body.lines().collect();
+
+    let registers = product_list_param(params, "registers", DEFAULT_PRODUCT_REGISTERS);
+    let platforms = product_list_param(params, "platforms", DEFAULT_PRODUCT_PLATFORMS);
+    let conditional_section =
+        product_str_param(params, "conditional_section", DEFAULT_CONDITIONAL_SECTION);
+    let conditional_on = product_str_param(params, "conditional_on", DEFAULT_CONDITIONAL_ON);
+
+    let mut out = Vec::new();
+
+    // -- Register: required, bare, allowlisted.
+    let mut register: Option<String> = None;
+    match h2_section_window(ast, body_lines.len(), "register") {
+        None => out.push(
+            Diagnostic::error(
+                PRODUCT_REGISTER,
+                doc.location.clone(),
+                0,
+                0,
+                "`## Register` section is missing".to_string(),
+            )
+            .with_help(format!(
+                "add a `## Register` section holding a bare `{}`",
+                registers.join("` or `")
+            )),
+        ),
+        Some((start, end)) => {
+            let line = h2_heading_line(ast, "register");
+            let values = h2_section_values(&body_lines, start, end);
+            match values.split_first() {
+                None => out.push(
+                    Diagnostic::error(
+                        PRODUCT_REGISTER,
+                        doc.location.clone(),
+                        line,
+                        0,
+                        "`## Register` is empty".to_string(),
+                    )
+                    .with_help(format!("write a bare `{}`", registers.join("` or `"))),
+                ),
+                Some((first, rest)) => {
+                    let value = first.to_lowercase();
+                    if registers.contains(&value.as_str()) {
+                        register = Some(value);
+                    } else {
+                        out.push(
+                            Diagnostic::error(
+                                PRODUCT_REGISTER,
+                                doc.location.clone(),
+                                line,
+                                0,
+                                format!("register `{first}` is not a recognized value"),
+                            )
+                            .with_help(format!(
+                                "use a bare `{}` — the impeccable skill reads this line to \
+                                 pick the register reference",
+                                registers.join("` or `")
+                            )),
+                        );
+                    }
+                    if !rest.is_empty() {
+                        out.push(
+                            Diagnostic::warning(
+                                PRODUCT_REGISTER,
+                                doc.location.clone(),
+                                line,
+                                0,
+                                "`## Register` carries prose beyond its value".to_string(),
+                            )
+                            .with_help(
+                                "the value is a bare word — readers take the first line and \
+                                 ignore the rest",
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // -- Platform: optional (absent means `web`), bare, allowlisted.
+    if let Some((start, end)) = h2_section_window(ast, body_lines.len(), "platform") {
+        let line = h2_heading_line(ast, "platform");
+        let values = h2_section_values(&body_lines, start, end);
+        match values.split_first() {
+            None => out.push(
+                Diagnostic::warning(
+                    PRODUCT_REGISTER,
+                    doc.location.clone(),
+                    line,
+                    0,
+                    "`## Platform` is empty — readers will treat this project as `web`"
+                        .to_string(),
+                )
+                .with_help(format!("write a bare `{}`", platforms.join("` or `"))),
+            ),
+            Some((first, rest)) => {
+                if !platforms.contains(&first.to_lowercase().as_str()) {
+                    out.push(
+                        Diagnostic::warning(
+                            PRODUCT_REGISTER,
+                            doc.location.clone(),
+                            line,
+                            0,
+                            format!(
+                                "platform `{first}` is not recognized — readers will treat \
+                                 this project as `web`"
+                            ),
+                        )
+                        .with_help(format!(
+                            "use a bare `{}`, naming the design language the app renders, \
+                             not the toolchain",
+                            platforms.join("` or `")
+                        )),
+                    );
+                }
+                if !rest.is_empty() {
+                    out.push(
+                        Diagnostic::warning(
+                            PRODUCT_REGISTER,
+                            doc.location.clone(),
+                            line,
+                            0,
+                            "`## Platform` carries prose beyond its value".to_string(),
+                        )
+                        .with_help(
+                            "the value is a bare word — readers take the first line and \
+                             ignore the rest",
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // -- The register-conditional section. Skipped when the register did not
+    // resolve: there is no decision to enforce against.
+    if let Some(register) = register {
+        let normalized = normalize_heading(conditional_section);
+        let present = h2_section_window(ast, body_lines.len(), &normalized).is_some();
+        let wanted = register == conditional_on.to_lowercase();
+        if wanted && !present {
+            out.push(
+                Diagnostic::error(
+                    PRODUCT_REGISTER,
+                    doc.location.clone(),
+                    0,
+                    0,
+                    format!(
+                        "the `{register}` register requires a `## {conditional_section}` section"
+                    ),
+                )
+                .with_help(format!("add a `## {conditional_section}` section")),
+            );
+        } else if !wanted && present {
+            out.push(
+                Diagnostic::error(
+                    PRODUCT_REGISTER,
+                    doc.location.clone(),
+                    h2_heading_line(ast, &normalized),
+                    0,
+                    format!(
+                        "`## {conditional_section}` belongs to the `{conditional_on}` register, \
+                         but this file declares `{register}`"
+                    ),
+                )
+                .with_help(format!(
+                    "drop the section, heading included, or change the register to \
+                     `{conditional_on}`"
+                )),
+            );
         }
     }
 
@@ -4669,6 +6296,29 @@ mod tests {
     use crate::ast::{Ast, Heading, Link};
     use std::collections::BTreeMap;
 
+    /// Prose-drift guard for the third copy of the `research.type` vocabulary
+    /// (ADR-095). The enforcement const `RESEARCH_TYPES` and the `research.type`
+    /// json metadata now share one source; the pack.toml comment documents the
+    /// same vocabulary in prose. Deriving that comment from the metadata (full
+    /// PDOC-003) would need the config generator to inject it — out of scope
+    /// here — so this cheaply asserts every enforced genre is still named in the
+    /// pack comment, catching drift without wiring generation.
+    #[test]
+    fn research_pack_comment_lists_every_research_type() {
+        let pack = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packs/research/pack.toml"
+        ))
+        .expect("packs/research/pack.toml is readable");
+        for genre in RESEARCH_TYPES {
+            assert!(
+                pack.contains(genre),
+                "packs/research/pack.toml comment must mention the `{genre}` research.type genre \
+                 (prose drift from RESEARCH_TYPES)"
+            );
+        }
+    }
+
     fn doc(location: &str, body: &str, headings: Vec<(u8, &str)>) -> Document {
         Document {
             id: "AGENTS-1"
@@ -4853,6 +6503,42 @@ mod tests {
     }
 
     #[test]
+    fn scan_file_level_retains_synthetic_documents() {
+        // ADR-103 § SRF-001: a path-claimed id-less file yields one entry
+        // in `scan.documents` with its location set, an empty `raw_id`,
+        // and a populated AST + frontmatter metadata.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("ctxgrd.toml"),
+            "[AGENTS]\npaths = [\"CLAUDE.md\"]\nrules = [\"agents.context-budget\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            "---\ntitle: Build guide\n---\n# Build guide\n\nRun make check.\n",
+        )
+        .unwrap();
+
+        let config = crate::config::load_with_global(root, None).expect("config loads");
+        let claims = PathClaims::from_config(&config);
+        let scan = scan_file_level(root, &config, &claims).expect("scan succeeds");
+
+        assert_eq!(scan.files_linted, 1);
+        assert_eq!(scan.documents.len(), 1, "synthetic document retained");
+        let doc = &scan.documents[0];
+        assert_eq!(doc.location, "CLAUDE.md");
+        assert_eq!(doc.raw_id, "");
+        assert_eq!(doc.id.namespace, "AGENTS");
+        assert_eq!(
+            doc.metadata.get("title"),
+            Some(&serde_json::Value::String("Build guide".to_string()))
+        );
+        let ast = doc.ast.as_ref().expect("ast populated");
+        assert_eq!(ast.headings[0].text, "Build guide");
+    }
+
+    #[test]
     fn dangling_import_ignores_tokens_in_fenced_code() {
         // BUG-006: a decorator in a fenced example is not an import —
         // Claude Code does not resolve tokens inside code blocks.
@@ -4864,14 +6550,34 @@ mod tests {
     }
 
     #[test]
-    fn dangling_import_ignores_tokens_in_inline_code() {
-        // BUG-006: a backticked token is documentation about the syntax;
-        // Claude Code does not resolve inline-code spans.
+    fn dangling_import_reads_tokens_in_inline_code() {
+        // Reverses BUG-006's inline half (BUG-029 follow-up). Claude Code
+        // resolves a backticked `@path`, so a dangling one inside a span is
+        // a real lost reference and must warn. BUG-006's masking was right
+        // about fenced blocks — see `dangling_import_ignores_tokens_in_
+        // fenced_code`, still passing — and unmeasured about spans.
         let tmp = tempfile::tempdir().expect("tempdir");
         let body = "Write `import @docs/missing.md` style imports.\n";
         let d = synthetic_document("AGENTS", "CLAUDE.md".to_string(), body.to_string());
         let diags = dangling_import_diags(&d, tmp.path());
-        assert!(diags.is_empty(), "inline code must not warn: {diags:?}");
+        assert_eq!(diags.len(), 1, "inline-code import must warn: {diags:?}");
+        assert!(diags[0].message.contains("`@docs/missing.md`"));
+    }
+
+    #[test]
+    fn dangling_import_skips_backtick_adjacent_token() {
+        // The guard that replaces span masking: a backtick directly against
+        // the `@` is not whitespace, so the token never matches. This is the
+        // form documentation actually writes, and it is what keeps a
+        // CLAUDE.md describing this rule from flagging itself.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let body = "Never write `@docs/missing.md` as an import.\n";
+        let d = synthetic_document("AGENTS", "CLAUDE.md".to_string(), body.to_string());
+        let diags = dangling_import_diags(&d, tmp.path());
+        assert!(
+            diags.is_empty(),
+            "a backtick-adjacent token is not an import: {diags:?}"
+        );
     }
 
     #[test]
@@ -4935,6 +6641,106 @@ mod tests {
             "warning should suggest the lazy link: {:?}",
             diags[0].help
         );
+    }
+
+    #[test]
+    fn headings_rule_warns_on_inline_eager_import() {
+        // BUG-029 case A. Claude Code resolves a mid-sentence `@TODO.md`
+        // exactly as it resolves an own-line one, so this is eager. Under
+        // the old own-line grammar the import was invisible here and the
+        // rule fell through to "does not link to it" — an orphan error
+        // about a file the agent loads on every turn.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
+        let d = synthetic_document(
+            "AGENTS",
+            "CLAUDE.md".to_string(),
+            "# Project\n\nVolatile state lives in @TODO.md, read it first.\n".to_string(),
+        );
+        let diags = check_context_headings(&d, None, root);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
+        assert!(
+            diags[0].message.contains("eagerly"),
+            "inline import must raise the eager warning, not the orphan error: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn headings_rule_warns_on_inline_import_despite_lazy_link() {
+        // BUG-029 case C — the live `llmkit-bug042` shape, and the worst of
+        // the three: an inline import plus the lazy link the help line
+        // suggests. The link satisfied the discoverability half and nothing
+        // was left to notice the import, so the file linted clean while the
+        // reader loaded a 209k-char TODO.md into every session prefix.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
+        let d = synthetic_document(
+            "AGENTS",
+            "CLAUDE.md".to_string(),
+            "# Project\n\nState lives in @TODO.md.\n\n[TODO.md](TODO.md)\n".to_string(),
+        );
+        let diags = check_context_headings(&d, None, root);
+        assert_eq!(
+            diags.len(),
+            1,
+            "a lazy link must not cancel an eager import: {diags:?}"
+        );
+        assert!(diags[0].message.contains("eagerly"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn headings_rule_warns_on_import_inside_inline_code() {
+        // BUG-029 follow-up. A code span does not stop Claude Code from
+        // resolving the token, so it must not stop the rule either — the
+        // file is loaded eagerly and the lazy link alongside it does not
+        // undo that. Was clean before this change; the owner's call.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
+        let d = synthetic_document(
+            "AGENTS",
+            "CLAUDE.md".to_string(),
+            "# Project\n\nDo not write `state in @TODO.md` inline.\n\n[TODO.md](TODO.md)\n"
+                .to_string(),
+        );
+        let diags = check_context_headings(&d, None, root);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("eagerly"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn headings_rule_ignores_backtick_adjacent_todo_mention() {
+        // The surviving self-reference guard, and the one this repo's own
+        // CLAUDE.md relies on: `@TODO.md` written with the backtick against
+        // the `@` is prose about the syntax, not an import.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("TODO.md"), "# TODO\n").unwrap();
+        let d = synthetic_document(
+            "AGENTS",
+            "CLAUDE.md".to_string(),
+            "# Project\n\nLinked, not `@TODO.md`-imported.\n\n[TODO.md](TODO.md)\n".to_string(),
+        );
+        assert!(
+            check_context_headings(&d, None, root).is_empty(),
+            "a backtick-adjacent mention must stay clean"
+        );
+    }
+
+    #[test]
+    fn wide_import_paths_are_not_line_anchored() {
+        // Counterpart to `import_paths_are_line_anchored`. The reader's
+        // grammar takes the token anywhere on the line, while keeping the
+        // conservative filters: emails are skipped (no whitespace before
+        // `@`) and a dotless word is not file-like once its trailing
+        // sentence punctuation is stripped.
+        let body = "@TODO.md\nSee @docs/plan.md mid-prose.\nEmail a@b.com\n@internal.\n";
+        let d = synthetic_document("AGENTS", "CLAUDE.md".to_string(), body.to_string());
+        assert_eq!(wide_import_paths(&d), vec!["TODO.md", "docs/plan.md"]);
     }
 
     #[test]
@@ -5272,7 +7078,7 @@ tests pass
         assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
         assert!(diags[0].message.contains("`src/routes/projects.ts`"));
         // Pointed at the bullet's line (line 4 of the body).
-        assert_eq!(diags[0].line, 4);
+        assert_eq!(diags[0].line, Some(4));
     }
 
     #[test]
@@ -5379,7 +7185,7 @@ tests pass
         assert_eq!(diags.len(), 1, "unexpected: {diags:?}");
         assert_eq!(diags[0].code, "agent.assigned");
         assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
-        assert_eq!(diags[0].line, 5, "points at the `agents` frontmatter line");
+        assert_eq!(diags[0].line, Some(5), "points at the `agents` frontmatter line");
         assert!(
             diags[0].message.contains("code-viewer"),
             "names the unresolved agent: {:?}",
@@ -5525,7 +7331,7 @@ tests pass
             "names the defect: {}",
             diags[0].message
         );
-        assert_eq!(diags[0].line, 4);
+        assert_eq!(diags[0].line, Some(4));
     }
 
     #[test]
@@ -6083,7 +7889,7 @@ shall is discussed in the EARS paper.
             "message: {}",
             diags[0].message
         );
-        assert_eq!(diags[0].line, 2, "diagnostic anchored at Overview heading");
+        assert_eq!(diags[0].line, Some(2), "diagnostic anchored at Overview heading");
     }
 
     #[test]
@@ -6126,6 +7932,176 @@ shall is discussed in the EARS paper.
             diags.is_empty(),
             "no recognized sections must pass: {diags:?}"
         );
+    }
+
+    // -- product.register (ADR-104 § PMD-001..003) -----------------------
+
+    /// A PRODUCT.md built from real markdown — `product.register` reads the
+    /// body lines under each heading, so a headings-only synthetic AST would
+    /// not exercise it.
+    fn product_doc(register: &str, platform: Option<&str>, conversion: bool) -> Document {
+        let mut body = format!("# Product\n\n## Register\n\n{register}\n");
+        if let Some(platform) = platform {
+            body.push_str(&format!("\n## Platform\n\n{platform}\n"));
+        }
+        body.push_str(
+            "\n## Users\n\nA Mac knowledge worker who wants healthy work rhythms.\n\
+             \n## Product Purpose\n\nAn ambient reminder companion for macOS.\n",
+        );
+        if conversion {
+            body.push_str(
+                "\n## Conversion & Proof\n\n- Primary CTA: Download the app.\n\
+                 - Secondary CTA: See how it works.\n",
+            );
+        }
+        body.push_str("\n## Design Principles\n\n- Keep the reminder calm until it matters.\n");
+        Document {
+            id: "PRODUCT-0".parse().unwrap(),
+            raw_id: String::new(),
+            location: "PRODUCT.md".to_owned(),
+            depends_on: Vec::new(),
+            frontmatter_lines: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            pin: None,
+            ast: Some(markdown::parse_ast(&body)),
+            body,
+        }
+    }
+
+    #[test]
+    fn product_register_brand_with_conversion_passes() {
+        let d = product_doc("brand", Some("web"), true);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "a conformant brand file must pass: {diags:?}");
+    }
+
+    #[test]
+    fn product_register_product_without_conversion_passes() {
+        let d = product_doc("product", Some("ios"), false);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "a conformant product file must pass: {diags:?}");
+    }
+
+    #[test]
+    fn product_register_absent_platform_passes() {
+        // An absent `## Platform` is legal and means `web` (init.md Step 4).
+        let d = product_doc("brand", None, true);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "absent platform must be silent: {diags:?}");
+    }
+
+    #[test]
+    fn product_register_unknown_value_errors() {
+        let d = product_doc("marketing", Some("web"), true);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one register error: {diags:?}");
+        assert_eq!(diags[0].code, "product.register");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+        assert!(diags[0].message.contains("marketing"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn product_register_unresolved_skips_the_conditional_arm() {
+        // `marketing` is not a register, so there is no decision to enforce
+        // `Conversion & Proof` against — one error, not two.
+        let d = product_doc("marketing", Some("web"), false);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "conditional arm must be skipped: {diags:?}");
+    }
+
+    #[test]
+    fn product_register_prose_instead_of_bare_value_errors() {
+        let d = product_doc("This is a brand surface, mostly.", Some("web"), true);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one register error: {diags:?}");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+    }
+
+    #[test]
+    fn product_register_trailing_commentary_warns_but_resolves() {
+        let d = product_doc("brand\n\nWe may revisit this once the app ships.", Some("web"), true);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one prose warning: {diags:?}");
+        assert_eq!(
+            diags[0].severity,
+            crate::diagnostic::Severity::Warning,
+            "the reader takes the first line and carries on, so this never errors"
+        );
+    }
+
+    #[test]
+    fn product_register_missing_section_errors() {
+        let mut d = product_doc("brand", Some("web"), true);
+        let body = d.body.replace("## Register\n\nbrand\n", "");
+        d.ast = Some(markdown::parse_ast(&body));
+        d.body = body;
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one missing-section error: {diags:?}");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+        assert!(diags[0].message.contains("missing"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn product_register_unknown_platform_warns_matching_the_reader() {
+        // The consumer falls back to `web` on an unrecognized platform rather
+        // than failing, so the linter must not be stricter than it.
+        let d = product_doc("brand", Some("macOS"), true);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one platform warning: {diags:?}");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
+        assert!(diags[0].message.contains("macOS"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn product_register_brand_missing_conversion_errors() {
+        let d = product_doc("brand", Some("web"), false);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one conditional error: {diags:?}");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+        assert!(
+            diags[0].message.contains("Conversion & Proof"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn product_register_product_carrying_conversion_errors() {
+        let d = product_doc("product", Some("web"), true);
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "expected one conditional error: {diags:?}");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+        assert!(
+            diags[0].message.contains("belongs to the `brand` register"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn product_register_conditional_heading_matched_case_insensitively() {
+        // init.md's template writes `## Conversion & proof`; the wild writes
+        // `## Conversion & Proof`. Capitalization must not be load-bearing.
+        let mut d = product_doc("brand", Some("web"), true);
+        let body = d.body.replace("## Conversion & Proof", "## Conversion & proof");
+        d.ast = Some(markdown::parse_ast(&body));
+        d.body = body;
+        let diags = check_product_register(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "capitalization must not matter: {diags:?}");
+    }
+
+    #[test]
+    fn product_register_values_are_config_driven() {
+        // Nothing about impeccable is baked into the binary.
+        let d = product_doc("editorial", Some("print"), false);
+        let params = serde_json::json!({
+            "registers": ["editorial", "commerce"],
+            "platforms": ["print", "web"],
+            "conditional_section": "Circulation",
+            "conditional_on": "commerce",
+        });
+        let diags = check_product_register(&d, Some(&params), Path::new("."));
+        assert!(diags.is_empty(), "config allowlists must govern: {diags:?}");
     }
 
     // -- design.token-ref (ADR-027 § DES-003) ----------------------------
@@ -6314,7 +8290,7 @@ shall is discussed in the EARS paper.
             "order arm must be a warning, never an error"
         );
         assert!(diags[0].message.contains("Voice Principles"), "{}", diags[0].message);
-        assert_eq!(diags[0].line, 2, "anchored at the out-of-order heading");
+        assert_eq!(diags[0].line, Some(2), "anchored at the out-of-order heading");
     }
 
     #[test]
@@ -6643,6 +8619,45 @@ shall is discussed in the EARS paper.
         assert!(diags.is_empty(), "file-relative `../SOUL.md` must satisfy: {diags:?}");
     }
 
+    #[test]
+    fn requires_link_help_suggests_a_reference_that_satisfies_it() {
+        // BUG-035: `targets` resolve against the lint root, references
+        // resolve against the document. The help renders references, so it
+        // must render them at the document's depth — otherwise pasting the
+        // suggestion verbatim leaves the diagnostic standing for every
+        // document below the root.
+        //
+        // Asserted as the property (the suggestion, inserted verbatim,
+        // clears the diagnostic) rather than as a string, and at depth 0, 1
+        // and 2: a test written only at the root reproduces the bug instead
+        // of catching it, since depth 0 is the case that already worked.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("SOUL.md"), "# Soul\n").expect("write SOUL.md");
+        std::fs::create_dir_all(tmp.path().join("cli/nested")).expect("mkdir cli/nested");
+        let params = serde_json::json!({"targets": ["SOUL.md"]});
+
+        for location in ["CLAUDE.md", "cli/CLAUDE.md", "cli/nested/CLAUDE.md"] {
+            let d = guide_doc(location, "# Guide\n\nNo persona reference here.\n");
+            let diags = check_requires_link(&d, Some(&params), tmp.path());
+            assert_eq!(diags.len(), 1, "{location} must fire unreferenced: {diags:?}");
+            let help = diags[0].help.as_deref().expect("the diagnostic carries help");
+            // The help quotes the markdown link and the `@import` in
+            // backticks, in that order.
+            let quoted: Vec<&str> = help.split('`').skip(1).step_by(2).collect();
+            assert_eq!(quoted.len(), 2, "help quotes both reference forms: {help}");
+
+            for suggestion in quoted {
+                let fixed = guide_doc(location, &format!("# Guide\n\n{suggestion}\n"));
+                let after = check_requires_link(&fixed, Some(&params), tmp.path());
+                assert!(
+                    after.is_empty(),
+                    "the help for {location} suggested `{suggestion}`, \
+                     which does not satisfy the rule it was suggested for: {after:?}",
+                );
+            }
+        }
+    }
+
     // -- soul.referenced / style.referenced (ADR-047 § PRF-001/002) -----
 
     /// A persona file at `location`; only its location is read by the rule
@@ -6780,7 +8795,7 @@ shall is discussed in the EARS paper.
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.dep-shape");
         assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
-        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[0].line, Some(5));
         assert!(
             diags[0].message.contains("SPEC") && diags[0].message.contains("PRD"),
             "{}",
@@ -6941,6 +8956,77 @@ shall is discussed in the EARS paper.
         );
     }
 
+    // -- core.file-name (ADR-091 § FNM-001) ------------------------------
+
+    fn fname_doc(raw_id: &str, location: &str) -> Document {
+        let mut frontmatter_lines = BTreeMap::new();
+        frontmatter_lines.insert("id".to_owned(), 2u32);
+        Document {
+            id: raw_id.parse().unwrap(),
+            raw_id: raw_id.to_owned(),
+            location: location.to_owned(),
+            depends_on: Vec::new(),
+            frontmatter_lines,
+            metadata: BTreeMap::new(),
+            pin: None,
+            ast: None,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn file_name_clean_when_zero_padded_prefix_matches_id() {
+        let d = fname_doc("ADR-91", "docs/adrs/091-file-name-rule.md");
+        assert!(check_file_name(&d, None, Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn file_name_clean_when_unpadded_prefix_matches_id_numerically() {
+        // FNM-003: compared as numbers, so `88-` satisfies `id: ADR-88`
+        // even though the padding width differs from the `088-` convention.
+        let d = fname_doc("ADR-88", "docs/adrs/88-checklist-pack.md");
+        assert!(check_file_name(&d, None, Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn file_name_errors_when_prefix_number_differs_from_id() {
+        let d = fname_doc("ADR-88", "docs/adrs/087-roadmap.md");
+        let diags = check_file_name(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.file-name");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+        assert_eq!(diags[0].line, Some(2));
+        assert_eq!(
+            diags[0].message,
+            "ADR-88: filename prefix `087` does not match the id number 88"
+        );
+    }
+
+    #[test]
+    fn file_name_errors_when_no_numeric_prefix() {
+        let d = fname_doc("ADR-88", "docs/adrs/roadmap-namespace.md");
+        let diags = check_file_name(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.file-name");
+        assert_eq!(
+            diags[0].message,
+            "ADR-88: filename `roadmap-namespace.md` has no numeric prefix — \
+             expected it to start with `88` to match the id"
+        );
+    }
+
+    #[test]
+    fn file_name_errors_when_prefix_overflows_u32() {
+        // A prefix too large to be any real id number is a mismatch, not a panic.
+        let d = fname_doc("ADR-88", "docs/adrs/99999999999-x.md");
+        let diags = check_file_name(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "ADR-88: filename prefix `99999999999` does not match the id number 88"
+        );
+    }
+
     // -- core.calendar-freshness (ADR-040 § PIN-008) ---------------------
 
     #[test]
@@ -6975,7 +9061,7 @@ shall is discussed in the EARS paper.
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "core.calendar-freshness");
         assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
-        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[0].line, Some(5));
         assert!(
             diags[0].message.contains("POLICY-001 is stale")
                 && diags[0].message.contains("`reviewed_date`"),
@@ -7052,7 +9138,7 @@ shall is discussed in the EARS paper.
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "security.vuln-sla");
         assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
-        assert_eq!(diags[0].line, 3);
+        assert_eq!(diags[0].line, Some(3));
         assert!(
             diags[0].message.starts_with("VULN-014: open `high` finding is")
                 && diags[0].message.ends_with("past its 30-day SLA"),
@@ -7142,6 +9228,35 @@ shall is discussed in the EARS paper.
         assert!(diags[0].message.contains("open `critical` finding"));
     }
 
+    // -- the conditional-link matcher (BUG-030 / BUG-031) ----------------
+
+    /// Config params plus the synthesized resolved-refs set, exactly as
+    /// `run.rs` assembles them — `present` names the ids that exist in the
+    /// run besides `doc`'s own.
+    ///
+    /// The refs are computed by the **production** [`resolved_refs`] rather
+    /// than hand-written, so these tests exercise the real matcher: the
+    /// resolution lookup, the own-id exclusion, and the code-span/
+    /// strikethrough filter. A hand-written array would let the matcher
+    /// regress while every test still passed.
+    ///
+    /// A test that omits this and passes bare config params is asserting
+    /// the *fail-closed* path, not the rule's logic — see
+    /// `conditional_link_rules_fail_closed_without_resolution`.
+    fn with_refs(params: Option<serde_json::Value>, doc: &Document, present: &[&str]) -> serde_json::Value {
+        let mut known: BTreeSet<DocumentId> = present
+            .iter()
+            .map(|s| s.parse().expect("test fixture id parses"))
+            .collect();
+        known.insert(doc.id.clone());
+        let refs = resolved_refs(doc, &known);
+        let mut merged = params.unwrap_or_else(|| serde_json::json!({}));
+        merged[RESOLVED_REFS_PARAM] = serde_json::Value::Array(
+            refs.into_iter().map(serde_json::Value::String).collect(),
+        );
+        merged
+    }
+
     // -- security.risk-expiry (ADR-041 § SEC-005) ------------------------
 
     /// A RISK/VULN document with metadata fields and `depends_on` links.
@@ -7206,7 +9321,7 @@ shall is discussed in the EARS paper.
         );
         let diags = check_risk_expiry(&d, None, Path::new("."));
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].line, 6);
+        assert_eq!(diags[0].line, Some(6));
         assert_eq!(
             diags[0].message,
             "RISK-005: `expires` (2020-01-01) is not in the future — re-decide the risk"
@@ -7249,15 +9364,45 @@ shall is discussed in the EARS paper.
     fn risk_expiry_exempt_when_links_canonical_risk() {
         // An accepted VULN that links a RISK is exempt — the RISK carries
         // the fields canonically, so the inline fields are not required.
-        let d = risk_doc("VULN-080", &[("status", "accepted")], &["RISK-003"]);
-        let params =
+        let cfg =
             serde_json::json!({ "require-when-status": "accepted", "exempt-when-links": "RISK" });
+        let d = risk_doc("VULN-080", &[("status", "accepted")], &["RISK-003"]);
+        let params = with_refs(Some(cfg.clone()), &d, &["RISK-003"]);
         assert!(check_risk_expiry(&d, Some(&params), Path::new(".")).is_empty());
 
         // Linking some other namespace does not exempt it.
         let d2 = risk_doc("VULN-081", &[("status", "accepted")], &["ADR-040"]);
-        let diags = check_risk_expiry(&d2, Some(&params), Path::new("."));
+        let params2 = with_refs(Some(cfg), &d2, &["ADR-040"]);
+        let diags = check_risk_expiry(&d2, Some(&params2), Path::new("."));
         assert_eq!(diags.len(), 3);
+    }
+
+    /// BUG-030, the exemption case and the most consequential one: a
+    /// phantom `RISK` link did not merely satisfy a requirement, it
+    /// *discharged* the signing and time-boxing requirement entirely. An
+    /// unsigned, un-time-boxed risk acceptance passed by citing a risk
+    /// document that was never written.
+    ///
+    /// The pair is the test. Identical documents, identical params; the only
+    /// difference is whether `RISK-003` exists in the run.
+    #[test]
+    fn risk_expiry_phantom_risk_link_grants_no_exemption() {
+        let cfg =
+            serde_json::json!({ "require-when-status": "accepted", "exempt-when-links": "RISK" });
+        let d = risk_doc("VULN-082", &[("status", "accepted")], &["RISK-003"]);
+
+        let exists = with_refs(Some(cfg.clone()), &d, &["RISK-003"]);
+        assert!(
+            check_risk_expiry(&d, Some(&exists), Path::new(".")).is_empty(),
+            "a resolving RISK link must still exempt"
+        );
+
+        let phantom = with_refs(Some(cfg), &d, &[]);
+        assert_eq!(
+            check_risk_expiry(&d, Some(&phantom), Path::new(".")).len(),
+            3,
+            "a RISK that does not exist must not discharge approver/rationale/expires"
+        );
     }
 
     // -- security.remediation-link (ADR-041 § SEC-006) -------------------
@@ -7288,7 +9433,11 @@ shall is discussed in the EARS paper.
     #[test]
     fn remediation_link_green_with_depends_on() {
         let d = remediation_doc("VULN-014", "mitigated", &["ADR-040"], "Fixed.");
-        let params = serde_json::json!({ "require-when-status": "mitigated" });
+        let params = with_refs(
+            Some(serde_json::json!({ "require-when-status": "mitigated" })),
+            &d,
+            &["ADR-040"],
+        );
         assert!(check_remediation_link(&d, Some(&params), Path::new(".")).is_empty());
     }
 
@@ -7300,7 +9449,11 @@ shall is discussed in the EARS paper.
             &[],
             "Remediated by ADR-040, which rewrote the auth boundary.",
         );
-        let params = serde_json::json!({ "require-when-status": "mitigated" });
+        let params = with_refs(
+            Some(serde_json::json!({ "require-when-status": "mitigated" })),
+            &d,
+            &["ADR-040"],
+        );
         assert!(check_remediation_link(&d, Some(&params), Path::new(".")).is_empty());
     }
 
@@ -7312,22 +9465,141 @@ shall is discussed in the EARS paper.
             &[],
             "We fixed it, trust me — no link.",
         );
-        let params = serde_json::json!({ "require-when-status": "mitigated" });
+        let params = with_refs(
+            Some(serde_json::json!({ "require-when-status": "mitigated" })),
+            &d,
+            &[],
+        );
         let diags = check_remediation_link(&d, Some(&params), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "security.remediation-link");
-        assert_eq!(diags[0].line, 3);
+        assert_eq!(diags[0].line, Some(3));
         assert_eq!(
             diags[0].message,
-            "VULN-016: mitigated finding must cross-ref its remediation (an ADR or tracker id) \
-             — add a `depends_on` entry or a body cross-ref"
+            "VULN-016: mitigated finding must cross-ref its remediation — a resolving ADR link \
+             or a `remediation_link`"
+        );
+    }
+
+    /// BUG-031: `ctxgrd new VULN` scaffolds `# VULN-001: <title>` as the
+    /// body H1, and the rule accepted a token of *any* namespace — so every
+    /// scaffolded finding self-satisfied from birth and marking one
+    /// `mitigated` was enough to pass. Nothing had to be fixed.
+    ///
+    /// The pair differs only in whether the H1 carries the host's own id.
+    /// After the fix neither passes; before it, the first one did.
+    #[test]
+    fn remediation_link_own_id_in_scaffolded_h1_is_not_a_remediation() {
+        let cfg = serde_json::json!({ "require-when-status": "mitigated" });
+
+        let scaffolded = remediation_doc(
+            "VULN-019",
+            "mitigated",
+            &[],
+            "# VULN-019: Unauthenticated admin endpoint\n\nFixed it.",
+        );
+        let params = with_refs(Some(cfg.clone()), &scaffolded, &[]);
+        assert_eq!(
+            check_remediation_link(&scaffolded, Some(&params), Path::new(".")).len(),
+            1,
+            "the document's own id is not evidence that it was remediated"
+        );
+
+        let retitled = remediation_doc(
+            "VULN-019",
+            "mitigated",
+            &[],
+            "# Unauthenticated admin endpoint\n\nFixed it.",
+        );
+        let params = with_refs(Some(cfg.clone()), &retitled, &[]);
+        assert_eq!(
+            check_remediation_link(&retitled, Some(&params), Path::new(".")).len(),
+            1,
+            "removing the scaffolded H1 must not change the verdict — otherwise the test \
+             cannot tell a fix from a rename"
+        );
+
+        // And the fix does not simply ban everything: the same scaffolded
+        // H1 plus a real ADR link passes.
+        let fixed = remediation_doc(
+            "VULN-019",
+            "mitigated",
+            &["ADR-040"],
+            "# VULN-019: Unauthenticated admin endpoint\n\nFixed it.",
+        );
+        let params = with_refs(Some(cfg), &fixed, &["ADR-040"]);
+        assert!(check_remediation_link(&fixed, Some(&params), Path::new(".")).is_empty());
+    }
+
+    /// BUG-031 option 2: an unresolvable token is not a remediation either,
+    /// and an id outside `accepted-namespaces` does not stand in for one.
+    #[test]
+    fn remediation_link_rejects_phantom_and_off_vocabulary_links() {
+        let cfg = serde_json::json!({ "require-when-status": "mitigated" });
+
+        // A well-formed ADR id for an ADR nobody wrote (BUG-030).
+        let phantom = remediation_doc("VULN-020", "mitigated", &["ADR-999"], "Fixed.");
+        let params = with_refs(Some(cfg.clone()), &phantom, &[]);
+        assert_eq!(
+            check_remediation_link(&phantom, Some(&params), Path::new(".")).len(),
+            1
+        );
+
+        // A resolving link into a namespace that is not the remediation
+        // vocabulary. `accepted-namespaces` defaults to ADR.
+        let off_vocab = remediation_doc("VULN-021", "mitigated", &["POLICY-002"], "Fixed.");
+        let params = with_refs(Some(cfg.clone()), &off_vocab, &["POLICY-002"]);
+        assert_eq!(
+            check_remediation_link(&off_vocab, Some(&params), Path::new(".")).len(),
+            1
+        );
+
+        // Widening the vocabulary admits it — the param is the knob, not
+        // the absence of one.
+        let widened = serde_json::json!({
+            "require-when-status": "mitigated",
+            "accepted-namespaces": ["ADR", "POLICY"],
+        });
+        let params = with_refs(Some(widened), &off_vocab, &["POLICY-002"]);
+        assert!(check_remediation_link(&off_vocab, Some(&params), Path::new(".")).is_empty());
+    }
+
+    /// The external-tracker escape (BUG-031 option 2): a fix tracked outside
+    /// the document graph goes in an explicit field, so it is legible as
+    /// "opaque external pointer" rather than masquerading as a cross-ref
+    /// nothing can resolve. An empty value is not an escape.
+    #[test]
+    fn remediation_link_accepts_explicit_field_but_not_an_empty_one() {
+        let cfg = serde_json::json!({ "require-when-status": "mitigated" });
+
+        let mut d = remediation_doc("VULN-022", "mitigated", &[], "Fixed.");
+        d.metadata.insert(
+            "remediation_link".to_owned(),
+            serde_json::Value::String("JIRA-421".to_owned()),
+        );
+        let params = with_refs(Some(cfg.clone()), &d, &[]);
+        assert!(check_remediation_link(&d, Some(&params), Path::new(".")).is_empty());
+
+        let mut empty = remediation_doc("VULN-023", "mitigated", &[], "Fixed.");
+        empty.metadata.insert(
+            "remediation_link".to_owned(),
+            serde_json::Value::String("   ".to_owned()),
+        );
+        let params = with_refs(Some(cfg), &empty, &[]);
+        assert_eq!(
+            check_remediation_link(&empty, Some(&params), Path::new(".")).len(),
+            1
         );
     }
 
     #[test]
     fn remediation_link_silent_for_open_finding_out_of_scope() {
         let d = remediation_doc("VULN-017", "open", &[], "Still investigating.");
-        let params = serde_json::json!({ "require-when-status": "mitigated" });
+        let params = with_refs(
+            Some(serde_json::json!({ "require-when-status": "mitigated" })),
+            &d,
+            &[],
+        );
         assert!(check_remediation_link(&d, Some(&params), Path::new(".")).is_empty());
     }
 
@@ -7336,8 +9608,39 @@ shall is discussed in the EARS paper.
         // No require-when-status: the rule always acts, so an unlinked
         // finding is flagged regardless of status.
         let d = remediation_doc("VULN-018", "accepted", &[], "No link here.");
-        let diags = check_remediation_link(&d, None, Path::new("."));
+        let params = with_refs(None, &d, &[]);
+        let diags = check_remediation_link(&d, Some(&params), Path::new("."));
         assert_eq!(diags.len(), 1);
+    }
+
+    /// The fail-closed contract (BUG-030/BUG-031). Every rule in
+    /// `RESOLUTION_AWARE_RULES` is a false green in its unfixed form, so a
+    /// dropped param threading must produce a loud diagnostic rather than
+    /// silence. This test pins that: identical documents that would pass
+    /// with the resolution view fail without it.
+    ///
+    /// It is the test that would catch a future "simplification" of the
+    /// `run.rs` dispatch — and the reason the fallback is not permissive.
+    #[test]
+    fn conditional_link_rules_fail_closed_without_resolution() {
+        let cfg = serde_json::json!({ "require-when-status": "mitigated" });
+        let d = remediation_doc("VULN-024", "mitigated", &["ADR-040"], "Fixed.");
+        let threaded = with_refs(Some(cfg.clone()), &d, &["ADR-040"]);
+        assert!(check_remediation_link(&d, Some(&threaded), Path::new(".")).is_empty());
+        assert_eq!(
+            check_remediation_link(&d, Some(&cfg), Path::new(".")).len(),
+            1,
+            "without the resolved-refs param the rule must report a gap, not stay silent"
+        );
+
+        let ropa = ropa_doc("ROPA-020", "processor", &["DPA-003"], "Payroll processing.");
+        let threaded = with_refs(None, &ropa, &["DPA-003"]);
+        assert!(check_processor_dpa(&ropa, Some(&threaded), Path::new(".")).is_empty());
+        assert_eq!(
+            check_processor_dpa(&ropa, None, Path::new(".")).len(),
+            1,
+            "a parameterless rule must fail closed too — `None` params means no resolution"
+        );
     }
 
     // -- gdpr.processor-dpa (ADR-066 § GDPR-002) ------------------------
@@ -7368,7 +9671,8 @@ shall is discussed in the EARS paper.
     #[test]
     fn processor_dpa_green_with_dpa_depends_on() {
         let d = ropa_doc("ROPA-007", "processor", &["DPA-003"], "Payroll processing.");
-        assert!(check_processor_dpa(&d, None, Path::new(".")).is_empty());
+        let params = with_refs(None, &d, &["DPA-003"]);
+        assert!(check_processor_dpa(&d, Some(&params), Path::new(".")).is_empty());
     }
 
     #[test]
@@ -7379,7 +9683,23 @@ shall is discussed in the EARS paper.
             &[],
             "Governed by DPA-003, the executed processor agreement.",
         );
-        assert!(check_processor_dpa(&d, None, Path::new(".")).is_empty());
+        let params = with_refs(None, &d, &["DPA-003"]);
+        assert!(check_processor_dpa(&d, Some(&params), Path::new(".")).is_empty());
+    }
+
+    /// BUG-030: a processor-role ROPA discharged its Art. 28 obligation by
+    /// citing a DPA that does not exist. The pair differs only in whether
+    /// `DPA-003` is in the run.
+    #[test]
+    fn processor_dpa_phantom_dpa_does_not_satisfy() {
+        let d = ropa_doc("ROPA-010", "processor", &["DPA-003"], "Payroll processing.");
+        let exists = with_refs(None, &d, &["DPA-003"]);
+        assert!(check_processor_dpa(&d, Some(&exists), Path::new(".")).is_empty());
+        let phantom = with_refs(None, &d, &[]);
+        assert_eq!(
+            check_processor_dpa(&d, Some(&phantom), Path::new(".")).len(),
+            1
+        );
     }
 
     #[test]
@@ -7388,7 +9708,7 @@ shall is discussed in the EARS paper.
         let diags = check_processor_dpa(&d, None, Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "gdpr.processor-dpa");
-        assert_eq!(diags[0].line, 4);
+        assert_eq!(diags[0].line, Some(4));
         assert_eq!(
             diags[0].message,
             "ROPA-009: a processor-role ROPA must cross-ref its governing `DPA` \
@@ -7457,7 +9777,30 @@ shall is discussed in the EARS paper.
             &["POLICY-002"],
             "Implemented by our risk-analysis policy.",
         );
-        assert!(check_safeguard_evidence(&d, Some(&addressable_params()), Path::new(".")).is_empty());
+        let params = with_refs(Some(addressable_params()), &d, &["POLICY-002"]);
+        assert!(check_safeguard_evidence(&d, Some(&params), Path::new(".")).is_empty());
+    }
+
+    /// BUG-030: a required safeguard cited a POLICY that does not exist and
+    /// the register reported clean. The pair differs only in whether
+    /// `POLICY-002` is in the run — the message that appears is the
+    /// "needs implementing evidence" one, which is the accurate statement:
+    /// evidence that does not exist is not evidence.
+    #[test]
+    fn safeguard_evidence_phantom_policy_is_not_evidence() {
+        let d = srmap_doc(
+            "SAFEGUARD-010",
+            "164.308.risk_analysis",
+            None,
+            &["POLICY-002"],
+            "Implemented by our risk-analysis policy.",
+        );
+        let exists = with_refs(Some(addressable_params()), &d, &["POLICY-002"]);
+        assert!(check_safeguard_evidence(&d, Some(&exists), Path::new(".")).is_empty());
+        let phantom = with_refs(Some(addressable_params()), &d, &[]);
+        let diags = check_safeguard_evidence(&d, Some(&phantom), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("needs implementing evidence"));
     }
 
     #[test]
@@ -7466,7 +9809,7 @@ shall is discussed in the EARS paper.
         let diags = check_safeguard_evidence(&d, Some(&addressable_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "hipaa.safeguard-evidence");
-        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[0].line, Some(5));
         assert_eq!(
             diags[0].message,
             "SAFEGUARD-002: required safeguard `164.308.risk_analysis` needs implementing evidence \
@@ -7523,7 +9866,8 @@ shall is discussed in the EARS paper.
             &[],
             "Implemented per ADR-040, which mandates at-rest encryption.",
         );
-        assert!(check_safeguard_evidence(&d, Some(&addressable_params()), Path::new(".")).is_empty());
+        let params = with_refs(Some(addressable_params()), &d, &["ADR-040"]);
+        assert!(check_safeguard_evidence(&d, Some(&params), Path::new(".")).is_empty());
     }
 
     // -- soc2.control-evidence (ADR-069 § SOC-002) ----------------------
@@ -7584,7 +9928,7 @@ shall is discussed in the EARS paper.
         let diags = check_control_evidence(&d, Some(&control_evidence_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "soc2.control-evidence");
-        assert_eq!(diags[0].line, 7);
+        assert_eq!(diags[0].line, Some(7));
         assert_eq!(
             diags[0].message,
             "SOC2-001: in-scope control for criterion `CC6.1` needs operating-effectiveness evidence \
@@ -7617,7 +9961,32 @@ shall is discussed in the EARS paper.
             &["POLICY-004"],
             "Governed by our access-provisioning policy.",
         );
-        assert!(check_control_evidence(&d, Some(&control_evidence_params()), Path::new(".")).is_empty());
+        let params = with_refs(Some(control_evidence_params()), &d, &["POLICY-004"]);
+        assert!(check_control_evidence(&d, Some(&params), Path::new(".")).is_empty());
+    }
+
+    /// BUG-030 on the rule whose stated purpose the phantom reference
+    /// defeats (ADR-069 § SOC-002): a Type II attestation asserts operating
+    /// effectiveness over a period, and a control naming a POLICY nobody
+    /// wrote reported clean. The pair differs only in whether `POLICY-004`
+    /// is in the run.
+    #[test]
+    fn control_evidence_phantom_policy_is_not_evidence() {
+        let d = soc2_doc(
+            "SOC2-010",
+            "CC6.2",
+            "implemented",
+            None,
+            &["POLICY-004"],
+            "Governed by our access-provisioning policy.",
+        );
+        let exists = with_refs(Some(control_evidence_params()), &d, &["POLICY-004"]);
+        assert!(check_control_evidence(&d, Some(&exists), Path::new(".")).is_empty());
+        let phantom = with_refs(Some(control_evidence_params()), &d, &[]);
+        assert_eq!(
+            check_control_evidence(&d, Some(&phantom), Path::new(".")).len(),
+            1
+        );
     }
 
     #[test]
@@ -7716,7 +10085,7 @@ shall is discussed in the EARS paper.
         let diags = check_iso_control_evidence(&d, Some(&iso_nist_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "iso27001.control-evidence");
-        assert_eq!(diags[0].line, 6);
+        assert_eq!(diags[0].line, Some(6));
         assert_eq!(
             diags[0].message,
             "ISO27001-001: in-scope control `A.5.15` needs implementing evidence \
@@ -7751,7 +10120,8 @@ shall is discussed in the EARS paper.
             &["POLICY-007"],
             "Governed by our information security policy.",
         );
-        assert!(check_iso_control_evidence(&d, Some(&iso_nist_params()), Path::new(".")).is_empty());
+        let params = with_refs(Some(iso_nist_params()), &d, &["POLICY-007"]);
+        assert!(check_iso_control_evidence(&d, Some(&params), Path::new(".")).is_empty());
     }
 
     #[test]
@@ -7806,7 +10176,7 @@ shall is discussed in the EARS paper.
         let diags = check_nist_control_evidence(&d, Some(&iso_nist_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "nist.control-evidence");
-        assert_eq!(diags[0].line, 6);
+        assert_eq!(diags[0].line, Some(6));
         assert_eq!(
             diags[0].message,
             "NIST80053-001: in-scope control for family `AC` needs implementing evidence \
@@ -7840,6 +10210,193 @@ shall is discussed in the EARS paper.
             "We process no PII.",
         );
         assert!(check_nist_control_evidence(&d, Some(&iso_nist_params()), Path::new(".")).is_empty());
+    }
+
+    // -- core.evidence-link (ADR-115 § REG-001) -------------------------
+
+    /// A register entry over an arbitrary trigger field — the shape
+    /// `core.evidence-link` reads, with `field` naming the key rather than
+    /// the rule hardcoding one.
+    fn register_doc(
+        raw_id: &str,
+        field: &str,
+        value: &str,
+        status: &str,
+        evidence_link: Option<&str>,
+        depends_on: &[&str],
+        body: &str,
+    ) -> Document {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            field.to_owned(),
+            serde_json::Value::String(value.to_owned()),
+        );
+        metadata.insert(
+            "status".to_owned(),
+            serde_json::Value::String(status.to_owned()),
+        );
+        if let Some(link) = evidence_link {
+            metadata.insert(
+                "evidence_link".to_owned(),
+                serde_json::Value::String(link.to_owned()),
+            );
+        }
+        let mut frontmatter_lines = BTreeMap::new();
+        frontmatter_lines.insert(field.to_owned(), 6u32);
+        frontmatter_lines.insert("id".to_owned(), 2u32);
+        Document {
+            id: raw_id.parse().unwrap(),
+            raw_id: raw_id.to_owned(),
+            location: format!("docs/compliance/nis2/measures/{raw_id}.md"),
+            depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
+            frontmatter_lines,
+            metadata,
+            pin: None,
+            ast: Some(markdown::parse_ast(body)),
+            body: body.to_owned(),
+        }
+    }
+
+    /// `core.evidence-link` params as the `nis2` pack ships them.
+    fn nis2_params() -> Value {
+        serde_json::json!({
+            "field": "measure",
+            "evidence-fields": ["evidence_link"],
+            "out-of-scope-status": ["not-applicable"]
+        })
+    }
+
+    #[test]
+    fn evidence_link_errors_when_field_param_absent() {
+        // REG-001: a namespace binding this rule must say which key carries
+        // the obligation id. The failure mode for a misconfiguration must be
+        // a diagnostic, never silence — a rule advertising an evidence gate
+        // while enforcing none is the defect this whole family fixes. Note
+        // the document itself is *fine*; only the config is wrong.
+        let d = register_doc(
+            "NIS2-001",
+            "measure",
+            "21(2)(b)",
+            "implemented",
+            Some("https://grc.example/controls/ir-01"),
+            &[],
+            "Incident handling is implemented.",
+        );
+        let params = serde_json::json!({ "evidence-fields": ["evidence_link"] });
+        let diags = check_evidence_link(&d, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.evidence-link");
+        assert_eq!(
+            diags[0].message,
+            "NIS2-001: [NIS2.\"core.evidence-link\"] must declare `field` — the metadata key \
+             carrying the obligation identifier"
+        );
+    }
+
+    #[test]
+    fn evidence_link_field_param_present_is_the_positive_control() {
+        // The pair for the test above: the same document, the same evidence,
+        // with `field` declared — silent. Without this, "errors when the
+        // param is absent" is indistinguishable from "always errors".
+        let d = register_doc(
+            "NIS2-001",
+            "measure",
+            "21(2)(b)",
+            "implemented",
+            Some("https://grc.example/controls/ir-01"),
+            &[],
+            "Incident handling is implemented.",
+        );
+        assert!(check_evidence_link(&d, Some(&nis2_params()), Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn evidence_link_phantom_cross_ref_is_not_evidence() {
+        // BUG-030 for the regime-neutral rule: citing a POLICY nobody wrote
+        // must not satisfy the gate. Asserted as a pair with the test below,
+        // which cites a POLICY that does resolve.
+        let d = register_doc(
+            "NIS2-002",
+            "measure",
+            "21(2)(a)",
+            "implemented",
+            None,
+            &["POLICY-999"],
+            "Risk analysis policy.",
+        );
+        let params = with_refs(Some(nis2_params()), &d, &[]);
+        let diags = check_evidence_link(&d, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.evidence-link");
+        assert_eq!(
+            diags[0].message,
+            "NIS2-002: in-scope entry for `measure` `21(2)(a)` needs implementing evidence \
+             (a POLICY or ADR cross-ref) or an `evidence_link`"
+        );
+    }
+
+    #[test]
+    fn evidence_link_resolving_cross_ref_satisfies() {
+        let d = register_doc(
+            "NIS2-002",
+            "measure",
+            "21(2)(a)",
+            "implemented",
+            None,
+            &["POLICY-001"],
+            "Risk analysis policy.",
+        );
+        let params = with_refs(Some(nis2_params()), &d, &["POLICY-001"]);
+        assert!(check_evidence_link(&d, Some(&params), Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn evidence_link_own_id_is_not_evidence() {
+        // BUG-031's shape, for a namespace whose own id shares the evidence
+        // vocabulary: the scaffolded H1 must not satisfy the gate.
+        let d = register_doc(
+            "POLICY-007",
+            "measure",
+            "21(2)(c)",
+            "implemented",
+            None,
+            &[],
+            "# POLICY-007: Business continuity\n\nDrafted.",
+        );
+        let params = with_refs(Some(nis2_params()), &d, &[]);
+        let diags = check_evidence_link(&d, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1, "own id must not count as its own evidence");
+    }
+
+    #[test]
+    fn evidence_link_message_names_the_configured_namespaces() {
+        // The diagnostic must name the namespaces the rule actually accepts.
+        // A pack narrowing `evidence-namespaces` to ADR previously still read
+        // "a POLICY or ADR cross-ref", telling the author to do something the
+        // rule would reject.
+        let d = register_doc(
+            "NIS2-003",
+            "measure",
+            "21(2)(d)",
+            "implemented",
+            None,
+            &[],
+            "Supply chain security.",
+        );
+        let mut params = nis2_params();
+        params["evidence-namespaces"] = serde_json::json!(["ADR"]);
+        let diags = check_evidence_link(&d, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("(an ADR cross-ref)"),
+            "message must name the configured namespace: {}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains("POLICY"),
+            "message must not name a namespace the rule rejects: {}",
+            diags[0].message
+        );
     }
 
     // -- ddd.context-map-shape (ADR-082 § DDD-003) ----------------------
@@ -7933,7 +10490,7 @@ shall is discussed in the EARS paper.
         let diags = check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "ddd.context-map-shape");
-        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[0].line, Some(5));
         assert_eq!(
             diags[0].message,
             "CONTEXTMAP-003: a context map must connect exactly 2 BOUNDEDCONTEXT contexts, found 1"
@@ -7972,7 +10529,7 @@ shall is discussed in the EARS paper.
         let diags = check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "ddd.context-map-shape");
-        assert_eq!(diags[0].line, 8);
+        assert_eq!(diags[0].line, Some(8));
         assert_eq!(
             diags[0].message,
             "CONTEXTMAP-005: asymmetric pattern `Customer-Supplier` must declare both `upstream` and `downstream` roles"
@@ -7992,7 +10549,7 @@ shall is discussed in the EARS paper.
         let diags = check_context_map_shape(&d, Some(&context_map_shape_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "ddd.context-map-shape");
-        assert_eq!(diags[0].line, 8);
+        assert_eq!(diags[0].line, Some(8));
         assert_eq!(
             diags[0].message,
             "CONTEXTMAP-006: symmetric pattern `Partnership` must not declare `upstream`/`downstream` roles"
@@ -8034,7 +10591,7 @@ shall is discussed in the EARS paper.
         let diags = check_acceptance_complete(&d, Some(&task_terminal_params()), Path::new("."));
         assert_eq!(diags.len(), 1, "one open box → one diagnostic: {diags:?}");
         assert_eq!(diags[0].code, "core.acceptance-complete");
-        assert_eq!(diags[0].line, 6, "anchored at the `- [ ] Retry path tested` line");
+        assert_eq!(diags[0].line, Some(6), "anchored at the `- [ ] Retry path tested` line");
         assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
         assert_eq!(
             diags[0].message,
@@ -8051,8 +10608,8 @@ shall is discussed in the EARS paper.
         let d = acceptance_doc("TASK-015", "done", body);
         let diags = check_acceptance_complete(&d, Some(&task_terminal_params()), Path::new("."));
         assert_eq!(diags.len(), 2);
-        assert_eq!(diags[0].line, 5);
-        assert_eq!(diags[1].line, 7);
+        assert_eq!(diags[0].line, Some(5));
+        assert_eq!(diags[1].line, Some(7));
     }
 
     #[test]
@@ -8090,7 +10647,7 @@ shall is discussed in the EARS paper.
         let d = acceptance_doc("TASK-019", "done", body);
         let diags = check_acceptance_complete(&d, Some(&task_terminal_params()), Path::new("."));
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].line, 5);
+        assert_eq!(diags[0].line, Some(5));
     }
 
     #[test]
@@ -8115,7 +10672,7 @@ shall is discussed in the EARS paper.
         let d = acceptance_doc("TASK-021", "done", body);
         let diags = check_acceptance_complete(&d, Some(&task_terminal_params()), Path::new("."));
         assert_eq!(diags.len(), 1, "the box directly under the heading must fire: {diags:?}");
-        assert_eq!(diags[0].line, 4, "anchored at the `- [ ]` line, not the heading");
+        assert_eq!(diags[0].line, Some(4), "anchored at the `- [ ]` line, not the heading");
     }
 
     #[test]
@@ -8221,5 +10778,511 @@ shall is discussed in the EARS paper.
 
         // Unset anchors param is a silent no-op.
         assert_eq!(check_required_anchors(&d, None, Path::new(".")).len(), 0);
+    }
+
+    // -- test.completion (ADR-098 § QA-003) ---------------------------
+
+    /// A full-pipeline TEST report Document — frontmatter and AST parsed the
+    /// way the ingest pipeline does, so the document-level rule reads real
+    /// `metadata` / `ast` (not a re-parse).
+    fn test_report_doc(body: &str) -> Document {
+        let ast = markdown::parse_ast(body);
+        let (metadata, frontmatter_lines) =
+            crate::frontmatter::Frontmatter::parse_with_lines(body)
+                .map(|(fm, lines)| (fm.metadata, lines))
+                .unwrap_or_default();
+        Document {
+            id: "TEST-1".parse().unwrap(),
+            raw_id: "TEST-1".to_string(),
+            location: "docs/tests/TEST-001-release-1-0.md".to_string(),
+            depends_on: Vec::new(),
+            frontmatter_lines,
+            metadata,
+            pin: None,
+            ast: Some(ast),
+            body: body.to_owned(),
+        }
+    }
+
+    /// A real 40-hex commit SHA (SHA-1 shape).
+    const GOOD_TESTED: &str = "1cb8eaf0aa9b7d2e3f4c5a6b7c8d9e0f1a2b3c4d";
+    const GOOD_SPEC: &str = "50c6166f9e8d7c6b5a4f3e2d1c0b9a8776554433";
+
+    fn sealed_body(result: &str, pins: &str, defects: &str) -> String {
+        format!(
+            "---\nid: TEST-1\ntitle: Release 1.0 completion\nstatus: sealed\n\
+             result: {result}\nrelease: 1.0\ndate: 2026-07-13\n\
+             evidence: https://ci.example.com/runs/4210\n{pins}---\n\n\
+             ## Scope\nSystem and acceptance suites for release 1.0.\n\n\
+             ## Test Environment\nstaging, build 4210.\n\n\
+             ## Results Summary\n204 passed, 0 failed.\n\n\
+             ## Outstanding Defects\n{defects}\n\n\
+             ## Exit Criteria\nAll gates met.\n\n\
+             ## Sign-off\nQA lead accepted 2026-07-13.\n\n\
+             ## References\nSPEC-003; CI run 4210.\n"
+        )
+    }
+
+    #[test]
+    fn test_completion_sealed_missing_tested_commit_fails() {
+        let body = sealed_body("pass", &format!("spec_commit: {GOOD_SPEC}\n"), "None.");
+        let d = test_report_doc(&body);
+        let diags = check_test_completion(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
+        assert!(
+            diags[0].message.contains("must set `tested_commit`"),
+            "names the missing pin: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn test_completion_sealed_missing_spec_commit_fails() {
+        let body = sealed_body("pass", &format!("tested_commit: {GOOD_TESTED}\n"), "None.");
+        let d = test_report_doc(&body);
+        let diags = check_test_completion(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
+        assert!(
+            diags[0].message.contains("must set `spec_commit`"),
+            "names the missing pin: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn test_completion_malformed_sha_fails() {
+        let pins = format!("tested_commit: not-a-sha\nspec_commit: {GOOD_SPEC}\n");
+        let body = sealed_body("pass", &pins, "None.");
+        let d = test_report_doc(&body);
+        let diags = check_test_completion(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
+        assert!(
+            diags[0].message.contains("not a 40-character hex commit SHA"),
+            "names the shape defect: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn test_completion_conditional_pass_empty_defects_fails() {
+        // Both pins valid; the empty Outstanding Defects section is the only
+        // defect. An empty section body (only the heading) must fail.
+        let pins = format!("tested_commit: {GOOD_TESTED}\nspec_commit: {GOOD_SPEC}\n");
+        let body = sealed_body("conditional-pass", &pins, "");
+        let d = test_report_doc(&body);
+        let diags = check_test_completion(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "one diagnostic: {diags:?}");
+        assert!(
+            diags[0].message.contains("conditional-pass") && diags[0].message.contains("empty"),
+            "names the empty-waiver defect: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn test_completion_conditional_pass_with_defects_is_clean() {
+        let pins = format!("tested_commit: {GOOD_TESTED}\nspec_commit: {GOOD_SPEC}\n");
+        let body = sealed_body(
+            "conditional-pass",
+            &pins,
+            "- DEFECT-9: intermittent timeout on the nightly export, waived to 1.1.",
+        );
+        let d = test_report_doc(&body);
+        let diags = check_test_completion(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "a named waiver is clean: {diags:?}");
+    }
+
+    #[test]
+    fn test_completion_draft_with_no_pins_is_clean() {
+        let body = "---\nid: TEST-1\ntitle: Release 1.0 completion\nstatus: draft\n\
+                    result: pass\nrelease: 1.0\ndate: 2026-07-13\n\
+                    evidence: https://ci.example.com/runs/4210\n---\n\n\
+                    ## Scope\nDraft in progress.\n";
+        let d = test_report_doc(body);
+        let diags = check_test_completion(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "a draft carries no pins yet: {diags:?}");
+    }
+
+    #[test]
+    fn test_completion_sealed_pass_empty_defects_is_clean() {
+        // A clean pass with both pins present and valid; an empty Outstanding
+        // Defects section is fine when the verdict is `pass`, not a waiver.
+        let pins = format!("tested_commit: {GOOD_TESTED}\nspec_commit: {GOOD_SPEC}\n");
+        let body = sealed_body("pass", &pins, "None.");
+        let d = test_report_doc(&body);
+        let diags = check_test_completion(&d, None, Path::new("."));
+        assert!(diags.is_empty(), "sealed pass with valid pins is clean: {diags:?}");
+    }
+
+    // -- writing.ai-fingerprints (ADR-102) ---------------------------------
+
+    /// Build an instruction-file Document (AST populated) for the fingerprint
+    /// rule. No frontmatter needed — the rule reads the body, not metadata.
+    fn fingerprint_doc(body: &str) -> Document {
+        let ast = markdown::parse_ast(body);
+        Document {
+            id: "CLAUDE-0".parse().unwrap(),
+            raw_id: String::new(),
+            location: "CLAUDE.md".to_string(),
+            depends_on: Vec::new(),
+            frontmatter_lines: std::collections::BTreeMap::new(),
+            metadata: std::collections::BTreeMap::new(),
+            pin: None,
+            ast: Some(ast),
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn fingerprints_flags_curly_quote() {
+        let doc = fingerprint_doc("Run the \u{201C}generated\u{201D} build.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert_eq!(diags.len(), 2, "both curly quotes flagged: {diags:?}");
+        assert_eq!(diags[0].code, AI_FINGERPRINTS);
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
+        assert_eq!(diags[0].line, Some(1));
+    }
+
+    #[test]
+    fn fingerprints_flags_decorative_emoji() {
+        // Rocket (U+1F680) in a heading and a checkmark (U+2705) in prose.
+        let doc = fingerprint_doc("## \u{1F680} Getting Started\nBuild passes \u{2705}\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        let emoji: Vec<_> = diags.iter().filter(|d| d.message.contains("emoji")).collect();
+        assert_eq!(emoji.len(), 2, "rocket + checkmark flagged: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_emoji_disabled_by_config() {
+        let doc = fingerprint_doc("Ship it \u{1F680}\n");
+        let params = serde_json::json!({"flag_emoji": false});
+        let diags = check_ai_fingerprints(&doc, Some(&params), Path::new("."));
+        assert!(diags.is_empty(), "flag_emoji=false suppresses: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_flags_default_phrases_case_insensitively() {
+        // "You're" capitalized — the compiled default is matched case-insensitively.
+        let doc = fingerprint_doc("You're absolutely right about the seam.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        let phr: Vec<_> = diags.iter().filter(|d| d.message.contains("phrase")).collect();
+        assert_eq!(phr.len(), 1, "one artifact phrase: {diags:?}");
+        assert!(phr[0].message.contains("you're absolutely right"), "{}", phr[0].message);
+    }
+
+    #[test]
+    fn fingerprints_borderline_phrase_not_in_default() {
+        // "let me know if" is deliberately excluded from the shipped default (AIF-005).
+        let doc = fingerprint_doc("Let me know if you need anything else.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert!(diags.is_empty(), "borderline phrase not flagged by default: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_phrases_config_overrides_default() {
+        let doc = fingerprint_doc("Let me know if that works.\n");
+        let params = serde_json::json!({"phrases": ["let me know if"]});
+        let diags = check_ai_fingerprints(&doc, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1, "configured phrase fires: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_no_ai_slop_phrase_is_opt_in() {
+        let doc = fingerprint_doc("Here's the thing: the build is broken.\n");
+        assert!(
+            check_ai_fingerprints(&doc, None, Path::new(".")).is_empty(),
+            "approved no-ai-slop phrases are not shipped defaults"
+        );
+        let params = serde_json::json!({"phrases": ["here's the thing"]});
+        let diags = check_ai_fingerprints(&doc, Some(&params), Path::new("."));
+        assert_eq!(diags.len(), 1, "configured no-ai-slop phrase fires: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_empty_phrases_disables_class() {
+        let doc = fingerprint_doc("You're absolutely right.\n");
+        let params = serde_json::json!({"phrases": []});
+        let diags = check_ai_fingerprints(&doc, Some(&params), Path::new("."));
+        assert!(diags.is_empty(), "explicit [] disables phrase class: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_flags_em_dash_overuse() {
+        let doc = fingerprint_doc(
+            "The parser \u{2014} rewritten \u{2014} walks the tree \u{2014} twice \u{2014} \
+             before it emits \u{2014} finally \u{2014} the result.\n",
+        );
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        let dash: Vec<_> = diags.iter().filter(|d| d.message.contains("dash")).collect();
+        assert_eq!(dash.len(), 1, "one density finding for the whole file: {diags:?}");
+        assert!(dash[0].message.contains("density"), "{}", dash[0].message);
+    }
+
+    #[test]
+    fn fingerprints_no_dash_is_clean() {
+        let doc = fingerprint_doc("A plain sentence with no dashes at all here.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert!(diags.is_empty(), "no dashes, nothing else: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_dash_threshold_zero_disables() {
+        let doc = fingerprint_doc("a \u{2014} b \u{2014} c \u{2014} d\n");
+        let params = serde_json::json!({"max_em_dashes_per_kwords": 0});
+        let diags = check_ai_fingerprints(&doc, Some(&params), Path::new("."));
+        assert!(diags.is_empty(), "threshold 0 disables the dash class: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_masks_fenced_code() {
+        // Curly quotes, an emoji, and a phrase all inside a fenced block: a
+        // sample, not prose. Nothing fires.
+        let doc = fingerprint_doc(
+            "```sh\necho \"curly \u{201C}x\u{201D} \u{1F680} you're absolutely right\"\n```\n",
+        );
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert!(diags.is_empty(), "fenced code is masked: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_masks_inline_code() {
+        let doc = fingerprint_doc("Set the value in `config\u{2019}s key` please.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert!(diags.is_empty(), "inline code span is masked: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_prose_curly_still_fires_with_inline_code_present() {
+        // The curly is in prose; the backticked span is masked. Exactly one hit.
+        let doc = fingerprint_doc("A \u{201C}real\u{201D} tell near `code` here.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert_eq!(diags.len(), 2, "both prose curly quotes fire, code masked: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_reports_byte_column_on_multibyte_line() {
+        // "café " is 6 bytes (é is 2), so the curly quote sits at byte col 7,
+        // not char col 6 — the UTF-8/column-unit guard (AIF-001 trap #2).
+        let doc = fingerprint_doc("caf\u{00E9} \u{201C}test\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "one curly quote: {diags:?}");
+        assert_eq!(diags[0].col, Some(7), "byte column, not char column");
+    }
+
+    #[test]
+    fn fingerprints_technical_vocabulary_is_clean() {
+        // AIF-002: `seam` and `load-bearing` are legitimate software vocabulary;
+        // the deterministic rule must never flag a correctly written doc.
+        let doc = fingerprint_doc(
+            "The retry logic is load-bearing; the queue drains through this exact seam.\n",
+        );
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert!(diags.is_empty(), "technical prose is clean: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_ast_none_skips_maskable_but_runs_phrases() {
+        // AIF-001 fallback: no AST → curly/emoji/dash skipped (can't mask),
+        // but the phrase class still runs over the raw body.
+        let body = "You're absolutely right \u{201C}quote\u{201D} \u{1F680}\n";
+        let mut doc = fingerprint_doc(body);
+        doc.ast = None;
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "only the phrase fires without an AST: {diags:?}");
+        assert!(diags[0].message.contains("phrase"), "{}", diags[0].message);
+    }
+
+    // -- regression: the six code-review findings on the first cut -----------
+
+    #[test]
+    fn fingerprints_multiline_inline_span_does_not_panic() {
+        // Review #1: a backtick span wrapping a newline files col_end on the
+        // next line, inverting the byte-slice range in the old mask — a panic
+        // that aborted the whole lint. The curly quotes sit before the span and
+        // must still fire; the call must not panic.
+        let body =
+            "Start \u{201C}alpha\u{201D} and a span `line one\ntwo` done here.\n";
+        let doc = fingerprint_doc(body);
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert_eq!(diags.len(), 2, "both curly quotes fire, no panic: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_skips_yaml_frontmatter() {
+        // Review #3: frontmatter is metadata, not prose. A curly apostrophe and
+        // an em-dash in a frontmatter value must not be flagged.
+        let body =
+            "---\ntitle: Don\u{2019}t \u{2014} do it\nstatus: draft\n---\n\nBody is clean.\n";
+        let doc = fingerprint_doc(body);
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert!(diags.is_empty(), "frontmatter values are not prose: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_dash_density_ignores_no_space_dashes() {
+        // Review #4: word—word (no surrounding spaces, standard typography) must
+        // count as two words, so spaced and unspaced dashes yield equal density.
+        let spaced = fingerprint_doc("alpha \u{2014} beta \u{2014} gamma delta epsilon zeta eta\n");
+        let packed = fingerprint_doc("alpha\u{2014}beta\u{2014}gamma delta epsilon zeta eta\n");
+        let ds = check_ai_fingerprints(&spaced, None, Path::new("."));
+        let dp = check_ai_fingerprints(&packed, None, Path::new("."));
+        assert_eq!(ds.len(), 1, "spaced fires once: {ds:?}");
+        assert_eq!(dp.len(), 1, "packed fires once: {dp:?}");
+        assert!(ds[0].message.contains("density 285"), "spaced: {}", ds[0].message);
+        assert!(dp[0].message.contains("density 285"), "packed: {}", dp[0].message);
+    }
+
+    #[test]
+    fn fingerprints_multi_scalar_emoji_reported_once() {
+        // Review #5: a flag is two regional-indicator scalars — one visible
+        // glyph, one finding, not two.
+        let doc = fingerprint_doc("Flag \u{1F1FA}\u{1F1F8} here.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "one finding for the flag glyph: {diags:?}");
+    }
+
+    #[test]
+    fn fingerprints_arrows_are_not_emoji() {
+        // Review #6: dingbat/block arrows (➡ U+27A1, ⭐ U+2B50) legitimately
+        // appear in prose and are excluded from the decorative-emoji ranges.
+        let doc = fingerprint_doc("Flow: A \u{27A1} B and a \u{2B50} rating.\n");
+        let diags = check_ai_fingerprints(&doc, None, Path::new("."));
+        assert!(diags.is_empty(), "arrows and stars are not flagged: {diags:?}");
+    }
+
+    // -- core.file-budget (ADR-109) ------------------------------------
+
+    /// A TODO.md-shaped document: a short `## Now` section and a long
+    /// `## Shipped` archive, so the largest-section suggestion has an
+    /// unambiguous answer.
+    fn budget_doc(shipped_lines: usize) -> Document {
+        let mut body = String::from("# Project state\n\n## Now\n\nFinish the budget rule.\n\n## Shipped\n\n");
+        for n in 0..shipped_lines {
+            body.push_str(&format!("- 0.{n}.0 shipped a rule\n"));
+        }
+        synthetic_document("TODO", "TODO.md".to_owned(), body)
+    }
+
+    fn max_chars(n: u64) -> Value {
+        serde_json::json!({ "max_chars": n })
+    }
+
+    #[test]
+    fn file_budget_silent_under_and_at_the_budget() {
+        let doc = budget_doc(4);
+        let chars = doc.body.chars().count() as u64;
+        assert!(
+            check_file_budget(&doc, Some(&max_chars(chars)), Path::new(".")).is_empty(),
+            "a file exactly at its budget is not over it"
+        );
+        assert!(
+            check_file_budget(&doc, Some(&max_chars(chars + 1)), Path::new(".")).is_empty(),
+            "a file under its budget is silent"
+        );
+    }
+
+    #[test]
+    fn file_budget_warns_once_with_the_character_counts() {
+        let doc = budget_doc(4);
+        let chars = doc.body.chars().count() as u64;
+        let diags = check_file_budget(&doc, Some(&max_chars(chars - 10)), Path::new("."));
+        assert_eq!(diags.len(), 1, "one finding per over-budget file: {diags:?}");
+        assert_eq!(diags[0].code, "core.file-budget");
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Warning);
+        assert_eq!(
+            diags[0].message,
+            format!("file is {chars} characters (budget {})", chars - 10)
+        );
+    }
+
+    #[test]
+    fn file_budget_help_names_the_largest_section_and_the_overage() {
+        let doc = budget_doc(60);
+        let chars = doc.body.chars().count() as u64;
+        let diags = check_file_budget(&doc, Some(&max_chars(chars - 200)), Path::new("."));
+        let help = diags[0].help.as_deref().expect("help suggests a fix");
+        assert!(
+            help.starts_with("trim 200 characters"),
+            "the help states how much has to go: {help}"
+        );
+        assert!(
+            help.contains("`## Shipped`"),
+            "the help names the biggest section, not the small one: {help}"
+        );
+        assert!(
+            !help.contains("`## Now`"),
+            "only the largest section is suggested: {help}"
+        );
+    }
+
+    #[test]
+    fn file_budget_help_points_at_the_preamble_when_it_outweighs_every_section() {
+        // A TODO.md whose bulk is dated narrative above the first `## ` — the
+        // largest *section* is small, so naming it would misdirect the fix.
+        let preamble = "Shipped X, then Y, then Z. ".repeat(40);
+        let body = format!("# State\n\n{preamble}\n\n## Now\n\nOne item.\n");
+        let doc = synthetic_document("TODO", "TODO.md".to_owned(), body);
+        let chars = doc.body.chars().count() as u64;
+        let diags = check_file_budget(&doc, Some(&max_chars(chars - 100)), Path::new("."));
+        let help = diags[0].help.as_deref().expect("help suggests a fix");
+        assert!(
+            help.contains("above the first `## ` heading"),
+            "the help points at the unsectioned preamble, not `## Now`: {help}"
+        );
+        assert!(
+            !help.contains("`## Now`"),
+            "the small section is not the suggested fix: {help}"
+        );
+    }
+
+    #[test]
+    fn file_budget_help_falls_back_when_the_document_has_no_h2() {
+        let doc = synthetic_document(
+            "TODO",
+            "TODO.md".to_owned(),
+            "# Project state\n\nOne long paragraph and no sections at all.\n".to_owned(),
+        );
+        let diags = check_file_budget(&doc, Some(&max_chars(10)), Path::new("."));
+        let help = diags[0].help.as_deref().expect("help suggests a fix");
+        assert!(
+            help.contains("move settled detail into a linked file"),
+            "without H2 sections the advice is generic but still actionable: {help}"
+        );
+    }
+
+    #[test]
+    fn file_budget_note_names_the_namespace_to_raise_the_ceiling_in() {
+        let doc = budget_doc(4);
+        let diags = check_file_budget(&doc, Some(&max_chars(10)), Path::new("."));
+        assert_eq!(
+            diags[0].note.as_deref(),
+            Some(
+                "raise the ceiling with `[TODO.\"core.file-budget\"] max_chars = <n>` \
+                 if this size is intended"
+            )
+        );
+    }
+
+    #[test]
+    fn file_budget_defaults_to_the_claude_threshold_without_params() {
+        // BDG-002: a bare binding reproduces the reader's own 150000-character
+        // warning, so a document just over that line fires with no config.
+        let doc = budget_doc(0);
+        assert!(
+            check_file_budget(&doc, None, Path::new(".")).is_empty(),
+            "a small file is silent on the default budget"
+        );
+
+        let big = synthetic_document(
+            "TODO",
+            "TODO.md".to_owned(),
+            "x".repeat(DEFAULT_MAX_CHARS as usize + 1),
+        );
+        let diags = check_file_budget(&big, None, Path::new("."));
+        assert_eq!(diags.len(), 1, "150001 characters is over the default");
+        assert_eq!(
+            diags[0].message,
+            "file is 150001 characters (budget 150000)"
+        );
     }
 }

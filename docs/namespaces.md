@@ -94,15 +94,45 @@ To exclude superseded ADRs from linting, add them to
 `cfg.paths-invalid` configuration error. ctxgrd is a per-repo tool; all
 patterns must be root-relative.
 
-**`[ignore]` wins.** When a file matches both `[<NS>].paths` and an
-`[ignore].patterns` entry, `[ignore]` takes precedence and the file is
-not walked at all. To silence a path-claimed file without tightening
-the path glob, add it to `[ignore].patterns`.
+**`[ignore]` usually wins, but a claim can reach inside it.** When a file
+matches both `[<NS>].paths` and an `[ignore].patterns` entry, `[ignore]`
+normally takes precedence and the file is not walked at all. The
+exception is a namespace whose glob points *inside* an ignored tree —
+`paths = [".claude/skills/**/SKILL.md"]` under the default `**/.*` —
+where the claimed files are still reached, since otherwise the claim
+could never be satisfied. The exemption admits only files a `paths` glob
+positively matches, and descends only into directories ignored for the
+same reason the claim's own directory prefix is, so a `node_modules`
+under a claim prefix still prunes.
+
+Because of that exemption, `[ignore]` is **not** a reliable way to narrow
+a path-claimed namespace: if a `paths` glob matches a file inside an
+exempted tree, adding an `[ignore]` pattern for it will not remove it.
+Narrow the `paths` glob instead — and note that `*` is recursive here (see
+Glob syntax above), so `skills/*/README.md` claims READMEs at every depth
+under `skills/`, not just one level down.
 
 **Source-emitted documents do not use `[<NS>].paths`.** External sources
 (see `docs/sources.md`) emit documents with synthetic locations;
 `[<NS>].paths` does not apply to them. Source-emitted documents are
 classified by their `id` only.
+
+**A `paths` glob can only claim `.md` files.** Pointing a namespace at
+source code or data is the natural first attempt at linting non-markdown,
+and it does not work — the walker ingests markdown only, so the namespace
+holds zero documents and its rules never run. When a glob matches files
+that were skipped for their extension and the namespace ingested nothing,
+ctxgrd says so rather than reporting a clean run:
+
+```
+warning[cfg.paths-skipped]: [STATUTE] paths match 27 files the walker skipped, and the namespace ingested no documents
+  note: only .md files are ingested; the skipped files had: .pl
+  help: to lint non-markdown facts, emit them from a source (`ctxgrd docs sources`) — a namespace cannot claim them directly
+```
+
+External sources are the supported route for non-markdown facts. A
+namespace holding real documents alongside skipped files (say, images
+beside your ADRs) is working as intended and stays quiet.
 
 ## Adding parameterized rules
 
@@ -135,8 +165,14 @@ status = ["draft", "accepted", "rejected", "superseded"]
 ```
 
 **`core.required-headings`** — every listed string must appear as an
-H2 heading (`## Heading`) in the document body. Exact-match,
-case-sensitive.
+H2 heading (`## Heading`) in the document body. Matching is normalized:
+a leading enumerator (`1.`, `1)`, `A.`) is stripped, a trailing colon is
+dropped, and comparison is case-insensitive — so `headings = ["Status"]`
+matches `## 1. Status` or `## STATUS:`. Presence, not order. Configure
+headings as rendered text, without markup: a heading written
+`` ## Run `make check` first `` is matched by
+`headings = ["Run make check first"]` — inline code, bold, and emphasis
+markers are not part of the heading's text.
 
 **`core.required-metadata`** — every listed key must be present in the
 unified metadata map (frontmatter keys for local files, `extra` fields
@@ -189,6 +225,83 @@ an id under overlapping paths produce a `cfg.path-conflict`
 configuration error — they cannot be linted under two rule sets at
 once.
 
+## Coverage: who owns a namespace, and which ones you forgot
+
+Two always-on checks report what is *missing* from the config rather than
+what a document gets wrong. Both are warnings — they never change the exit
+code — and neither is listed in `[<NS>].rules`; they run on every unscoped
+lint.
+
+**`cfg.namespace-unowned`** — every namespace that actually holds documents
+should name the role accountable for writing them:
+
+```toml
+[roles]
+allowed = ["developer", "product-strategist", "writer"]
+
+[ADR]
+owner = "developer"
+paths = ["docs/adrs/**"]
+rules = ["core.frontmatter", "core.id"]
+```
+
+`owner` names a **role**, not the particular skill or agent that writes the
+document today. Leaf tools get renamed, split and absorbed; roles do not, and
+a config pinned to a leaf name turns every such rename into a migration.
+
+The `[roles].allowed` table is the vocabulary `owner` values are checked
+against. It is deliberately project-declared — ctxgrd ships no built-in role
+list, because a built-in one would go stale and over-fire. Omit the table and
+`owner` is declare-only: any string is accepted, and only a *missing* `owner`
+is reported. Declare it and a value outside the list is reported too.
+
+A namespace the config declares but no document claims is not reported —
+an unused shelf is not a coverage gap.
+
+**`cfg.namespace-undeclared`** — documents carrying `id: REPORT-001` when
+nothing declares `[REPORT]`:
+
+```
+warning[cfg.namespace-undeclared]: 2 documents claim namespace 'REPORT', which ctxgrd.toml does not declare
+  --> docs/reports/001-phase-0.md:2:0
+  help: add a [REPORT] block to ctxgrd.toml, or add 'REPORT' to [ignore].namespaces if the id belongs to another repo
+  note: an undeclared namespace lints with the 6 zero-config core rules only — no
+        required-headings, required-metadata, allowed-values, or min-docs
+```
+
+This is the check for a convention a team invented but never declared. Such
+documents are *not* skipped — they are ingested, listed by `ctxgrd list`, and
+linted, but only under the six zero-config core rules, with the run still
+reporting `ok`. One diagnostic is emitted per namespace (not per document),
+anchored at the lowest-numbered claimant, and it names the `pack add` that
+would declare the namespace when a built-in pack ships it.
+
+To opt out — a namespace you are staging deliberately, or ids that belong to
+another repo — list it:
+
+```toml
+[ignore]
+namespaces = ["REPORT"]
+```
+
+The exemption silences the warning but does not hide the fact. The count
+still appears on the summary line and in `--format json`:
+
+```
+ok: 213 documents · 116 rules · 0 diagnostics · 1 namespace undeclared
+```
+
+```jsonc
+"summary": { "errors": 0, "warnings": 0, "infos": 0, "files": 213, "namespaces_undeclared": 1 }
+```
+
+The human line shows the field only when the count is nonzero; the JSON key
+is always present, so tooling can read it without probing for absence.
+
+Neither check fires in zero-config mode (no `ctxgrd.toml` at all — every
+namespace is undeclared there by definition) or under a `--namespace` /
+`--pack` scope (a scoped run reports one slice, not the whole config).
+
 ## Core rules reference
 
 | Rule code                | Parameterized | What it checks                                                |
@@ -198,18 +311,32 @@ once.
 | `core.id-unique`         | No            | No two documents in the run share the same ID                 |
 | `core.dep-resolved`      | No            | Every `depends_on` entry resolves to a known document         |
 | `core.dep-cycle`         | No            | The `depends_on` graph contains no cycles                     |
+| `core.dep-status`        | Optional      | A terminal-status document's `depends_on` targets are terminal too |
 | `core.cross-ref`         | No            | Every `NS-NNN` token in the body resolves to a known document |
 | `core.required-headings` | Yes           | Required H2 headings are present                              |
 | `core.required-metadata` | Yes           | Required metadata keys are present                            |
 | `core.allowed-values`    | Yes           | Metadata values are in their configured allow-list            |
 
-The first six rules need no parameters and can be added to any
+The rules marked "No" need no parameters and can be added to any
 namespace without a sub-table. If you include a parameterized rule but
 omit its sub-table, ctxgrd exits with code 2 (kernel error) at startup.
+
+`core.dep-status` is marked "Optional": it runs on documented defaults
+with no sub-table, and accepts `terminal` (the statuses that count as
+settled, default the shared terminal-status vocabulary) and `severity`
+(`error` or `warning`, default `error`). It is opt-in — no shipped pack
+binds it, so a namespace activates it by listing the code.
 
 `core.frontmatter` and `core.id` (IdMissing) only fire for files that
 claim intent. A file with frontmatter but no `id` and no `[<NS>].paths`
 match is silently skipped — those rules never see it.
+
+The fence contract: the opening `---` must be line 1, exactly, with
+nothing after it. The closing fence is a line that is `---` after
+trimming trailing spaces and tabs. YAML's `...` document-end marker is
+deliberately **not** accepted as a closing delimiter — a file ending its
+frontmatter with `...` fails `core.frontmatter` with an error naming
+the near-miss.
 
 ## Global overrides
 

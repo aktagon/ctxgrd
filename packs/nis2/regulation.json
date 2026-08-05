@@ -1,0 +1,127 @@
+{
+  "_note": "Catalog read off the official Official Journal text of Directive (EU) 2022/2555 (OJ L 333, 27.12.2022, p. 80), retrieved 2026-07-30 from the Publications Office CELLAR (http://publications.europa.eu/resource/celex/32022L2555, Accept-Language: eng). Nothing here was written from memory. Article 21(2) enumerates exactly ten measures, points (a) to (j), verbatim subjects below; the catalog is closed and will not drift without an amending act. Article 3(1)/(2) gives the essential/important split. Article 20(1) requires the management body to APPROVE the Article 21 measures, which is what makes a dated approval record the highest-value cross-ref in the register. Article 23(4) gives the staged reporting clock: (a) early warning within 24 hours of becoming aware, (b) incident notification within 72 hours of becoming aware, (c) an intermediate report on request with NO deadline, (d) a final report not later than ONE MONTH AFTER SUBMISSION OF THE INCIDENT NOTIFICATION -- not after awareness, which is the anchor CR-007 assumed -- and (e) where the incident is still ongoing at that point, a progress report then and a final report within one month of the handling of the incident. A derogation in Article 23(4) gives trust service providers 24 hours rather than 72 for incidents affecting their trust services. ctxgrd models the RECORD, never conformance to an hour-granular clock: its date primitives are day-granular (YYYY-MM-DD), so it cannot tell 2 hours from 46 hours across a date boundary. See ADR-115 for what is deliberately not checked. Transposition: Article 41(1), measures adopted by 17 October 2024 and applied from 18 October 2024.",
+  "edition": "Directive (EU) 2022/2555 (NIS2), OJ L 333, 27.12.2022, p. 80",
+  "summary": "NIS2 cybersecurity risk-management register (NIS2) and Article 23 incident register (NIS2INC) over the security base — Directive (EU) 2022/2555 Arts. 20, 21(2) and 23. Paperwork existence/metadata/freshness only, never conformance to the statutory reporting clock.",
+  "depends": [
+    "security"
+  ],
+  "vocabularies": {
+    "measure": {
+      "cite": "Directive (EU) 2022/2555 Art. 21(2), points (a)-(j)",
+      "values": [
+        { "id": "21(2)(a)", "subject": "policies on risk analysis and information system security" },
+        { "id": "21(2)(b)", "subject": "incident handling" },
+        { "id": "21(2)(c)", "subject": "business continuity, such as backup management and disaster recovery, and crisis management" },
+        { "id": "21(2)(d)", "subject": "supply chain security, including security-related aspects concerning the relationships between each entity and its direct suppliers or service providers" },
+        { "id": "21(2)(e)", "subject": "security in network and information systems acquisition, development and maintenance, including vulnerability handling and disclosure" },
+        { "id": "21(2)(f)", "subject": "policies and procedures to assess the effectiveness of cybersecurity risk-management measures" },
+        { "id": "21(2)(g)", "subject": "basic cyber hygiene practices and cybersecurity training" },
+        { "id": "21(2)(h)", "subject": "policies and procedures regarding the use of cryptography and, where appropriate, encryption" },
+        { "id": "21(2)(i)", "subject": "human resources security, access control policies and asset management" },
+        { "id": "21(2)(j)", "subject": "the use of multi-factor authentication or continuous authentication solutions, secured voice, video and text communications and secured emergency communication systems within the entity, where appropriate" }
+      ]
+    },
+    "entity_class": {
+      "cite": "Directive (EU) 2022/2555 Art. 3(1) (essential) and Art. 3(2) (important)",
+      "values": [
+        "essential",
+        "important"
+      ]
+    },
+    "significance_basis": {
+      "cite": "Directive (EU) 2022/2555 Art. 23(3), points (a) and (b)",
+      "values": [
+        { "id": "23(3)(a)", "subject": "has caused or is capable of causing severe operational disruption of the services or financial loss for the entity concerned" },
+        { "id": "23(3)(b)", "subject": "has affected or is capable of affecting other natural or legal persons by causing considerable material or non-material damage" }
+      ]
+    },
+    "report_stage": {
+      "cite": "Directive (EU) 2022/2555 Art. 23(4), points (a)-(e)",
+      "values": [
+        "early-warning",
+        "incident-notification",
+        "intermediate-report",
+        "final-report",
+        "progress-report"
+      ]
+    }
+  },
+  "namespaces": [
+    {
+      "name": "NIS2",
+      "comment": "NIS2 cybersecurity risk-management register (Directive (EU) 2022/2555 Arts. 20 and 21, ADR-115). One document per Article 21(2) measure, the measure id projected from the closed ten-point catalog into core.allowed-values. The cleanest closed vocabulary in this family: Article 21(2) enumerates exactly ten measures, (a) through (j), and cannot grow without an amending act. `entity_class` (essential or important, Art. 3(1)/(2)) rides every row because it selects the supervision model and the reporting duties, so a register that does not record which class it was built against cannot say whether it is complete. core.evidence-link over `measure` requires each in-scope measure to cite an implementing POLICY/ADR or an `evidence_link`. Measure 21(2)(f) — assessing the EFFECTIVENESS of the measures — is the row clients skip, and it is the one whose evidence is properly a SECREV record rather than a policy: a policy asserting that effectiveness is assessed is not an assessment. Article 20(1) requires the MANAGEMENT BODY to approve the Article 21 measures, so the register's highest-value cross-ref is a dated approval (a POLICY or a DEC record) — ctxgrd checks that one is cited, never that the body was competent to give it. The `status` vocabulary is deliberately open (ADR-114 § STV-001); the freshness field is `reviewed_date`, one spelling across this family (ADR-114 § FLD-001).",
+      "paths": [
+        "docs/compliance/nis2/measures/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.dep-resolved",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "core.calendar-freshness",
+        "core.evidence-link"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "measure",
+        "entity_class",
+        "owner",
+        "reviewed_date"
+      ],
+      "allowed_values": [
+        "measure",
+        "entity_class"
+      ],
+      "calendar_freshness": {
+        "field": "reviewed_date",
+        "stale_days": 365
+      },
+      "control_evidence": {
+        "rule": "core.evidence-link",
+        "field": "measure",
+        "evidence_fields": [
+          "evidence_link"
+        ],
+        "out_of_scope_status": [
+          "not-applicable"
+        ]
+      }
+    },
+    {
+      "name": "NIS2INC",
+      "comment": "NIS2 Article 23 significant-incident register (ADR-115). One document per significant incident, carrying the staged reporting record: `awareness_date` (the anchor for Art. 23(4)(a) and (b)), `notification_date` (the anchor the final report runs from under Art. 23(4)(d) — NOT awareness), `report_stage`, and `significance_basis` from the closed two-limb Art. 23(3) test. WHAT CTXGRD CHECKS HERE IS THE RECORD, NOT THE CLOCK. Article 23(4) sets 24 hours for the early warning and 72 hours for the incident notification, both from becoming aware; ctxgrd's date primitives are day-granular (YYYY-MM-DD), so it cannot distinguish 2 elapsed hours from 46 across one date boundary and does not pretend to. It requires the dates to be present and well-formed so a human or an auditor can compute conformance; a rule that scored the hour-granular deadline from dates alone would be a false green, which is the defect class ADR-112 exists to close. The one-month final-report window IS day-expressible and is filed for `core.date-interval` (ADR-115 Open Questions), not shipped. NO core.min-docs binding, deliberately: most entities have never filed a report, and a namespace seeded with a minimum-document count would pressure an entity to invent one. The artifact actually under review is the PROCEDURE — who declares an incident significant, against which criteria, and who files — which belongs in a POLICY the register cross-refs. Trust service providers get 24 hours rather than 72 under the Art. 23(4) derogation; that distinction is not modelled because it changes an hour-granular deadline ctxgrd does not score.",
+      "paths": [
+        "docs/compliance/nis2/incidents/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.dep-resolved",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "entity_class",
+        "significance_basis",
+        "report_stage",
+        "awareness_date",
+        "owner"
+      ],
+      "allowed_values": [
+        "entity_class",
+        "significance_basis",
+        "report_stage"
+      ]
+    }
+  ]
+}

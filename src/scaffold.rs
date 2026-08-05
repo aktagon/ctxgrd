@@ -65,7 +65,7 @@ pub fn scaffold(
 /// in the sequence are preserved. If the fixture has ADR-001 and
 /// ADR-099, the next scaffold is ADR-100, not ADR-002. Users who
 /// want gap-filling can always pass `--id <n>`.
-pub fn next_id(namespace: &str, existing: &[Document]) -> u32 {
+pub(crate) fn next_id(namespace: &str, existing: &[Document]) -> u32 {
     existing
         .iter()
         .filter(|d| d.id.namespace == namespace)
@@ -80,7 +80,7 @@ pub fn next_id(namespace: &str, existing: &[Document]) -> u32 {
 /// Lowercase, non-ASCII-alnum → `-`, collapse consecutive dashes,
 /// trim edge dashes, truncate to 60 chars (then re-trim). Empty
 /// → "untitled".
-pub fn slugify(title: &str) -> String {
+pub(crate) fn slugify(title: &str) -> String {
     let mut out = String::new();
     for c in title.chars() {
         if c.is_ascii_alphanumeric() {
@@ -575,6 +575,17 @@ pub fn render_init_toml(active: &[&str], commented: &[&str], paths: &DetectedPat
     }
     out.push_str("]\n\n");
 
+    // ADR-076 § OWN-003: the role vocabulary every `owner` below is
+    // checked against. Commented out because it is a claim about the
+    // adopting team, not something ctxgrd can know — but the seeded
+    // `owner` values are live, so a fresh `init` lints clean rather than
+    // warning about itself on the first run.
+    out.push_str("# Roles that may own a namespace. Uncomment to check every\n");
+    out.push_str("# `owner` value below against this list; leave it commented and\n");
+    out.push_str("# `owner` is accepted as written.\n");
+    out.push_str("# [roles]\n");
+    out.push_str("# allowed = [\"developer\", \"product-strategist\", \"writer\"]\n\n");
+
     let mut first = true;
     for ns in active {
         if !first {
@@ -616,6 +627,11 @@ fn render_namespace_block(
 ) {
     let mut buf = String::new();
     buf.push_str(&format!("[{namespace}]\n"));
+    // ADR-076 § OWN-003: the role accountable for writing this document
+    // type. Seeded rather than left out, so a generated config does not
+    // trip `cfg.namespace-unowned` on its own first run — a linter that
+    // warns about the file it just wrote teaches the wrong lesson.
+    buf.push_str(&format!("owner = \"{}\"\n", default_owner(namespace)));
     buf.push_str("rules = [\n");
     for rule in [
         "core.frontmatter",
@@ -712,6 +728,25 @@ fn render_namespace_block(
     }
 }
 
+/// Seed `owner` role per namespace (ADR-076 § OWN-003).
+///
+/// A role, never a leaf skill — the whole point of the key. These are
+/// starting points a team edits into its own vocabulary, not a claim about
+/// how anyone's org is structured, which is also why `[roles].allowed`
+/// ships commented out: an unchecked seed is a suggestion, a checked one
+/// would be an imposition.
+///
+/// `developer` is the fallback because every namespace `init` can generate
+/// is an engineering-adjacent record; a namespace whose real owner is
+/// elsewhere is a one-word edit.
+fn default_owner(namespace: &str) -> &'static str {
+    match namespace {
+        "PRD" | "ROADMAP" => "product-strategist",
+        "GUIDE" | "README" => "writer",
+        _ => "developer",
+    }
+}
+
 /// Conventional minimal H2 heading sets, per namespace.
 ///
 /// These reflect the industry-standard structures for each record
@@ -757,7 +792,7 @@ fn default_headings(namespace: &str) -> Vec<&'static str> {
 /// short and biased toward common shapes; ADR 006 § EXT-003 picks
 /// "prefer misses to nags" — false positives in init output are
 /// corrosive to user trust, so niche layouts go unflagged on purpose.
-pub const BODY_HEADER_SCAN_DIRS: &[(&str, &str)] = &[
+pub(crate) const BODY_HEADER_SCAN_DIRS: &[(&str, &str)] = &[
     // ADR
     ("docs/adr", "ADR"),
     ("docs/adrs", "ADR"),
@@ -1037,6 +1072,7 @@ mod tests {
             params,
             paths: None,
             path_patterns: Vec::new(),
+            owner: None,
         }
     }
 
@@ -1296,6 +1332,7 @@ depends_on: []
             params,
             paths: None,
             path_patterns: Vec::new(),
+            owner: None,
         };
         let s = scaffold(
             "THREAT",

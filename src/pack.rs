@@ -16,7 +16,7 @@
 //! binary, then `<global>/packs/*`, then `<root>/packs/*`. On a name
 //! collision the more-local source wins.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -45,9 +45,18 @@ const HIPAA_TOML: &str = include_str!("../packs/hipaa/pack.toml");
 const SOC2_TOML: &str = include_str!("../packs/soc2/pack.toml");
 const ISO27001_TOML: &str = include_str!("../packs/iso-27001/pack.toml");
 const NIST80053_TOML: &str = include_str!("../packs/nist-800-53/pack.toml");
+const NIS2_TOML: &str = include_str!("../packs/nis2/pack.toml");
+const EU_AI_ACT_TOML: &str = include_str!("../packs/eu-ai-act/pack.toml");
+const CCPA_TOML: &str = include_str!("../packs/ccpa/pack.toml");
 const GITHUB_TOML: &str = include_str!("../packs/github/pack.toml");
 const GITLAB_TOML: &str = include_str!("../packs/gitlab/pack.toml");
 const DDD_TOML: &str = include_str!("../packs/ddd/pack.toml");
+const GOVERNANCE_TOML: &str = include_str!("../packs/governance/pack.toml");
+const RESEARCH_TOML: &str = include_str!("../packs/research/pack.toml");
+const QA_TOML: &str = include_str!("../packs/qa/pack.toml");
+const MARKETING_TOML: &str = include_str!("../packs/marketing/pack.toml");
+const STRIPE_INTEGRATION_WEB_TOML: &str =
+    include_str!("../packs/stripe-integration-web/pack.toml");
 
 /// A discovered pack, normalised across the three discovery sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +114,20 @@ pub struct NamespaceView {
     pub rules: Vec<String>,
     pub required_metadata: Vec<String>,
     pub path_patterns: Vec<String>,
+    /// Every `[NS."rule.code"]` param table the namespace declares, keyed by
+    /// rule code (ADR-113 § PKJ-001).
+    ///
+    /// **Complete by construction, not by allow-list.** Every sub-table of a
+    /// namespace block *is* a rule's param table, so this collects "every
+    /// table present" rather than a curated selection. A withheld param is a
+    /// param a downstream consumer must transcribe, which ADR-076 § OWN-001
+    /// forbids — so there is deliberately no filter here that could fall out
+    /// of sync with the packs.
+    ///
+    /// Includes `core.required-metadata`, which [`NamespaceView::required_metadata`]
+    /// also hoists. The duplication is deliberate: removing the hoisted field
+    /// would break the `pack show --format json` shape ADR-096 § CMD-002 ships.
+    pub params: BTreeMap<String, serde_json::Value>,
 }
 
 /// A paid (non-built-in) pack the public binary *advertises* but does not
@@ -144,7 +167,8 @@ pub struct AddPlan {
     pub rules_to_copy: Vec<PackRule>,
 }
 
-/// The built-in packs (PACK-009). Seventeen packs: `project-docs`, `ops`,
+/// The built-in packs (PACK-009). This list narrates the major additions,
+/// not every entry. Core set: `project-docs`, `ops`,
 /// `agents`, `design`, `persona`, `security`, `claude`, `workflow`, `codex`,
 /// `gemini`, `opencode`, `guide`, `c4`, `gdpr`, `hipaa`, `soc2`, `iso-27001`,
 /// and `nist-800-53` (ADR-023 § PKC-001, ADR-027, ADR-034, ADR-035, ADR-041,
@@ -168,6 +192,20 @@ pub struct AddPlan {
 /// the shared evidence_gap core. ADR-082 added `ddd` (strategic Domain-Driven
 /// Design: the id-claimed BOUNDEDCONTEXT and CONTEXTMAP namespaces typed on the
 /// dependency graph, with one new builtin `ddd.context-map-shape` rule).
+/// ADR-085 added `stripe-integration-web` (the INTSTRIPE Stripe
+/// web-integration checklist profile ADR-078 § CHK-006 deferred: an
+/// [INTSTRIPE] namespace on docs/integrations/stripe/** binding the
+/// checklist.* rules plus core.required-headings/anchors for the seven
+/// Stripe phases and twelve inline-tier @stripe.* markers — the ctxgrd
+/// presence leg of the Stripe verification triad with wrkgrd and cmplgrd).
+/// ADR-092 added `governance` (the DEC program/governance decision register on
+/// docs/decisions/[0-9]*.md — the first RAID+ register family member, kept out of
+/// project-docs as an opt-in authority/impact overlay, the same placement the
+/// intake pack's CR change register already set).
+/// ADR-100 added `marketing` (the CAMPAIGN/PERSONA/POSITIONING/ICP
+/// marketing-strategy namespaces — id-less path-claims with framework-sourced
+/// required-headings and one monotonic builtin `marketing.frontmatter`, kept on
+/// the docs side of the CRM line).
 /// ADR-052's `machine-learning` pack was reverted in 0.31.0 (see its
 /// Change log).
 pub fn builtin_packs() -> Vec<Pack> {
@@ -334,6 +372,24 @@ pub fn builtin_packs() -> Vec<Pack> {
             rules: Vec::new(),
         },
         Pack {
+            // RESEARCH namespace — path-claimed on docs/research/**. Deep-research
+            // reports (a multi-source cited synthesis genre) kept evidence-honest
+            // by the builtin-compiled `research.evidence` rule: an evidence/sources
+            // section is required (error) and a limitations/data-gaps section is
+            // nudged (configurable warning), with an optional monotonic
+            // `research.type` field routing a report into its academic/market/
+            // deep-research skeleton. It also binds core.min-docs (a non-empty
+            // research folder once adopted). id-less: the filename is the slug. No
+            // dep rules, no core.allowed-values (the rule self-validates the type),
+            // and no external scripts. ADR-093.
+            name: "research".to_string(),
+            summary: summary_of(RESEARCH_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: RESEARCH_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
             // CHECKLIST namespace — path-claimed on docs/checklists/**. Turns a
             // markdown checklist into an auditable, commit-pinned sign-off:
             // `checklist.structure` (title + living|sealed status + a pin when
@@ -348,6 +404,24 @@ pub fn builtin_packs() -> Vec<Pack> {
             source_label: "built-in".to_string(),
             rank: 0,
             toml_text: CHECKLIST_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // INTSTRIPE — the Stripe web-integration checklist profile ADR-078
+            // § CHK-006 deferred, unblocked once core.required-anchors shipped.
+            // A dedicated [INTSTRIPE] namespace on docs/integrations/stripe/**
+            // (its own path, so it coexists with the generic `checklist` pack)
+            // binding the checklist.* sign-off rules plus core.required-headings
+            // (the seven Stripe phases) and core.required-anchors (twelve
+            // inline-tier @stripe.* markers). The ctxgrd "presence" leg of the
+            // Stripe verification triad: wrkgrd's anchor-coverage proves the
+            // tier=code half, cmplgrd orchestrates by tier. id-less, no external
+            // scripts. ADR-085.
+            name: "stripe-integration-web".to_string(),
+            summary: summary_of(STRIPE_INTEGRATION_WEB_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: STRIPE_INTEGRATION_WEB_TOML.to_string(),
             rules: Vec::new(),
         },
         Pack {
@@ -460,6 +534,56 @@ pub fn builtin_packs() -> Vec<Pack> {
             rules: Vec::new(),
         },
         Pack {
+            // NIS2 / NIS2INC — Directive (EU) 2022/2555. Unlike soc2/iso-27001/
+            // nist-800-53 this is a LAW, not a control framework, so it earns two
+            // namespaces (ADR-066 § Context): the Art. 21(2) measures register and
+            // the Art. 23 significant-incident register. Art. 21(2)'s ten points
+            // (a)-(j) are the cleanest closed vocabulary in the family. NIS2INC
+            // deliberately binds no clock rule and no core.min-docs — ctxgrd's
+            // dates are day-granular and cannot score a 24h/72h statutory deadline,
+            // and an incident namespace with a minimum-document count would
+            // pressure an entity to invent a report (ADR-115 § NIS-002/003).
+            // Generated from packs/nis2/regulation.json.
+            name: "nis2".to_string(),
+            summary: summary_of(NIS2_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: NIS2_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // AIACT / FRIA — Regulation (EU) 2024/1689. A law with two namespaces:
+            // the obligation register, where `risk_tier` and `role` are
+            // load-bearing because the Act's requirement set is *selected* by tier
+            // and role (Art. 25 lets one entity hold provider and deployer duties
+            // over one system), and the Art. 27 fundamental rights impact
+            // assessment, modelled separately for the same reason gdpr's DPIA is —
+            // a dated assessment of a specific deployment, not a table row.
+            // Generated from packs/eu-ai-act/regulation.json (ADR-116).
+            name: "eu-ai-act".to_string(),
+            summary: summary_of(EU_AI_ACT_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: EU_AI_ACT_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // CCPA / SPA — California Civil Code Title 1.81.5 (CCPA as amended by
+            // the CPRA). A separate pack, NOT a gdpr extension: ADR-066 § CMP-001
+            // requires one pack per regulation so a GDPR-subject project is not
+            // forced to carry US state privacy namespaces (ADR-117 § CCP-001).
+            // ROPA-shaped, but the pivot is a sale/sharing determination rather
+            // than a lawful basis — and `sold`/`shared` are separate statutory
+            // definitions (§ 1798.140(ad)/(ah)), so `both` is a real value.
+            // Generated from packs/ccpa/regulation.json.
+            name: "ccpa".to_string(),
+            summary: summary_of(CCPA_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: CCPA_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
             // CONTRIBUTING/CODEOFCONDUCT/SECURITYDOC/SUPPORT — the markdown
             // community-health files GitHub recognizes (root, .github/, or
             // docs/), path-claimed and id-less with a single warning-severity
@@ -512,6 +636,78 @@ pub fn builtin_packs() -> Vec<Pack> {
             toml_text: DDD_TOML.to_string(),
             rules: Vec::new(),
         },
+        Pack {
+            // DEC — a program/governance decision register (ADR-092). One
+            // id-claimed namespace on docs/decisions/[0-9]*.md: pure core.*
+            // (frontmatter/id/id-unique/dep-resolved/dep-cycle/cross-ref/
+            // required-headings [Decision/Rationale/Impact/Approval]/
+            // required-metadata [+ the DEC-distinguishing `decision-maker`
+            // authority key]/allowed-values [the governance lifecycle
+            // proposed→pending→approved|rejected|deferred→superseded]/
+            // successor-link), so `rules` (external scripts) is empty. NOT the
+            // ADR namespace: an ADR is a technical decision owned by
+            // engineering; a DEC is a program/strategic decision emphasizing
+            // authority and cross-cutting impact (scope/cost/schedule/benefits/
+            // risk/stakeholders). Its own opt-in pack, not project-docs, because
+            // a governance register is an authority/impact overlay (like ops/
+            // security/compliance), and DEC is the first member of the RAID+
+            // register family — the change register (CR) already lives outside
+            // project-docs in `intake`, the same precedent (CR-004).
+            name: "governance".to_string(),
+            summary: summary_of(GOVERNANCE_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: GOVERNANCE_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // TEST — a pinned Test Completion Report register (ADR-098). One
+            // id-claimed namespace on docs/tests/TEST-*.md: the durable,
+            // human-authored milestone artifact (IEEE 829 / ISO-29119-3) that
+            // records whether a release cleared its exit gate, against which
+            // tree and which contract revision, its outstanding defects, and
+            // sign-off. Pure core.* plus one new builtin, `test.completion`,
+            // which enforces the two sealed-record invariants core presence
+            // rules cannot express: the `tested_commit`/`spec_commit` pins
+            // (shape-only, cloned from checklist.pinned) and the non-empty
+            // Outstanding Defects section a `conditional-pass` waiver requires.
+            // The pack is named `qa` but the namespace is [TEST], since a
+            // document's namespace is its id prefix (`id: TEST-<N>`), the same
+            // pack-name/namespace-name split as governance -> [DEC]. Its own
+            // opt-in pack, not project-docs, because a completion report is
+            // QA-lifecycle-specific and will grow siblings (test plans, status
+            // reports) — the governance-pack precedent (ADR-092).
+            name: "qa".to_string(),
+            summary: summary_of(QA_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: QA_TOML.to_string(),
+            rules: Vec::new(),
+        },
+        Pack {
+            // marketing — the markdown-documentable marketing-strategy artifacts:
+            // CAMPAIGN briefs, buyer PERSONAs, POSITIONING, and the ICP. Four
+            // path-claimed, id-less namespaces (the filename is the slug, like
+            // GUIDE/RESEARCH — strategy singletons, not an id-keyed graph). The
+            // scope boundary is the CRM line: individual prospect/lead records,
+            // lead scores, and UTM tables live in Salesforce/HubSpot, never in
+            // markdown, so they get no namespace. Everything is core.* except one
+            // builtin, `marketing.frontmatter`: a monotonic opt-in validating a
+            // nested `marketing.type` genre discriminator (nested to dodge the
+            // SSG-reserved top-level `type:`, BUG-015 — a check no core primitive
+            // can express). Greenfield default globs are docs/marketing/**; a
+            // project overrides `paths` (this repo points them at docs/strategy/,
+            // as governance points [DEC] at docs/strategy/decisions/). The
+            // PERSONA/POSITIONING/ICP required-headings are framework-sourced
+            // (Revella's 5 Rings; Moore ∩ Dunford; the B2B ICP standard); CAMPAIGN
+            // stays deliberately minimal until a real brief format exists. ADR-100.
+            name: "marketing".to_string(),
+            summary: summary_of(MARKETING_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: MARKETING_TOML.to_string(),
+            rules: Vec::new(),
+        },
     ]
 }
 
@@ -541,7 +737,7 @@ pub fn paid_packs() -> Vec<PaidPack> {
 /// order (PACK-003): built-in, then `<global>/packs/*`, then
 /// `<root>/packs/*`, with the more-local source winning on name
 /// collision. Returned sorted by name.
-pub fn discover_packs(root: &Path, global_dir: Option<&Path>) -> Vec<Pack> {
+pub(crate) fn discover_packs(root: &Path, global_dir: Option<&Path>) -> Vec<Pack> {
     let mut by_name: BTreeMap<String, Pack> = BTreeMap::new();
     for p in builtin_packs() {
         by_name.insert(p.name.clone(), p);
@@ -575,7 +771,7 @@ pub fn find(root: &Path, name: &str) -> Option<Pack> {
 /// bundles (e.g. `skills.frontmatter` → `agents`) and external-script pack
 /// rules — so a `cfg.rule-unknown` for either kind can point at the pack
 /// that installs it. Empty when no discoverable pack provides the code.
-pub fn providers_of(root: &Path, code: &str) -> Vec<String> {
+pub(crate) fn providers_of(root: &Path, code: &str) -> Vec<String> {
     let mut names: Vec<String> = discover(root)
         .iter()
         .filter(|p| {
@@ -583,6 +779,24 @@ pub fn providers_of(root: &Path, code: &str) -> Vec<String> {
                 .iter()
                 .any(|v| v.rules.iter().any(|r| r == code))
         })
+        .map(|p| p.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Names of discoverable packs that define namespace `ns` (ADR-025 §
+/// PKD-001, applied to namespaces rather than rule codes). Sorted,
+/// deduplicated, empty when no pack ships it.
+///
+/// Lets `cfg.namespace-undeclared` (ADR-076 § OWN-004) name the exact
+/// `pack add` that would declare the namespace a document already claims,
+/// instead of leaving the reader to hunt through `ctxgrd pack list`.
+pub(crate) fn providers_of_namespace(root: &Path, ns: &str) -> Vec<String> {
+    let mut names: Vec<String> = discover(root)
+        .iter()
+        .filter(|p| namespace_views(p).iter().any(|v| v.name == ns))
         .map(|p| p.name.clone())
         .collect();
     names.sort();
@@ -722,14 +936,59 @@ pub fn namespace_views(pack: &Pack) -> Vec<NamespaceView> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // ADR-113 § PKJ-001: every sub-table of the namespace block is a
+            // rule's param table. Scalars and arrays at this level are the
+            // namespace's own keys (`paths`, `rules`, `owner`), already
+            // surfaced above.
+            let params: BTreeMap<String, serde_json::Value> = ns_tbl
+                .map(|t| {
+                    t.iter()
+                        .filter_map(|(code, v)| {
+                            v.as_table().map(|tbl| (code.clone(), toml_table_to_json(tbl)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             NamespaceView {
                 name,
                 rules,
                 required_metadata,
                 path_patterns,
+                params,
             }
         })
         .collect()
+}
+
+/// One TOML value as JSON, for the machine-readable pack contract
+/// (ADR-113 § PKJ-002).
+///
+/// Hand-written rather than routed through `serde` because the target must be
+/// **canonical**: `serde_json::Map` is a `BTreeMap` in this build (no
+/// `preserve_order` feature), so object keys sort and the same pack always
+/// serialises to the same bytes. That is what lets a consumer pin a digest it
+/// computes itself. A TOML datetime has no JSON counterpart and becomes its
+/// RFC 3339 string, which is how every pack already spells dates anyway.
+fn toml_value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Integer(i) => serde_json::Value::from(*i),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Datetime(d) => serde_json::Value::String(d.to_string()),
+        Value::Array(a) => serde_json::Value::Array(a.iter().map(toml_value_to_json).collect()),
+        Value::Table(t) => toml_table_to_json(t),
+    }
+}
+
+fn toml_table_to_json(t: &toml::Table) -> serde_json::Value {
+    serde_json::Value::Object(
+        t.iter()
+            .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
+            .collect(),
+    )
 }
 
 /// Plan a `pack add` against the current `ctxgrd.toml` text, without
@@ -974,13 +1233,99 @@ pub(crate) fn existing_namespaces(toml: &str) -> std::collections::BTreeSet<Stri
         .collect()
 }
 
+/// One `# pack: <name>` provenance comment and the run of namespace
+/// blocks that follows it, in file order (ADR-080 § AVS-004).
+///
+/// A run ends at the next `# pack:` comment or the next non-namespace
+/// top-level table (`[pipeline]`, `[ignore]`). `pack add` writes one
+/// comment immediately before each block it appends (`plan_add`), so the
+/// generated form is a one-block run; hands routinely consolidate a
+/// pack's blocks under a single comment (see this repo's `# pack:
+/// marketing` run), so a run can be longer.
+///
+/// Segmentation reuses [`header_namespace`], the same predicate
+/// [`namespace_blocks`] segments on; `namespace_blocks` itself cannot be
+/// used here because it drops the preamble (where the first block's stamp
+/// lives) and rejoins lines, losing the comment's position.
+pub(crate) fn stamped_runs(config_toml: &str) -> Vec<(String, Vec<String>)> {
+    let mut runs: Vec<(String, Vec<String>)> = Vec::new();
+    let mut open = false;
+    let mut current_ns: Option<String> = None;
+    for line in config_toml.lines() {
+        if let Some(prov) = parse_provenance(line) {
+            runs.push((prov.pack, Vec::new()));
+            open = true;
+            current_ns = None;
+            continue;
+        }
+        match header_namespace(line) {
+            Some(ns) => {
+                if current_ns.as_deref() != Some(ns.as_str()) {
+                    if open {
+                        if let Some((_, namespaces)) = runs.last_mut() {
+                            namespaces.push(ns.clone());
+                        }
+                    }
+                    current_ns = Some(ns);
+                }
+            }
+            // A non-namespace top-level table ends the stamped run.
+            None if line.trim_start().starts_with('[') => {
+                open = false;
+                current_ns = None;
+            }
+            None => {}
+        }
+    }
+    runs
+}
+
+/// The namespaces `--pack <name>` selects: those stamped with that pack's
+/// ADR-053 provenance comment in the project's own `ctxgrd.toml` (ADR-080
+/// § AVS-004). Never the namespace list the built-in pack *declares* —
+/// packs are applied by copy, so a project routinely adopts a subset, and
+/// scoping to an unadopted namespace would lint nothing and report a
+/// false clean.
+///
+/// Within a stamped run, the block the comment directly introduces is
+/// always the pack's. A *trailing* block in the same run is the pack's
+/// only when the pack's own definition declares it — that is what
+/// separates a hand-consolidated `# pack: marketing` run (PERSONA,
+/// POSITIONING, ICP all come from the pack) from a hand-written block
+/// appended after someone else's stamped block. The definition is used
+/// here as a filter on what the project actually stamped, never as the
+/// source of the namespace list. A pack this binary cannot resolve (an
+/// external or removed one) has no definition to filter with, so its
+/// whole run counts.
+pub(crate) fn stamped_namespaces(root: &Path, name: &str, config_toml: &str) -> BTreeSet<String> {
+    let declared: Option<BTreeSet<String>> = find(root, name).map(|p| {
+        namespace_blocks(&p.toml_text)
+            .into_iter()
+            .map(|(ns, _)| ns)
+            .collect()
+    });
+    let mut selected: BTreeSet<String> = BTreeSet::new();
+    for (pack, namespaces) in stamped_runs(config_toml) {
+        if pack != name {
+            continue;
+        }
+        for (i, ns) in namespaces.iter().enumerate() {
+            let is_head = i == 0;
+            if is_head || declared.as_ref().is_none_or(|d| d.contains(ns)) {
+                selected.insert(ns.clone());
+            }
+        }
+    }
+    selected
+}
+
 /// Segment `pack.toml` text into `(namespace, verbatim_block)` pairs in
 /// declaration order. A namespace block is the contiguous run of lines
 /// from its `[<NS>]` header through the table headers nested under it
 /// (`[<NS>."core.required-metadata"]` etc.), up to the next top-level
 /// namespace header. Preamble before the first namespace header (the
 /// `# summary:` line) is dropped. Trailing blank lines are trimmed.
-pub fn namespace_blocks(toml: &str) -> Vec<(String, String)> {
+pub(crate) fn namespace_blocks(toml: &str) -> Vec<(String, String)> {
     let mut blocks: Vec<(String, String)> = Vec::new();
     let mut current: Option<String> = None;
     for line in toml.lines() {
@@ -1044,7 +1389,7 @@ fn is_namespace_key(key: &str) -> bool {
 /// The suffix is an inert comment to any binary that does not parse it,
 /// so older binaries keep linting a v2 config unchanged (PKM-006).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Provenance {
+pub(crate) struct Provenance {
     /// The pack name the block was generated from.
     pub pack: String,
     /// The binary version that stamped the block (provenance label
@@ -1058,7 +1403,7 @@ pub struct Provenance {
 /// Parse a `# pack: <name>[@<version>[ sha:<hash>]]` provenance line.
 /// Returns `None` for any line that is not a provenance comment.
 /// Surrounding whitespace is tolerated.
-pub fn parse_provenance(line: &str) -> Option<Provenance> {
+pub(crate) fn parse_provenance(line: &str) -> Option<Provenance> {
     let rest = line.trim().strip_prefix("# pack:")?.trim();
     if rest.is_empty() {
         return None;
@@ -2085,7 +2430,78 @@ mod tests {
             .find(|p| p.name == "project-docs")
             .unwrap();
         let names: Vec<String> = namespace_views(&pack).into_iter().map(|v| v.name).collect();
-        assert_eq!(names, vec!["ADR", "PRD", "RFC", "BUG", "TODO", "README"]);
+        assert_eq!(
+            names,
+            vec!["ADR", "PRD", "ROADMAP", "RFC", "BUG", "TODO", "README"]
+        );
+    }
+
+    #[test]
+    fn builtin_project_docs_roadmap_is_nnl_shaped() {
+        // ADR-088 § RDM-001/002/003/006: nine core.* rules, NNL headings,
+        // required owner/date metadata, horizon-as-status vocabulary.
+        let pack = builtin_packs()
+            .into_iter()
+            .find(|p| p.name == "project-docs")
+            .unwrap();
+        let roadmap = namespace_views(&pack)
+            .into_iter()
+            .find(|v| v.name == "ROADMAP")
+            .unwrap();
+        assert_eq!(
+            roadmap.rules,
+            vec![
+                "core.frontmatter",
+                "core.id",
+                "core.id-unique",
+                "core.dep-resolved",
+                "core.dep-cycle",
+                "core.required-headings",
+                "core.required-metadata",
+                "core.allowed-values",
+                "core.min-docs",
+            ]
+        );
+        assert_eq!(
+            roadmap.required_metadata,
+            vec!["id", "title", "status", "date", "owner"]
+        );
+        assert_eq!(roadmap.path_patterns, vec!["docs/roadmap/**"]);
+        let headings = builtin_pack_headings_for(&pack, "ROADMAP").unwrap();
+        assert_eq!(headings, vec!["Problem", "Outcome", "Ideas", "Success Metrics"]);
+        let statuses: Vec<String> = pack
+            .toml_text
+            .parse::<Value>()
+            .unwrap()
+            .get("ROADMAP")
+            .and_then(|v| v.get("core.allowed-values"))
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(statuses, vec!["now", "next", "later", "done", "dropped"]);
+    }
+
+    #[test]
+    fn builtin_project_docs_prd_binds_min_docs() {
+        // ADR-089 § MND-001: PRD is now mandatory when enabled, same as
+        // README and the new ROADMAP.
+        let pack = builtin_packs()
+            .into_iter()
+            .find(|p| p.name == "project-docs")
+            .unwrap();
+        let prd = namespace_views(&pack)
+            .into_iter()
+            .find(|v| v.name == "PRD")
+            .unwrap();
+        assert!(
+            prd.rules.contains(&"core.min-docs".to_string()),
+            "PRD binds core.min-docs:\n{:?}",
+            prd.rules
+        );
     }
 
     #[test]
@@ -2234,6 +2650,7 @@ mod tests {
             plan.added,
             vec![
                 "PRD".to_string(),
+                "ROADMAP".to_string(),
                 "RFC".to_string(),
                 "BUG".to_string(),
                 "TODO".to_string(),
@@ -2241,8 +2658,9 @@ mod tests {
             ]
         );
         // Every added block carries a provenance comment.
-        assert_eq!(plan.blocks_text.matches("# pack: project-docs").count(), 5);
+        assert_eq!(plan.blocks_text.matches("# pack: project-docs").count(), 6);
         assert!(plan.blocks_text.contains("[PRD]"));
+        assert!(plan.blocks_text.contains("[ROADMAP]"));
         assert!(!plan.blocks_text.contains("[ADR]"));
     }
 
@@ -2254,7 +2672,7 @@ mod tests {
             .unwrap();
         let plan = plan_add(&pack, "", Path::new("/nonexistent-root"));
         assert!(plan.skipped.is_empty());
-        assert_eq!(plan.added.len(), 6);
+        assert_eq!(plan.added.len(), 7);
     }
 
     #[test]
@@ -2306,13 +2724,21 @@ mod tests {
     #[test]
     fn workflow_pack_holds_id_claimed_spec_task_prompt() {
         // ADR-051: SPEC/TASK/PROMPT moved out of `agents` into `workflow`.
+        // ADR-105: HANDOFF joined them — the session-continuity store.
         let names = pack_namespace_names("workflow");
-        assert_eq!(names, vec!["SPEC", "TASK", "PROMPT"]);
+        assert_eq!(names, vec!["SPEC", "TASK", "PROMPT", "HANDOFF"]);
         let pack = builtin_packs()
             .into_iter()
             .find(|p| p.name == "workflow")
             .unwrap();
         for v in namespace_views(&pack) {
+            // HANDOFF is the one path-claimed namespace here (ADR-105 § HND-001):
+            // id-claiming would silently skip a handoff written without an `id`,
+            // which is precisely the shape defect the namespace exists to catch.
+            if v.name == "HANDOFF" {
+                assert_eq!(v.path_patterns, vec!["docs/handoffs/**".to_string()]);
+                continue;
+            }
             assert!(
                 v.path_patterns.is_empty(),
                 "{} must be id-claimed (no paths)",
@@ -2631,6 +3057,114 @@ mod tests {
         let pd = packs.iter().find(|p| p.name == "project-docs").unwrap();
         assert_eq!(pd.source_label, "./packs/project-docs");
         assert_eq!(pd.summary, "Local override.");
+    }
+
+    // -- ADR-080 § AVS-004 `--pack` provenance resolution --------------
+
+    #[test]
+    fn stamped_runs_group_each_comment_with_the_blocks_that_follow_it() {
+        // The `pack add` form (one comment per block) and the
+        // hand-consolidated form (one comment over a run) in one file,
+        // plus hand-written blocks that carry no stamp at all.
+        let toml = "\
+[ADR]
+paths = [\"docs/adrs/**\"]
+
+# pack: marketing
+#
+# Path-claimed, id-less (ADR-100).
+[CAMPAIGN]
+paths = [\"docs/strategy/campaigns/**\"]
+
+[PERSONA]
+paths = [\"docs/strategy/personas/**\"]
+
+# pack: guide
+[GUIDE]
+paths = [\"docs/guides/**\"]
+
+[pipeline]
+stages = [\"PRD\", \"ADR\"]
+
+[BUG]
+paths = [\"docs/bugs/**\"]
+";
+        let runs = stamped_runs(toml);
+        assert_eq!(
+            runs,
+            vec![
+                (
+                    "marketing".to_string(),
+                    vec!["CAMPAIGN".to_string(), "PERSONA".to_string()]
+                ),
+                ("guide".to_string(), vec!["GUIDE".to_string()]),
+            ]
+        );
+        // `[ADR]` precedes every stamp and `[BUG]` follows the
+        // `[pipeline]` table that ends the run — neither is stamped, so
+        // `--pack` cannot reach them (AVS-004's accepted failure mode).
+        let stamped: Vec<&str> = runs
+            .iter()
+            .flat_map(|(_, ns)| ns.iter().map(String::as_str))
+            .collect();
+        assert_eq!(stamped, vec!["CAMPAIGN", "PERSONA", "GUIDE"]);
+    }
+
+    #[test]
+    fn stamped_namespaces_keeps_a_trailing_block_only_when_the_pack_declares_it() {
+        // `[PRD]` trails the `guide` stamp with no stamp of its own. The
+        // guide pack does not declare PRD, so it is not the guide pack's
+        // — over-attributing it would lint a namespace nobody scoped.
+        let toml = "\
+# pack: guide
+[GUIDE]
+paths = [\"docs/guides/**\"]
+
+[PRD]
+paths = [\"docs/prds/**\"]
+";
+        let root = Path::new(".");
+        assert_eq!(
+            stamped_namespaces(root, "guide", toml),
+            BTreeSet::from(["GUIDE".to_string()])
+        );
+        // An unstamped block is reachable by no pack at all.
+        assert_eq!(
+            stamped_namespaces(root, "project-docs", toml),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn stamped_namespaces_reads_this_repo_own_config() {
+        // Dogfood: the live `ctxgrd.toml` carries both the `# pack: name`
+        // and the full `# pack: name@version sha:…` stamp forms, and
+        // consolidates the marketing pack's four blocks under one comment.
+        let toml = include_str!("../ctxgrd.toml");
+        let root = Path::new(".");
+        assert_eq!(
+            stamped_namespaces(root, "marketing", toml),
+            BTreeSet::from([
+                "CAMPAIGN".to_string(),
+                "ICP".to_string(),
+                "PERSONA".to_string(),
+                "POSITIONING".to_string(),
+            ])
+        );
+        assert_eq!(
+            stamped_namespaces(root, "guide", toml),
+            BTreeSet::from(["GUIDE".to_string()])
+        );
+        // The `@version sha:` form resolves identically.
+        assert_eq!(
+            stamped_namespaces(root, "arc42", toml),
+            BTreeSet::from(["ARC42".to_string()])
+        );
+        // This repo's `[ADR]` block is hand-written, so no pack reaches it.
+        assert_eq!(
+            stamped_namespaces(root, "project-docs", toml).contains("ADR"),
+            false
+        );
     }
 
     // -- ADR-053 provenance v2, fingerprint, migrate ------------------

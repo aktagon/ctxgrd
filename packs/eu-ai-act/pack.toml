@@ -1,0 +1,59 @@
+# summary: EU AI Act obligation register (AIACT) and Art. 27 fundamental rights impact assessment register (FRIA) over the security base — Regulation (EU) 2024/1689. Paperwork existence/metadata/freshness only, never conformity or legal adequacy.
+# depends: security
+
+# EU AI Act obligation-to-evidence register (Regulation (EU) 2024/1689, ADR-116). One document per obligation, the article projected from the verified catalog into core.allowed-values, and core.evidence-link over `article` requiring each in-scope obligation to cite an implementing POLICY/ADR or an `evidence_link`. `risk_tier` and `role` are the load-bearing fields and the reason this cannot be a plain catalog: the AI Act's requirement set is SELECTED by tier and role, so a register that does not record which tier it was built against cannot say whether it is complete — and the same entity can hold provider and deployer duties over one system simultaneously (Art. 25, Responsibilities along the AI value chain). This is the machine-checkable residue of the applicability determination; ctxgrd checks that a tier and a role were recorded, never that they were determined correctly. That determination is a legal judgment and belongs in a dated decision record the register cross-refs. The `status` vocabulary is deliberately open (ADR-114 § STV-001); the freshness field is `reviewed_date` (ADR-114 § FLD-001). Art. 12 record-keeping and Art. 10 data governance appear as obligations whose evidence is a design document — the register never holds the logs or the datasets themselves.
+[AIACT]
+paths = ["docs/compliance/eu-ai-act/obligations/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.calendar-freshness",
+  "core.evidence-link",
+]
+
+[AIACT."core.required-metadata"]
+keys = ["id", "title", "status", "article", "role", "risk_tier", "owner", "reviewed_date"]
+
+[AIACT."core.allowed-values"]
+article = ["5", "6", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "22", "23", "24", "25", "26", "27", "43", "47", "48", "49", "50", "51", "53", "54", "55", "72", "73"]
+role = ["provider", "deployer", "authorised-representative", "importer", "distributor"]
+risk_tier = ["prohibited", "high-risk", "transparency", "minimal", "gpai", "gpai-systemic"]
+
+[AIACT."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 365
+
+[AIACT."core.evidence-link"]
+field = "article"
+evidence-fields = ["evidence_link"]
+out-of-scope-status = ["not-applicable"]
+
+# Art. 27 fundamental rights impact assessment register (ADR-116). DPIA-shaped and modelled separately for the same reason GDPR's DPIA is: it is a dated assessment of a specific deployment, re-reviewed when the deployment changes, not a row in an obligation table. Art. 27(1) scopes the duty to deployers that are bodies governed by public law or private entities providing public services, plus deployers of the Annex III points 5(b) and (c) systems, and excludes the Annex III point 2 area — so `role` here is effectively `deployer` and the applicability question is whose body it is, which no linter can answer. `reviewed_date` under core.calendar-freshness is the whole point: an impact assessment of a deployment that has since changed is worse than none, because it carries the authority of an assessment while describing a system that no longer exists. Cross-refs the AIACT obligation it discharges (Art. 27 in that register), which core.dep-resolved and core.cross-ref hold to a target that exists (ADR-112).
+[FRIA]
+paths = ["docs/compliance/eu-ai-act/fria/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.calendar-freshness",
+]
+
+[FRIA."core.required-metadata"]
+keys = ["id", "title", "status", "role", "risk_tier", "owner", "reviewed_date"]
+
+[FRIA."core.allowed-values"]
+role = ["provider", "deployer", "authorised-representative", "importer", "distributor"]
+risk_tier = ["prohibited", "high-risk", "transparency", "minimal", "gpai", "gpai-systemic"]
+
+[FRIA."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 365

@@ -4,90 +4,263 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::process::ExitCode;
-
-use anyhow::Result;
 
 use ctxgrd::diagnostic::Diagnostic;
-use ctxgrd::run;
+use ctxgrd::pack::MigratePlan;
 
-use super::{emit_error, relative_display, Format};
+use super::command::{Command, Ctx, KernelError, Outcome};
+use super::{relative_display, Format};
 
-/// `ctxgrd pack list` — read-only table of every discoverable pack
-/// (PACK-004). Touches no file.
-pub(super) fn pack_list_cmd(root: &Path, paid: bool) -> Result<ExitCode> {
-    if paid {
-        print!(
-            "{}",
-            ctxgrd::pack::render_paid_list(&ctxgrd::pack::paid_packs())
-        );
-    } else {
-        let packs = ctxgrd::pack::discover(root);
-        print!("{}", ctxgrd::pack::render_list(&packs));
+/// `ctxgrd pack list` — read-only table of every discoverable pack (PACK-004).
+pub(super) struct PackListCmd {
+    pub(super) paid: bool,
+    pub(super) format: Format,
+}
+
+impl Command for PackListCmd {
+    type Json = serde_json::Value;
+
+    fn emits_json(&self) -> bool {
+        matches!(self.format, Format::Json)
     }
-    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+
+    fn render_json(out: &Self::Json) -> String {
+        serde_json::to_string_pretty(out).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    fn run(self, ctx: &Ctx) -> Result<Outcome<Self::Json>, KernelError> {
+        let root = &ctx.root;
+        if matches!(self.format, Format::Json) {
+            // ADR-086 § WIRE-001: the pack catalog as a structured array an
+            // agent can act on — `[{"name":…,"namespaces":[…]}, …]`.
+            let catalog: Vec<serde_json::Value> = if self.paid {
+                ctxgrd::pack::paid_packs()
+                    .iter()
+                    .map(|p| serde_json::json!({ "name": p.name, "namespaces": p.namespaces }))
+                    .collect()
+            } else {
+                ctxgrd::pack::discover(root)
+                    .iter()
+                    .map(|p| {
+                        let namespaces: Vec<String> = ctxgrd::pack::namespace_views(p)
+                            .into_iter()
+                            .map(|v| v.name)
+                            .collect();
+                        serde_json::json!({ "name": p.name, "namespaces": namespaces })
+                    })
+                    .collect()
+            };
+            return Ok(Outcome::Did(serde_json::Value::Array(catalog)));
+        }
+        if self.paid {
+            print!(
+                "{}",
+                ctxgrd::pack::render_paid_list(&ctxgrd::pack::paid_packs())
+            );
+        } else {
+            let packs = ctxgrd::pack::discover(root);
+            print!("{}", ctxgrd::pack::render_list(&packs));
+        }
+        Ok(Outcome::Did(serde_json::Value::Null))
+    }
 }
 
-/// `ctxgrd pack show <name>` — read-only detail view of one pack
-/// (PACK-004). Touches no file.
-pub(super) fn pack_show_cmd(root: &Path, name: &str) -> Result<ExitCode> {
-    let Some(pack) = ctxgrd::pack::find(root, name) else {
-        return pack_not_found(root, name);
-    };
-    print!("{}", ctxgrd::pack::render_show(&pack));
-    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
+/// `ctxgrd pack show <name>` — read-only detail view of one pack (PACK-004).
+pub(super) struct PackShowCmd {
+    pub(super) name: String,
+    pub(super) format: Format,
 }
 
-/// `ctxgrd pack add <name>` — apply a pack, create-or-append, never
-/// clobber (PACK-005). `--dry-run` prints the config it would write and
-/// exits without touching any file.
-pub(super) fn pack_add_cmd(root: &Path, name: &str, dry_run: bool) -> Result<ExitCode> {
-    let Some(pack) = ctxgrd::pack::find(root, name) else {
-        return pack_not_found(root, name);
-    };
+impl Command for PackShowCmd {
+    type Json = serde_json::Value;
 
-    // ADR-068 § PKD-002: apply the dependency closure (deps first, `pack`
-    // last) so `pack add gdpr` also installs the `security` base.
-    let chain = match ctxgrd::pack::resolve_dependencies(root, &pack) {
-        Ok(c) => c,
-        Err(e) => return pack_dependency_error(root, &e),
-    };
+    fn emits_json(&self) -> bool {
+        matches!(self.format, Format::Json)
+    }
 
-    if dry_run {
-        // Thread the growing config so a later pack in the chain skips a
-        // namespace an earlier one already added.
-        let mut existing = fs::read_to_string(root.join("ctxgrd.toml")).unwrap_or_default();
-        let mut wrote_any = false;
+    fn render_json(out: &Self::Json) -> String {
+        serde_json::to_string_pretty(out).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn run(self, ctx: &Ctx) -> Result<Outcome<Self::Json>, KernelError> {
+        let root = &ctx.root;
+        let Some(pack) = ctxgrd::pack::find(root, &self.name) else {
+            return Err(pack_not_found(&self.name));
+        };
+        if matches!(self.format, Format::Json) {
+            // ADR-096 § CMD-002: the pack detail as a structured object. Per-
+            // namespace rules stay under `namespaces[]`; the top-level `rules`
+            // is the flat aggregate of every bound code across namespaces.
+            //
+            // ADR-113 § PKJ-001 adds `params` (every declared `[NS."rule"]`
+            // table), `depends`, and `scope`. `scope` is not decoration: this
+            // is the **pack definition**, not the project's materialised
+            // `ctxgrd.toml`. `pack add` copies blocks into the consumer's
+            // config, so the two diverge as a pack evolves — that gap is
+            // `pack outdated`'s to report (ADR-053 § PKM-004), and a consumer
+            // comparing against the wrong one gets a false green.
+            let views = ctxgrd::pack::namespace_views(&pack);
+            let mut aggregate: Vec<String> = Vec::new();
+            let namespaces: Vec<serde_json::Value> = views
+                .iter()
+                .map(|v| {
+                    for code in &v.rules {
+                        if !aggregate.contains(code) {
+                            aggregate.push(code.clone());
+                        }
+                    }
+                    serde_json::json!({
+                        "namespace": v.name,
+                        "rules": v.rules,
+                        "paths": v.path_patterns,
+                        "required_metadata": v.required_metadata,
+                        "params": v.params,
+                    })
+                })
+                .collect();
+            let external_rules: Vec<serde_json::Value> = pack
+                .rules
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "code": r.code(),
+                        "path": format!("rules/{}/{}/run", r.ns, r.name),
+                    })
+                })
+                .collect();
+            let doc = serde_json::json!({
+                "name": pack.name,
+                "path": pack.source_label,
+                "summary": pack.summary,
+                "depends": pack.depends(),
+                "scope": "pack-definition",
+                "namespaces": namespaces,
+                "external_rules": external_rules,
+                "rules": aggregate,
+            });
+            return Ok(Outcome::Did(doc));
+        }
+        print!("{}", ctxgrd::pack::render_show(&pack));
+        Ok(Outcome::Did(serde_json::Value::Null))
+    }
+}
+
+/// `ctxgrd pack add <name>` — apply a pack, create-or-append, never clobber
+/// (PACK-005). `--dry-run` prints the config it would write and touches no file.
+pub(super) struct PackAddCmd {
+    pub(super) name: String,
+    pub(super) dry_run: bool,
+    pub(super) format: Format,
+}
+
+/// ADR-096 § CMD-001 wire shape for `ctxgrd pack add <name> --format json`.
+#[derive(serde::Serialize)]
+pub(super) struct PackAddJson {
+    status: &'static str,
+    namespaces_added: Vec<String>,
+    path: String,
+}
+
+impl Command for PackAddCmd {
+    type Json = PackAddJson;
+
+    fn emits_json(&self) -> bool {
+        matches!(self.format, Format::Json)
+    }
+
+    fn run(self, ctx: &Ctx) -> Result<Outcome<Self::Json>, KernelError> {
+        let root = &ctx.root;
+        let Some(pack) = ctxgrd::pack::find(root, &self.name) else {
+            return Err(pack_not_found(&self.name));
+        };
+
+        // ADR-068 § PKD-002: apply the dependency closure (deps first, `pack`
+        // last) so `pack add gdpr` also installs the `security` base.
+        let chain = ctxgrd::pack::resolve_dependencies(root, &pack)
+            .map_err(|e| pack_dependency_error(&e))?;
+
+        let toml_rel = relative_display(&root.join("ctxgrd.toml"), root);
+
+        // ADR-096 § CMD-001: `--format json` emits `{status, namespaces_added,
+        // path}` — the dispatcher writes it; human progress stays on stderr.
+        if matches!(self.format, Format::Json) {
+            let mut added: Vec<String> = Vec::new();
+            if self.dry_run {
+                let mut existing = fs::read_to_string(root.join("ctxgrd.toml")).unwrap_or_default();
+                for p in &chain {
+                    let plan = ctxgrd::pack::plan_add(p, &existing, root);
+                    if !plan.blocks_text.is_empty() {
+                        existing.push_str(&plan.blocks_text);
+                    }
+                    added.extend(plan.added.iter().cloned());
+                }
+                let status = if added.is_empty() { "up-to-date" } else { "would-add" };
+                return Ok(Outcome::Did(PackAddJson {
+                    status,
+                    namespaces_added: added,
+                    path: toml_rel,
+                }));
+            }
+            for p in &chain {
+                let plan = ctxgrd::pack::apply_add(p, root).map_err(io_kernel)?;
+                added.extend(plan.added.iter().cloned());
+            }
+            let status = if added.is_empty() { "up-to-date" } else { "added" };
+            return Ok(Outcome::Did(PackAddJson {
+                status,
+                namespaces_added: added,
+                path: toml_rel,
+            }));
+        }
+
+        if self.dry_run {
+            // Thread the growing config so a later pack in the chain skips a
+            // namespace an earlier one already added.
+            let mut existing = fs::read_to_string(root.join("ctxgrd.toml")).unwrap_or_default();
+            let mut wrote_any = false;
+            let mut added: Vec<String> = Vec::new();
+            for p in &chain {
+                let plan = ctxgrd::pack::plan_add(p, &existing, root);
+                if !plan.blocks_text.is_empty() {
+                    print!("{}", plan.blocks_text);
+                    existing.push_str(&plan.blocks_text);
+                    wrote_any = true;
+                }
+                for ns in &plan.skipped {
+                    eprintln!("would skip [{ns}] — already defined in ctxgrd.toml");
+                }
+                for rule in &plan.rules_to_copy {
+                    eprintln!("would copy rules/{}/{}/run", rule.ns, rule.name);
+                }
+                added.extend(plan.added.iter().cloned());
+            }
+            if !wrote_any {
+                println!("# (nothing to add — every namespace is already present)");
+            }
+            let status = if added.is_empty() { "up-to-date" } else { "would-add" };
+            return Ok(Outcome::Did(PackAddJson {
+                status,
+                namespaces_added: added,
+                path: toml_rel,
+            }));
+        }
+
+        let mut added: Vec<String> = Vec::new();
         for p in &chain {
-            let plan = ctxgrd::pack::plan_add(p, &existing, root);
-            if !plan.blocks_text.is_empty() {
-                print!("{}", plan.blocks_text);
-                existing.push_str(&plan.blocks_text);
-                wrote_any = true;
-            }
-            for ns in &plan.skipped {
-                eprintln!("would skip [{ns}] — already defined in ctxgrd.toml");
-            }
-            for rule in &plan.rules_to_copy {
-                eprintln!("would copy rules/{}/{}/run", rule.ns, rule.name);
-            }
+            let plan = ctxgrd::pack::apply_add(p, root).map_err(io_kernel)?;
+            report_pack_add(p, &plan);
+            added.extend(plan.added.iter().cloned());
         }
-        if !wrote_any {
-            println!("# (nothing to add — every namespace is already present)");
-        }
-        return Ok(ExitCode::from(run::ExitStatus::Ok.code()));
+        let status = if added.is_empty() { "up-to-date" } else { "added" };
+        Ok(Outcome::Did(PackAddJson {
+            status,
+            namespaces_added: added,
+            path: toml_rel,
+        }))
     }
-
-    for p in &chain {
-        let plan = ctxgrd::pack::apply_add(p, root)?;
-        report_pack_add(p, &plan);
-    }
-    Ok(ExitCode::from(run::ExitStatus::Ok.code()))
 }
 
 /// Shared success report for `pack add` and `init --pack` (PKC-003).
-/// Uses `render_add_receipt` to split path-claimed vs id-claimed namespaces;
-/// reports any skipped or copied items separately.
 pub(crate) fn report_pack_add(pack: &ctxgrd::pack::Pack, plan: &ctxgrd::pack::AddPlan) {
     let receipt = ctxgrd::pack::render_add_receipt(pack, plan);
     if !receipt.is_empty() {
@@ -104,95 +277,126 @@ pub(crate) fn report_pack_add(pack: &ctxgrd::pack::Pack, plan: &ctxgrd::pack::Ad
     }
 }
 
-/// `ctxgrd pack outdated` — read-only drift report (ADR-053 § PKM-004).
-/// Exit 0 = no drift, 1 = drift present (clean rewrites and/or dirty
-/// diffs), 2 = config error.
-pub(super) fn pack_outdated_cmd(root: &Path, format: Format) -> Result<ExitCode> {
-    let toml_path = root.join("ctxgrd.toml");
-    let config_toml = match fs::read_to_string(&toml_path) {
-        Ok(c) => c,
-        Err(e) => return pack_config_read_error(root, &toml_path, &e),
-    };
-    let plan = ctxgrd::pack::plan_migrate(&config_toml, root);
-    let drift = !plan.rewrites.is_empty() || !plan.diffs.is_empty();
-
-    match format {
-        Format::Json => {
-            println!("{}", serde_json::to_string_pretty(&plan)?);
-        }
-        Format::Rich | Format::Simple => {
-            if !drift {
-                println!("ctxgrd.toml is up to date with the installed packs.");
-            } else {
-                print!("{}", ctxgrd::pack::render_migrate_report(&plan, true));
-            }
-        }
-    }
-
-    let exit = if drift {
-        run::ExitStatus::LintFailure
-    } else {
-        run::ExitStatus::Ok
-    };
-    Ok(ExitCode::from(exit.code()))
+/// `ctxgrd pack outdated` — read-only drift report (ADR-053 § PKM-004). Exit
+/// 0 = no drift, 1 = drift present, 2 = config error.
+pub(super) struct PackOutdatedCmd {
+    pub(super) format: Format,
 }
 
-/// `ctxgrd pack migrate` — rewrite fingerprint-clean blocks in place and
-/// emit a diff for hand-edited ones (ADR-053 § PKM-002). Exit 0 = nothing
-/// to do or only clean rewrites applied, 1 = dirty blocks need manual
-/// resolution, 2 = config error.
-pub(super) fn pack_migrate_cmd(root: &Path, dry_run: bool, format: Format) -> Result<ExitCode> {
-    let toml_path = root.join("ctxgrd.toml");
-    // Read first so a missing/unreadable config is a clean exit-2, not an
-    // io panic inside apply_migrate.
-    if let Err(e) = fs::read_to_string(&toml_path) {
-        return pack_config_read_error(root, &toml_path, &e);
-    }
-    let plan = ctxgrd::pack::apply_migrate(root, dry_run)?;
+impl Command for PackOutdatedCmd {
+    type Json = MigratePlan;
 
-    match format {
-        Format::Json => {
-            // Clean JSON stream on stdout; progress goes to stderr.
-            println!("{}", serde_json::to_string_pretty(&plan)?);
-            if !dry_run && !plan.rewrites.is_empty() {
-                eprintln!("migrated {} block(s) in ctxgrd.toml", plan.rewrites.len());
+    fn emits_json(&self) -> bool {
+        matches!(self.format, Format::Json)
+    }
+
+    fn render_json(out: &Self::Json) -> String {
+        serde_json::to_string_pretty(out).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn run(self, ctx: &Ctx) -> Result<Outcome<Self::Json>, KernelError> {
+        let root = &ctx.root;
+        let toml_path = root.join("ctxgrd.toml");
+        let config_toml =
+            fs::read_to_string(&toml_path).map_err(|e| pack_config_read_error(root, &toml_path, &e))?;
+        let plan = ctxgrd::pack::plan_migrate(&config_toml, root);
+        let drift = !plan.rewrites.is_empty() || !plan.diffs.is_empty();
+
+        match self.format {
+            // JSON: the dispatcher writes the plan (via `render_json`).
+            Format::Json => {}
+            Format::Rich | Format::Simple => {
+                if !drift {
+                    println!("ctxgrd.toml is up to date with the installed packs.");
+                } else {
+                    print!("{}", ctxgrd::pack::render_migrate_report(&plan, true));
+                }
             }
         }
-        Format::Rich | Format::Simple => {
-            print!("{}", ctxgrd::pack::render_migrate_report(&plan, dry_run));
+
+        if drift {
+            Ok(Outcome::Findings(plan))
+        } else {
+            Ok(Outcome::Did(plan))
         }
     }
+}
 
-    let exit = if plan.diffs.is_empty() {
-        run::ExitStatus::Ok
-    } else {
-        run::ExitStatus::LintFailure
-    };
-    Ok(ExitCode::from(exit.code()))
+/// `ctxgrd pack migrate` — rewrite fingerprint-clean blocks in place and emit a
+/// diff for hand-edited ones (ADR-053 § PKM-002). Exit 0 = nothing to do or
+/// only clean rewrites applied, 1 = dirty blocks need manual resolution, 2 =
+/// config error.
+pub(super) struct PackMigrateCmd {
+    pub(super) dry_run: bool,
+    pub(super) format: Format,
+}
+
+impl Command for PackMigrateCmd {
+    type Json = MigratePlan;
+
+    fn emits_json(&self) -> bool {
+        matches!(self.format, Format::Json)
+    }
+
+    fn render_json(out: &Self::Json) -> String {
+        serde_json::to_string_pretty(out).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn run(self, ctx: &Ctx) -> Result<Outcome<Self::Json>, KernelError> {
+        let root = &ctx.root;
+        let toml_path = root.join("ctxgrd.toml");
+        // Read first so a missing/unreadable config is a clean exit-2, not an
+        // io panic inside apply_migrate.
+        if let Err(e) = fs::read_to_string(&toml_path) {
+            return Err(pack_config_read_error(root, &toml_path, &e));
+        }
+        let plan = ctxgrd::pack::apply_migrate(root, self.dry_run).map_err(io_kernel)?;
+
+        match self.format {
+            Format::Json => {
+                // The dispatcher writes the plan; progress goes to stderr.
+                if !self.dry_run && !plan.rewrites.is_empty() {
+                    eprintln!("migrated {} block(s) in ctxgrd.toml", plan.rewrites.len());
+                }
+            }
+            Format::Rich | Format::Simple => {
+                print!("{}", ctxgrd::pack::render_migrate_report(&plan, self.dry_run));
+            }
+        }
+
+        if plan.diffs.is_empty() {
+            Ok(Outcome::Did(plan))
+        } else {
+            Ok(Outcome::Findings(plan))
+        }
+    }
+}
+
+/// An `io::Error` that escaped a pack apply/migrate — mirrors the pre-refactor
+/// anyhow bubble to `main`'s `internal` diagnostic (exit 2).
+fn io_kernel(e: io::Error) -> KernelError {
+    KernelError::report(Diagnostic::error("internal", "", 0, 0, format!("{e}")))
 }
 
 /// Emit a `pack.config-unreadable` kernel error (exit 2) for a config
 /// `pack migrate`/`pack outdated` cannot read.
-fn pack_config_read_error(root: &Path, path: &Path, e: &io::Error) -> Result<ExitCode> {
+fn pack_config_read_error(root: &Path, path: &Path, e: &io::Error) -> KernelError {
     let rel = relative_display(path, root);
-    let d = Diagnostic::error(
-        "pack.config-unreadable",
-        &rel,
-        0,
-        0,
-        format!("could not read {rel}: {e}"),
+    KernelError::report(
+        Diagnostic::error(
+            "pack.config-unreadable",
+            &rel,
+            0,
+            0,
+            format!("could not read {rel}: {e}"),
+        )
+        .with_help("run `ctxgrd init` to create a ctxgrd.toml, or check file permissions"),
     )
-    .with_help("run `ctxgrd init` to create a ctxgrd.toml, or check file permissions");
-    emit_error(&d, root);
-    Ok(ExitCode::from(run::ExitStatus::KernelError.code()))
 }
 
-/// Emit the `pack.dependency` error and return the kernel-error exit code
-/// (ADR-068 § PKD-003: an unresolvable dependency closure is a config error).
-fn pack_dependency_error(
-    root: &Path,
-    e: &ctxgrd::pack::DependencyError,
-) -> Result<ExitCode> {
+/// Emit the `pack.dependency` error (exit 2) for an unresolvable dependency
+/// closure (ADR-068 § PKD-003).
+fn pack_dependency_error(e: &ctxgrd::pack::DependencyError) -> KernelError {
     use ctxgrd::pack::DependencyError;
     let help = match e {
         DependencyError::Missing { .. } => {
@@ -203,15 +407,13 @@ fn pack_dependency_error(
         }
         DependencyError::Cycle { .. } => "break the cycle in the packs' `# depends:` lines",
     };
-    let d = Diagnostic::error("pack.dependency", "", 0, 0, e.to_string()).with_help(help);
-    emit_error(&d, root);
-    Ok(ExitCode::from(run::ExitStatus::KernelError.code()))
+    KernelError::report(Diagnostic::error("pack.dependency", "", 0, 0, e.to_string()).with_help(help))
 }
 
-/// Emit the `pack.unknown` error and return the kernel-error exit code.
-fn pack_not_found(root: &Path, name: &str) -> Result<ExitCode> {
-    let d = Diagnostic::error("pack.unknown", "", 0, 0, format!("unknown pack '{name}'"))
-        .with_help("run `ctxgrd pack list` to see available packs");
-    emit_error(&d, root);
-    Ok(ExitCode::from(run::ExitStatus::KernelError.code()))
+/// Emit the `pack.unknown` error (exit 2).
+fn pack_not_found(name: &str) -> KernelError {
+    KernelError::report(
+        Diagnostic::error("pack.unknown", "", 0, 0, format!("unknown pack '{name}'"))
+            .with_help("run `ctxgrd pack list` to see available packs"),
+    )
 }

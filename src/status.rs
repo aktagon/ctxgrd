@@ -1,375 +1,248 @@
-//! `ctxgrd status` — pipeline position resolution (SPEC-002).
+//! `ctxgrd status` — the per-document work queue (ADR-107, ADR-118).
 //!
-//! Sprint 1 scope: resolve the namespace DAG (declared-or-default,
-//! ADR-039 § DAG-007; EARS-01.1/01.3), name the DAG source in the JSON
-//! output (EARS-01.4), and fail loudly on namespace cycles
-//! (EARS-01.5). Gate evaluation (EARS-02.*), the BUG tripwire
-//! (EARS-03.*), full ladder/JSON rendering (EARS-04.*) and the
-//! `pipeline.conformance` rule (EARS-06.*) land with Sprints 2–4.
+//! ADR-118 removed the namespace stage layer. What a document can be
+//! worked on is now a property of the document: its own `status` and the
+//! statuses of the documents its `depends_on` closure names. There is no
+//! stage, no gate, no frontier, and no declared ladder — `core.dep-shape`
+//! carries namespace-level edge constraints, enforced per document at lint
+//! time (STG-006).
+//!
+//! The queue covers **every** linted document carrying an id (STG-001).
+//! The previous filter admitted only staged namespaces, which dropped 91 of
+//! 212 documents in this repo — including every `BUG` and every `HANDOFF`,
+//! the two namespaces that most directly answer "what can I work on"
+//! (`BUG-036` R1).
 
 use std::path::Path;
 
 use thiserror::Error;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::config::{Config, GatePredicate, GateQuantifier};
-use crate::dag::{self, NamespaceDag};
-use crate::diagnostic::Diagnostic;
+use crate::dag::{self};
 use crate::document::Document;
 use crate::id::DocumentId;
-use crate::run::{self, LintError, LintRun};
+use crate::run::{self, LintError};
 
-/// Where the resolved DAG came from (EARS-01.4). Named in the JSON
-/// output (`--format json`) — a built-in ladder is never passed off as
-/// derived to an agent routing on it; the human table omits it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DagSource {
-    Declared,
-    Default,
-}
-
-impl DagSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Declared => "declared",
-            Self::Default => "default",
-        }
-    }
-
-    /// Plain-language gloss of [`Self::as_str`], emitted as the JSON
-    /// `source_hint` so a person or an LLM reading `--format json` need not
-    /// decode the bare token. The const above stays the stable thing a strict
-    /// parser switches on; this is the human-readable companion.
-    pub fn hint(self) -> &'static str {
-        match self {
-            Self::Declared => "order you set in ctxgrd.toml",
-            Self::Default => "ctxgrd's default order (you haven't set one)",
-        }
-    }
-}
-
-/// The resolved namespace DAG plus its provenance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Resolution {
-    pub(crate) dag: NamespaceDag,
-    pub source: DagSource,
-}
-
-/// What can go wrong answering "where is the pipeline?".
+/// What can go wrong answering "what is workable?".
 #[derive(Debug, Error)]
 pub enum StatusError {
     /// Config / ingest failures — same channel as `lint`.
     #[error(transparent)]
     Lint(#[from] LintError),
-    /// EARS-01.5: the lifted namespace graph contains a cycle.
-    #[error("namespace dependency cycle between {}", .members.join(" ↔ "))]
-    Cycle { members: Vec<String> },
-    /// EARS-04.5: a `--lineage <ID>` selector that resolves to no document
-    /// in the run.
+    /// A `--lineage <ID>` selector that resolves to no document in the run
+    /// (EARS-04.5).
     #[error("lineage root '{id}' is not a document in this run")]
     LineageNotFound { id: String },
 }
 
-/// Built-in default ladder (EARS-01.3), applied in this order and
-/// restricted to namespaces active in the configuration.
-const DEFAULT_LADDER: [&str; 4] = ["PRD", "ADR", "SPEC", "TASK"];
+// `infer_dep_shape_requires` — the ADR-039 § DAG-007 init-time seam that
+// lifted `depends_on` edges into `core.dep-shape` `requires` suggestions —
+// was deleted along with the namespace DAG it was the only caller of. It
+// had no callers itself, so the whole chain (and `StatusError::Cycle`,
+// which only it could produce) was unreachable. Rebuild it against the
+// document graph if `ctxgrd init` ever wants to seed a declared shape.
 
-/// Resolve the namespace DAG for `root`: load config through the shared
-/// ingest pipeline (the same config `lint` sees), then apply the
-/// declared-or-default ladder (ADR-039 § DAG-007; SPEC-002 § Workflows
-/// step 1).
-pub fn resolve(root: &Path) -> Result<Resolution, StatusError> {
-    let run::IngestResult { config, .. } = run::ingest(root)?;
-    resolve_dag(&config)
-}
-
-/// ADR-039 § DAG-007 — the init-time inference seam. Lift the existing
-/// documents' `depends_on` edges into per-namespace `core.dep-shape`
-/// `requires` suggestions (edge `T → NS` ⇒ NS requires T), so `ctxgrd
-/// init` can seed a *declared* DAG that `status` then reports as
-/// `source: declared`. Returned map is keyed by namespace, values
-/// name-sorted; empty when nothing lifts. This is descriptive guidance
-/// for scaffolding only — runtime resolution never calls it (inference
-/// no longer runs live, DAG-007).
+/// The class a document draws in (ADR-108 § GRN-002), read off the same
+/// readiness projection the JSON publishes so the picture and the work
+/// queue cannot disagree.
 ///
-/// NOTE (DAG-007): `init_cmd` does not yet thread these suggestions into
-/// the generated `ctxgrd.toml` — see the TODO there. This function is the
-/// retained `infer_namespace_dag` caller-side entry point that wiring will
-/// build on.
-pub fn infer_dep_shape_requires(root: &Path) -> Result<BTreeMap<String, Vec<String>>, StatusError> {
-    let run::IngestResult { documents, .. } = run::ingest(root)?;
-    let dag = dag::infer_namespace_dag(&documents).map_err(|cycle| StatusError::Cycle {
-        members: cycle.members,
-    })?;
-    // A lifted edge `(from, to)` means `to`'s documents depend on `from`,
-    // so `to` requires `from`.
-    let mut requires: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (from, to) in dag.edges {
-        requires.entry(to).or_default().insert(from);
-    }
-    Ok(requires
-        .into_iter()
-        .map(|(ns, set)| (ns, set.into_iter().collect()))
-        .collect())
-}
-
-fn resolve_dag(config: &Config) -> Result<Resolution, StatusError> {
-    // DAG-001/DAG-002/DAG-005: the declared DAG is the union of every
-    // namespace's `core.dep-shape` `requires`/`allows` lifts and any
-    // `[pipeline].stages` adjacency, assembled through the same
-    // construction/validation as inference. A declared `[pipeline]`
-    // contributes its stages as nodes even when single-stage (no edges),
-    // so an isolated one-stage pipeline still resolves declared
-    // (EARS-01.1, DAG-005).
-    let stage_nodes: BTreeSet<String> = config
-        .pipeline
-        .as_ref()
-        .map(|p| p.stages.iter().cloned().collect())
-        .unwrap_or_default();
-    let declared =
-        dag::build_dag_from_edges(config.dep_shape_edges(), stage_nodes).map_err(|cycle| {
-            StatusError::Cycle {
-                members: cycle.members,
-            }
-        })?;
-    if !declared.order.is_empty() {
-        return Ok(Resolution {
-            dag: declared,
-            source: DagSource::Declared,
-        });
-    }
-
-    // ADR-039 § DAG-007: runtime resolution is declared-or-default. The
-    // descriptive `inferred` mode is gone — inference now belongs to
-    // `ctxgrd init` (see DAG-007 wiring TODO in `init_cmd`), so nothing
-    // guesses at runtime and the declaration is the only voice.
-
-    // EARS-01.3: cold start — the built-in ladder restricted to
-    // active namespaces, honestly labeled `default` (EARS-01.4).
-    let stages: Vec<String> = DEFAULT_LADDER
-        .iter()
-        .filter(|ns| config.namespaces.contains_key(**ns))
-        .map(|ns| ns.to_string())
-        .collect();
-    Ok(Resolution {
-        dag: dag::chain_dag(&stages),
-        source: DagSource::Default,
-    })
-}
-
-/// The gate predicate in force for `namespace` (EARS-02.4): the
-/// explicit `[pipeline.gate]` entry if present, else the default —
-/// `all:done` for TASK (the only built-in namespace whose terminal
-/// status is `done`), `any:accepted` for everything else. `gates` is
-/// empty whenever no `[pipeline]` is declared, so default DAGs get
-/// all-default gates.
-fn effective_gate(namespace: &str, gates: &BTreeMap<String, GatePredicate>) -> GatePredicate {
-    if let Some(explicit) = gates.get(namespace) {
-        return explicit.clone();
-    }
-    if namespace == "TASK" {
-        GatePredicate {
-            quantifier: GateQuantifier::All,
-            status: "done".to_string(),
-        }
-    } else {
-        GatePredicate {
-            quantifier: GateQuantifier::Any,
-            status: "accepted".to_string(),
-        }
-    }
-}
-
-/// One document's contribution to its namespace's gate (T2.2). Built
-/// from the same documents and rule diagnostics `lint` produces, so
-/// gate evaluation reuses the check pass rather than re-running it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DocView {
-    /// Author's exact id string, for naming a held document.
-    id: String,
-    /// Frontmatter `status`, if present.
-    status: Option<String>,
-    /// True when no rule diagnostic is anchored at this document.
-    clean: bool,
-}
-
-/// Outcome of evaluating one stage's gate over its documents.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GateOutcome {
-    /// EARS-02.1: predicate satisfied AND every counted document clean.
-    done: bool,
-    /// EARS-02.2: documents carrying the gate's terminal status that
-    /// nonetheless produced diagnostics. Name-sorted.
-    held: Vec<String>,
-}
-
-/// Evaluate a gate predicate over a namespace's documents
-/// (EARS-02.1/02.2/02.5).
-///
-/// `any:S` is satisfied by at least one document with status `S`, and
-/// done when every such document is lint-clean; a dirty `S` document
-/// holds the stage. `all:S` requires a non-empty namespace
-/// (EARS-02.5) in which every document has status `S` and is clean.
-/// Documents not carrying the gate's status are never "held" — they
-/// are simply not finished yet.
-fn evaluate_gate(predicate: &GatePredicate, docs: &[DocView]) -> GateOutcome {
-    let matches_status = |d: &DocView| d.status.as_deref() == Some(predicate.status.as_str());
-    let mut held: Vec<String> = docs
-        .iter()
-        .filter(|d| matches_status(d) && !d.clean)
-        .map(|d| d.id.clone())
-        .collect();
-    held.sort();
-
-    let done = match predicate.quantifier {
-        GateQuantifier::Any => {
-            // EARS-03.1 (SPEC-003): `any:` over an empty (or all-non-matching)
-            // namespace is unsatisfied — `any` stays false, so a pruned/empty
-            // lineage stage holds rather than passing vacuously, matching the
-            // `all:`-over-empty rule (EARS-02.5).
-            let matching = docs.iter().filter(|d| matches_status(d));
-            let mut any = false;
-            let mut all_clean = true;
-            for d in matching {
-                any = true;
-                all_clean &= d.clean;
-            }
-            any && all_clean
-        }
-        GateQuantifier::All => {
-            // EARS-02.5: an `all:` gate over an empty namespace is
-            // unsatisfied, never vacuously done.
-            !docs.is_empty() && docs.iter().all(|d| matches_status(d) && d.clean)
-        }
-    };
-
-    GateOutcome { done, held }
-}
-
-/// A resolved pipeline stage with its computed verdict (SPEC-002 §
-/// Stage states). `Blocked` is the BUG tripwire (EARS-03.1): an open
-/// BUG citing a document in the stage's namespace overrides the gate
-/// verdict, so a `Done` or `Current` stage can flip to `Blocked`.
+/// ADR-118 removed the `pending` and `blocked`-by-tripwire stage states
+/// along with the stage layer; a document is settled, workable, or waiting
+/// on a dependency, and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageState {
+pub enum DocState {
+    /// Terminal `status` — finished, nothing to do.
     Done,
+    /// Not terminal, and every dependency is. Workable now.
     Current,
-    Pending,
+    /// Not terminal, and at least one dependency is not either.
     Blocked,
 }
 
-impl StageState {
+impl DocState {
+    /// The stable token used as the Mermaid `classDef` name and in the
+    /// text report. `Current` renders as `current` (the ADR-038 palette
+    /// name) rather than `ready`, so the surviving diagram output is
+    /// unchanged by ADR-118.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Done => "done",
             Self::Current => "current",
-            Self::Pending => "pending",
             Self::Blocked => "blocked",
         }
     }
 }
 
-/// One stage in the resolved ladder: its namespace, computed state, the
-/// documents it counts, and a representative verdict (SPEC-002 § Data
-/// model — the JSON stage shape).
+/// One document's readiness (ADR-107 § RDY-001): the work-queue row a
+/// consumer filters on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stage {
+pub struct DocReadiness {
+    /// The document's id as written (`ADR-107`). JSON `id`.
+    pub id: String,
+    /// The namespace that claims it. JSON `namespace`.
     pub namespace: String,
-    pub state: StageState,
-    /// Document ids in this namespace, name-sorted. JSON `docs`.
-    pub docs: Vec<String>,
-    /// Representative status token (JSON `verdict`): `empty`, the gate's
-    /// terminal status when satisfied, `held`, or the status of the next
-    /// document to advance. A fixed vocabulary — never body text.
-    pub verdict: String,
-    /// This stage's own gate result (ADR-037 § WIRE-002): predicate
-    /// satisfied AND every counted document clean, independent of
-    /// parent-stage state (EARS-02.6) and the BUG tripwire. JSON
-    /// `gate_met` — the field to read beside `verdict`, which can render
-    /// a non-terminal status when the gate is met but a parent is not.
-    pub gate_met: bool,
-    /// Documents carrying the gate's terminal status that nonetheless
-    /// produced diagnostics (EARS-02.2). Drives the "held by" text and
-    /// the JSON `hold` array.
-    pub held: Vec<String>,
-    /// The document `next_action` targets for this stage, if any.
-    /// Internal — feeds the fixed next-action template, not serialized.
-    actionable: Option<String>,
+    /// The `status` frontmatter value verbatim, or `None` when absent —
+    /// which serializes as JSON `null` and counts as non-terminal.
+    pub status: Option<String>,
+    /// True iff `status` is NOT terminal AND every resolved `depends_on`
+    /// target's status IS terminal. A settled document is `false` with an
+    /// empty `blocked_by`: not workable because it is done.
+    ///
+    /// That combination is deliberate and is not a defect — `BUG-036` R1
+    /// was filed against it in error and corrected. `status` is in the row
+    /// so a consumer can tell "done" from "stuck" without a second query.
+    pub ready: bool,
+    /// The id-sorted resolved dependency targets whose status is not
+    /// terminal. Resolved against the full graph, so a blocker outside a
+    /// `--lineage` scope is still named (RDY-003).
+    pub blocked_by: Vec<String>,
+    /// Every resolved `depends_on` target, id-sorted — the superset of
+    /// `blocked_by`. The edge set the diagrams draw (ADR-108 § GRN-002);
+    /// not serialized. Unresolved entries are absent, as in `blocked_by`.
+    pub deps: Vec<String>,
 }
 
-/// The full `ctxgrd status` answer: the resolved DAG, its source, the
-/// per-stage verdicts, and the BUG tripwire (EARS-03.*).
+impl DocReadiness {
+    /// This row's diagram/report class.
+    ///
+    /// Keyed on the **settled** set, not the arming one: a `rejected` or
+    /// `deferred` document is [`DocState::Done`] for the census even though
+    /// nothing may rest on it (ADR-121 § SPL-001). `ready` is computed against
+    /// the same predicate, so the three states stay a partition.
+    pub fn state(&self) -> DocState {
+        if is_settled_status(self.status.as_deref()) {
+            DocState::Done
+        } else if self.ready {
+            DocState::Current
+        } else {
+            DocState::Blocked
+        }
+    }
+}
+
+/// The full `ctxgrd status` answer (ADR-118): the per-document work queue,
+/// plus the lineage scope when one is selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
-    pub source: DagSource,
-    pub(crate) dag: NamespaceDag,
-    pub stages: Vec<Stage>,
-    /// The pipeline's ready set (ADR-039 § DAG-006): the name-sorted
-    /// antichain of stages that are NOT done but whose every parent IS
-    /// done. Roots (no parents) appear iff not done; independent
-    /// components (multiple roots) all appear side by side. Empty when
-    /// the pipeline is complete.
-    pub frontier: Vec<String>,
-    /// `open` BUG documents citing a document in the active lineage
-    /// (EARS-03.1). Name-sorted; empty when the tripwire is clear.
-    pub blockers: Vec<String>,
-    /// Per-blocker attribution (ADR-037 § WIRE-004): each id in
-    /// `blockers` mapped to the name-sorted namespaces it blocks. Empty
-    /// keys match `blockers`; JSON `blocker_stages`.
-    pub blocker_stages: BTreeMap<String, Vec<String>>,
-    /// The single next action, from a fixed template keyed by (state,
-    /// verdict) — never document body text (EARS-04.3/04.4).
-    pub next_action: String,
     /// The lineage root id when scoped via `--lineage <ID>` (EARS-04.1), or
-    /// `None` for the global view. Serialized as the JSON `lineage` field
-    /// only in lineage mode — absent globally, so bare `status` output stays
-    /// byte-identical (EARS-04.7).
+    /// `None` for the global view. Serialized only in lineage mode.
     pub lineage: Option<String>,
-    /// Per-stage shared-node disclosure (EARS-04.4, ADR-059 § LIN-005):
-    /// namespace → the other lineage-root ids whose closures also contain a
-    /// document counted in that stage. Empty in the global view and for any
-    /// stage with no shared members; rendered as the JSON per-stage `shared`
-    /// array. Name-sorted, deduped.
-    pub shared: BTreeMap<String, Vec<String>>,
+    /// Shared-node disclosure (ADR-059 § LIN-005): the other lineage-root
+    /// ids whose closures also contain a document counted here. Name-sorted
+    /// and deduped; empty in the global view.
+    ///
+    /// ADR-118 re-keyed this from per-stage to a flat list — the per-stage
+    /// array went with the stages. The disclosure itself survives: LIN-005
+    /// requires shared members be named rather than silently folded.
+    pub shared: Vec<String>,
+    /// One row per counted document, id-sorted (ADR-107 § RDY-001).
+    pub documents: Vec<DocReadiness>,
 }
 
-/// The global `ctxgrd status` report (SPEC-002): the whole document set,
-/// no lineage scope. Thin wrapper over [`report_scoped`] with no selector.
+impl Report {
+    /// Documents workable right now.
+    ///
+    /// Keyed on [`DocReadiness::state`], not on the raw `ready` field. The
+    /// two agree for every row [`project`] builds, but the field is public
+    /// and a directly-constructed `DocReadiness` can set `ready: true`
+    /// beside a terminal `status` — which would put one row in both this
+    /// bucket and `settled`, breaking the partition that
+    /// `tests/reporting_properties.rs` asserts. Deriving all three buckets
+    /// from the same 3-way-exclusive function makes the partition hold by
+    /// construction rather than by the constructor's discipline.
+    pub fn ready(&self) -> impl Iterator<Item = &DocReadiness> {
+        self.documents
+            .iter()
+            .filter(|d| d.state() == DocState::Current)
+    }
+
+    /// Documents held by at least one non-terminal dependency **and not
+    /// themselves finished**.
+    ///
+    /// The second clause is the `HANDOFF-036` § 1 fix. This filtered on
+    /// `!blocked_by.is_empty()` alone, ignoring state, so an `accepted`
+    /// document pointing at a `draft` one was counted here *and* in
+    /// `settled` — three buckets over two documents, with a finished ADR
+    /// printed under `blocked:` as though someone were waiting on it.
+    ///
+    /// The edge is not discarded: [`settled_on_open_work`] names it, and
+    /// the JSON wire shape carries `status` and `blocked_by` per row, so a
+    /// consumer can still derive it. Whether such an edge is a *defect* is
+    /// `core.dep-status`'s question, and that rule is opt-in (ADR-106
+    /// § DPS-004) — the census must not answer it by arithmetic.
+    pub fn blocked(&self) -> impl Iterator<Item = &DocReadiness> {
+        self.documents
+            .iter()
+            .filter(|d| d.state() == DocState::Blocked)
+    }
+
+    /// Terminal documents that still point at open work, each paired with
+    /// the non-terminal targets holding the edge — the disclosure behind
+    /// the narrowed [`blocked`](Self::blocked).
+    ///
+    /// Named rather than counted, following `ADR-059` § LIN-005's `shared:`
+    /// disclosure: a report that drops a row from a bucket owes the reader
+    /// the row, not a tally.
+    pub fn settled_on_open_work(&self) -> impl Iterator<Item = &DocReadiness> {
+        self.documents
+            .iter()
+            .filter(|d| d.state() == DocState::Done && !d.blocked_by.is_empty())
+    }
+
+    /// STG-004: the `--exit-code` done-signal. True when no document in
+    /// scope is [`DocState::Blocked`].
+    ///
+    /// Note this asks whether anything is *stuck*, not whether everything
+    /// is *finished* — a repo with open work that nothing blocks is a
+    /// healthy repo, and `ADR-056`'s signal is meant to certify a feature
+    /// is unobstructed. Under the stage layer this could not pass at all
+    /// (`BUG-036` R2).
+    ///
+    /// It follows [`blocked`](Self::blocked) rather than testing
+    /// `blocked_by` directly, so a corpus whose only "block" is a finished
+    /// document pointing at open work now returns 0. That document is done;
+    /// nothing is waiting on it, and there is no action the signal could be
+    /// asking for. Gating that edge is `core.dep-status`'s job — a rule a
+    /// project opts into — not the done-signal's.
+    pub fn unblocked(&self) -> bool {
+        self.documents
+            .iter()
+            .all(|d| d.state() != DocState::Blocked)
+    }
+}
+
+/// The global `ctxgrd status` report: every document, no lineage scope.
 pub fn report(root: &Path) -> Result<Report, StatusError> {
     report_scoped(root, None)
 }
 
-/// Resolve the DAG, run the shared lint pass, optionally scope the document
-/// set to a lineage, compute per-stage verdicts, then sweep the BUG
-/// tripwire (SPEC-002 § Workflows steps 1–4; SPEC-003 § Workflows step 3).
+/// Ingest, optionally scope the document set to a lineage, and project
+/// per-document readiness (ADR-107 § RDY-001; ADR-118 § STG-001).
 ///
-/// WHERE `lineage` is `Some(id)`, the evaluated document set is restricted
-/// to the transitive **dependents** of `id` over the transpose of the
-/// `depends_on` graph (EARS-04.1) — the engine is unchanged, only the
-/// counted documents differ (EARS-04.2). Shared members (reachable from
-/// another lineage root) are disclosed, not folded (EARS-04.3/04.4). An
-/// `id` that resolves to no document is [`StatusError::LineageNotFound`]
-/// (EARS-04.5).
+/// WHERE `lineage` is `Some(id)`, the counted set is restricted to the
+/// transitive **dependents** of `id` over the transpose of the `depends_on`
+/// graph (EARS-04.1). Shared members (reachable from another lineage root)
+/// are disclosed, not folded (EARS-04.3/04.4). An `id` that resolves to no
+/// document is [`StatusError::LineageNotFound`] (EARS-04.5).
+///
+/// This runs [`run::ingest`], not the full lint pass. ADR-118 removed the
+/// only consumer of rule diagnostics here — the stage gate's
+/// satisfied-**and-clean** test — so `status` no longer executes 116 rules
+/// over the corpus to answer a question about frontmatter.
 pub fn report_scoped(root: &Path, lineage: Option<&str>) -> Result<Report, StatusError> {
-    let LintRun {
-        outcome,
-        config,
-        documents,
-    } = run::lint_run(root)?;
-    let resolution = resolve_dag(&config)?;
+    let run::IngestResult { documents, .. } = run::ingest(root)?;
+    // The one `depends_on` graph this run needs: it scopes the lineage
+    // (EARS-04.1) and projects readiness (ADR-107 § RDY-001). Built once.
+    let graph = dag::DepGraph::new(&documents);
 
-    // Step 3 — scope the document set (EARS-04.*). `members` is the lineage
-    // id-set the gate/tripwire count over; `None` is the global view, which
-    // counts every document and discloses nothing (EARS-04.7 byte-identity).
     let mut lineage_id: Option<String> = None;
     let mut members: Option<BTreeSet<DocumentId>> = None;
-    let mut shared: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut shared: Vec<String> = Vec::new();
     if let Some(raw) = lineage {
         let id: DocumentId = raw
             .parse()
             .map_err(|_| StatusError::LineageNotFound { id: raw.to_string() })?;
-        let graph = dag::DepGraph::new(&documents);
         let Some(root_idx) = graph.index_of(&id) else {
             return Err(StatusError::LineageNotFound { id: raw.to_string() });
         };
@@ -385,714 +258,380 @@ pub fn report_scoped(root: &Path, lineage: Option<&str>) -> Result<Report, Statu
         // Disclose shared members (EARS-04.4): a member reachable from a
         // lineage root other than the queried one is counted here AND named.
         for &m in &member_idxs {
-            let others: Vec<String> = graph
-                .owning_roots(m)
-                .into_iter()
-                .filter(|&r| r != root_idx)
-                .map(|r| documents[r].raw_id.clone())
-                .collect();
-            if others.is_empty() {
-                continue;
-            }
-            shared
-                .entry(documents[m].id.namespace.clone())
-                .or_default()
-                .extend(others);
+            shared.extend(
+                graph
+                    .owning_roots(m)
+                    .into_iter()
+                    .filter(|&r| r != root_idx)
+                    .map(|r| documents[r].raw_id.clone()),
+            );
         }
-        for ids in shared.values_mut() {
-            ids.sort();
-            ids.dedup();
-        }
+        shared.sort();
+        shared.dedup();
     }
 
-    let mut stages = compute_stages(
-        &resolution.dag,
-        &config,
-        &documents,
-        &outcome.diagnostics,
-        members.as_ref(),
-    );
-
-    // Step 4/5 — tripwire sweep (EARS-03.1), restricted to the scoped
-    // lineage (SPEC-003 § Workflows 5): an `open` BUG citing a counted
-    // document blocks the stage(s) it cites, overriding the gate verdict.
-    // Cleared automatically once no citing BUG is `open` (EARS-03.2).
-    let tripwire = sweep_tripwire(&resolution.dag, &documents, members.as_ref());
-    for stage in &mut stages {
-        if tripwire.blocked_namespaces.contains(&stage.namespace) {
-            stage.state = StageState::Blocked;
-        }
-    }
-
-    // Position: the frontier — the name-sorted ready set (ADR-039 §
-    // DAG-006). A stage is ready iff it is not done AND every parent is
-    // done; roots appear iff not done.
-    let frontier = compute_frontier(&resolution.dag, &stages);
-
-    let next_action = next_action(&stages, frontier.first().map(String::as_str), &tripwire.blockers, &config);
+    let documents = compute_documents(&documents, &graph, members.as_ref());
 
     Ok(Report {
-        source: resolution.source,
-        dag: resolution.dag,
-        stages,
-        frontier,
-        blockers: tripwire.blockers,
-        blocker_stages: tripwire.blocker_stages,
-        next_action,
         lineage: lineage_id,
         shared,
+        documents,
     })
 }
 
-/// The frontier (ADR-039 § DAG-006): the name-sorted set of stages that
-/// are NOT done and whose every parent IS done. `dag.order` is name-sorted
-/// within topological tiers, but the frontier is sorted by name directly
-/// so the output is a stable antichain regardless of `order` tie-breaks.
-fn compute_frontier(dag: &NamespaceDag, stages: &[Stage]) -> Vec<String> {
-    let done: BTreeSet<&str> = stages
-        .iter()
-        .filter(|s| s.state == StageState::Done)
-        .map(|s| s.namespace.as_str())
-        .collect();
-    let mut frontier: Vec<String> = stages
-        .iter()
-        .filter(|s| s.state != StageState::Done)
-        .filter(|s| {
-            dag.edges
-                .iter()
-                .filter(|(_, to)| to == &s.namespace)
-                .all(|(from, _)| done.contains(from.as_str()))
-        })
-        .map(|s| s.namespace.clone())
-        .collect();
-    frontier.sort();
-    frontier
-}
-
-/// The single next action, from a FIXED template keyed by (state,
-/// verdict) — never document body text (EARS-04.3/04.4). A live blocker
-/// dominates; otherwise the verb comes from the current stage's gate
-/// terminal status and the object is the stage's actionable document.
-fn next_action(
-    stages: &[Stage],
-    current: Option<&str>,
-    blockers: &[String],
-    config: &Config,
-) -> String {
-    if let Some(bug) = blockers.first() {
-        return format!("resolve {bug}");
-    }
-    let Some(current_ns) = current else {
-        return "pipeline complete".to_string();
-    };
-    let Some(stage) = stages.iter().find(|s| s.namespace == current_ns) else {
-        return "pipeline complete".to_string();
-    };
-    let empty = BTreeMap::new();
-    let gates = config.pipeline.as_ref().map(|p| &p.gates).unwrap_or(&empty);
-    let gate = effective_gate(current_ns, gates);
-    match stage.verdict.as_str() {
-        "empty" => format!("create the first {current_ns} document"),
-        "held" => match &stage.actionable {
-            Some(id) => format!("fix {id}"),
-            None => format!("fix the held {current_ns} document"),
-        },
-        _ => {
-            let verb = advance_verb(&gate.status);
-            match &stage.actionable {
-                Some(id) => format!("{verb} {id}"),
-                None => format!("{verb} the {current_ns} document"),
-            }
-        }
-    }
-}
-
-/// The verb that moves a document to a gate's terminal status. TASK's
-/// terminal status is `done` ("complete"); everything else advances by
-/// acceptance.
-fn advance_verb(terminal_status: &str) -> &'static str {
-    match terminal_status {
-        "done" => "complete",
-        _ => "accept",
-    }
-}
-
-/// Outcome of the BUG tripwire sweep (EARS-03.1/03.2).
-struct Tripwire {
-    /// `open` BUG ids citing the active lineage. Name-sorted, deduped.
-    blockers: Vec<String>,
-    /// Namespaces (within the DAG) that have a document cited by an
-    /// `open` BUG — each such stage is overridden to `Blocked`.
-    blocked_namespaces: BTreeSet<String>,
-    /// Per-blocker attribution (ADR-037 § WIRE-004): each blocking BUG id
-    /// mapped to the name-sorted lineage namespaces it cites. The union
-    /// of the values equals `blocked_namespaces`; the map keeps which BUG
-    /// holds which stage, which the flat sets discard.
-    blocker_stages: BTreeMap<String, Vec<String>>,
-}
-
-/// Reverse-edge query (SPEC-002 § Workflows step 4): find every `open`
-/// BUG document citing a document in the active lineage — the set of
-/// documents whose namespace appears in the resolved DAG. A BUG cites a
-/// document through its `depends_on` edges or a non-suppressed body
-/// cross-ref token (the same two pointer kinds [`run::find_references`]
-/// counts), reusing the already-ingested document set rather than
-/// re-walking the tree.
-fn sweep_tripwire(
-    dag: &NamespaceDag,
-    documents: &[Document],
-    members: Option<&BTreeSet<DocumentId>>,
-) -> Tripwire {
-    let lineage_ns: BTreeSet<&str> = dag.order.iter().map(String::as_str).collect();
-    // The cited-document set is every staged-namespace document, narrowed to
-    // the scoped lineage members when one is selected (SPEC-003 § Workflows
-    // 5). BUGs are still scanned across the whole corpus below — a BUG
-    // outside the lineage that cites a member still blocks its stage.
-    let lineage: BTreeSet<DocumentId> = documents
-        .iter()
-        .filter(|d| lineage_ns.contains(d.id.namespace.as_str()))
-        .filter(|d| members.is_none_or(|m| m.contains(&d.id)))
-        .map(|d| d.id.clone())
-        .collect();
-
-    let mut blockers: Vec<String> = Vec::new();
-    let mut blocked_namespaces: BTreeSet<String> = BTreeSet::new();
-    let mut blocker_stages: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for bug in documents.iter().filter(|d| d.id.namespace == "BUG") {
-        let open = bug
-            .metadata
-            .get("status")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == "open");
-        if !open {
-            continue;
-        }
-        let cited = cited_lineage_namespaces(bug, &lineage);
-        if cited.is_empty() {
-            continue;
-        }
-        blockers.push(bug.raw_id.clone());
-        // Record this BUG's own cited namespaces before draining `cited`
-        // into the flat set (BTreeSet → already name-sorted).
-        blocker_stages.insert(bug.raw_id.clone(), cited.iter().cloned().collect());
-        blocked_namespaces.extend(cited);
-    }
-    blockers.sort();
-    blockers.dedup();
-    Tripwire {
-        blockers,
-        blocked_namespaces,
-        blocker_stages,
-    }
-}
-
-/// The lineage namespaces `bug` cites, via `depends_on` entries or
-/// non-suppressed body cross-ref tokens. Empty when the BUG cites
-/// nothing in the active lineage.
-fn cited_lineage_namespaces(bug: &Document, lineage: &BTreeSet<DocumentId>) -> BTreeSet<String> {
-    let mut cited: BTreeSet<String> = BTreeSet::new();
-    for entry in &bug.depends_on {
-        if let Ok(id) = entry.parse::<DocumentId>() {
-            if lineage.contains(&id) {
-                cited.insert(id.namespace);
-            }
-        }
-    }
-    if let Some(ast) = bug.ast.as_ref() {
-        for tok in &ast.cross_ref_tokens {
-            if tok.in_code || tok.in_strikethrough {
-                continue;
-            }
-            let id = DocumentId::new(tok.namespace.as_str(), tok.number);
-            if lineage.contains(&id) {
-                cited.insert(id.namespace);
-            }
-        }
-    }
-    cited
-}
-
-/// Assign each stage a verdict (SPEC-002 § Stage states). A stage is
-/// `done` when its own gate is satisfied-and-clean AND every parent is
-/// done (EARS-02.6 — a join gate waits on all parents); the first
-/// not-done stage in DAG order is `current`, the rest `pending`.
+/// A `status` value is **arming** when it is in the shared vocabulary
+/// [`crate::agent_guide::DEFAULT_TERMINAL_STATUSES`], compared
+/// case-insensitively — the same test `core.dep-status` applies (ADR-106 §
+/// DPS-003). An absent status is non-arming: a document that never
+/// declares itself finished has not finished (ADR-107 § RDY-002).
 ///
-/// `dag.order` is already topologically sorted (name-order tie-break,
-/// EARS-01.6), so every parent's `done` verdict is settled before the
-/// stage that depends on it is processed.
-fn compute_stages(
-    dag: &NamespaceDag,
-    config: &Config,
-    documents: &[Document],
-    diagnostics: &[Diagnostic],
-    members: Option<&BTreeSet<DocumentId>>,
-) -> Vec<Stage> {
-    let gates = config
-        .pipeline
-        .as_ref()
-        .map(|p| p.gates.clone())
-        .unwrap_or_default();
-    let dirty: BTreeSet<&str> = diagnostics.iter().map(|d| d.location.as_str()).collect();
-
-    let position: BTreeMap<&str, usize> = dag
-        .order
-        .iter()
-        .enumerate()
-        .map(|(i, ns)| (ns.as_str(), i))
-        .collect();
-
-    /// Per-stage data accumulated in DAG order before the single
-    /// current stage is known.
-    struct Acc {
-        held: Vec<String>,
-        docs: Vec<String>,
-        verdict: String,
-        gate_met: bool,
-        actionable: Option<String>,
-    }
-
-    let mut done = vec![false; dag.order.len()];
-    let mut acc: Vec<Acc> = Vec::with_capacity(dag.order.len());
-    for (i, namespace) in dag.order.iter().enumerate() {
-        let mut views: Vec<DocView> = documents
-            .iter()
-            .filter(|d| d.id.namespace == *namespace)
-            // EARS-04.2: in lineage mode, count only the scoped members; the
-            // engine is unchanged, the document set is filtered.
-            .filter(|d| members.is_none_or(|m| m.contains(&d.id)))
-            .map(|d| DocView {
-                id: d.raw_id.clone(),
-                status: d
-                    .metadata
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                clean: !dirty.contains(d.location.as_str()),
-            })
-            .collect();
-        views.sort_by(|a, b| a.id.cmp(&b.id));
-        let gate = effective_gate(namespace, &gates);
-        let outcome = evaluate_gate(&gate, &views);
-        // EARS-02.6: a stage cannot be done while any parent is not.
-        let parents_done = dag
-            .edges
-            .iter()
-            .filter(|(_, to)| to == namespace)
-            .all(|(from, _)| done[position[from.as_str()]]);
-        let stage_done = outcome.done && parents_done;
-        done[i] = stage_done;
-
-        let docs: Vec<String> = views.iter().map(|v| v.id.clone()).collect();
-        let (verdict, actionable) = summarize_stage(&gate, &views, stage_done, &outcome);
-        acc.push(Acc {
-            held: outcome.held,
-            docs,
-            verdict,
-            // The stage's own gate, before parent-gating (EARS-02.6) and
-            // the tripwire override (ADR-037 § WIRE-002).
-            gate_met: outcome.done,
-            actionable,
-        });
-    }
-
-    let current_idx = done.iter().position(|d| !d);
-    acc.into_iter()
-        .enumerate()
-        .map(|(i, a)| {
-            let state = if done[i] {
-                StageState::Done
-            } else if Some(i) == current_idx {
-                StageState::Current
-            } else {
-                StageState::Pending
-            };
-            Stage {
-                namespace: dag.order[i].clone(),
-                state,
-                docs: a.docs,
-                verdict: a.verdict,
-                gate_met: a.gate_met,
-                held: a.held,
-                actionable: a.actionable,
-            }
-        })
-        .collect()
-}
-
-/// The stage's representative verdict token and the document
-/// `next_action` should target. Verdict tokens are a fixed vocabulary
-/// (`empty`, `held`, a terminal status, or the next document's status)
-/// — never document body text (EARS-04.4). `views` must be name-sorted
-/// so `first`/`find` pick deterministically.
-fn summarize_stage(
-    gate: &GatePredicate,
-    views: &[DocView],
-    stage_done: bool,
-    outcome: &GateOutcome,
-) -> (String, Option<String>) {
-    if views.is_empty() {
-        return ("empty".to_string(), None);
-    }
-    if stage_done {
-        // Gate satisfied and clean — the terminal status was reached.
-        return (gate.status.clone(), None);
-    }
-    // A terminal-but-dirty document holds the stage (EARS-02.2).
-    if let Some(first_held) = outcome.held.first() {
-        return ("held".to_string(), Some(first_held.clone()));
-    }
-    // Otherwise the first name-sorted document short of the terminal
-    // status is the one to advance; its status is the verdict.
-    if let Some(next) = views
-        .iter()
-        .find(|d| d.status.as_deref() != Some(gate.status.as_str()))
-    {
-        let verdict = next
-            .status
-            .clone()
-            .unwrap_or_else(|| "no-status".to_string());
-        return (verdict, Some(next.id.clone()));
-    }
-    // Locally satisfied but not done — waiting on a parent (EARS-02.6).
-    (gate.status.clone(), None)
-}
-
-/// Render the resolved DAG: the source token first (EARS-01.4), then
-/// the shape — one arrow line for chains, one edge per line for
-/// branching shapes.
-fn render_dag(source: DagSource, dag: &NamespaceDag) -> String {
-    let mut out = format!("source: {}\n", source.as_str());
-    if dag.order.is_empty() {
-        out.push_str("(no stages)\n");
-        return out;
-    }
-    if is_chain(dag) {
-        out.push_str(&dag.order.join(" → "));
-        out.push('\n');
-    } else {
-        for (from, to) in &dag.edges {
-            out.push_str(from);
-            out.push_str(" → ");
-            out.push_str(to);
-            out.push('\n');
+/// Answers *may a document rest on this one?*, so it is the right test for
+/// `blocked_by` and the wrong one for the census. Use [`is_settled_status`]
+/// there (ADR-121 § SPL-001).
+fn is_arming_status(status: Option<&str>) -> bool {
+    match status {
+        Some(s) => {
+            crate::agent_guide::DEFAULT_TERMINAL_STATUSES.contains(&s.to_lowercase().as_str())
         }
+        None => false,
     }
-    out
 }
 
-/// Sprint-1 DAG-only text output. Retained as a building block; the
-/// CLI now renders the full [`Report`] via [`render_report`].
-pub fn render_text(resolution: &Resolution) -> String {
-    render_dag(resolution.source, &resolution.dag)
+/// A `status` value is **settled** when the document has no work left —
+/// every arming status, plus `rejected` and `deferred`, which are finished
+/// without settling anything ([`crate::agent_guide::is_settled_status`]).
+/// An absent status is unsettled, for `is_arming_status`'s reason.
+///
+/// This is the census predicate: `ready`, [`DocState`], and every count
+/// derived from them. Reading the arming set here reported 34 finished
+/// documents as workable and diluted the queue by 46% (`BUG-037`).
+fn is_settled_status(status: Option<&str>) -> bool {
+    match status {
+        Some(s) => crate::agent_guide::is_settled_status(s),
+        None => false,
+    }
 }
 
-/// Full `ctxgrd status` text output (EARS-04.1): a KISS table — one
-/// aligned row per stage carrying its state, document count, upstream
-/// `needs`, and any hold/block — then a `ready:` line (the frontier) and
-/// the next action. The DAG shape lives in the per-row `needs` column,
-/// not a separate graph header: one column renders chains, diamonds, and
-/// disconnected roots identically (a root simply has no `needs`). No
-/// document body content reaches the output (EARS-04.4) — the next action
-/// is a fixed token, ids are author-chosen frontmatter, never prose.
-pub fn render_report(report: &Report) -> String {
-    // The human table does not print the DAG source — `declared` vs `default`
-    // is provenance for routing, not something a person reading the terminal
-    // needs decoded (EARS-01.4 now lives on the `--format json` contract,
-    // where agents consume it). `report.source` is still rendered by
-    // `render_json`.
-    let mut out = String::new();
-    if !report.stages.is_empty() {
-        // Column widths from the data so namespaces, states, and counts
-        // line up regardless of length (48 docs vs 0).
-        let ns_w = report.stages.iter().map(|s| s.namespace.len()).max().unwrap_or(0);
-        let state_w = report
-            .stages
-            .iter()
-            .map(|s| s.state.as_str().len())
-            .max()
-            .unwrap_or(0);
-        let count_w = report
-            .stages
-            .iter()
-            .map(|s| s.docs.len().to_string().len())
-            .max()
-            .unwrap_or(1);
+/// The document's `status` frontmatter value, or `None` when absent.
+fn doc_status(doc: &Document) -> Option<&str> {
+    doc.metadata.get("status").and_then(|v| v.as_str())
+}
 
-        for stage in &report.stages {
-            // Upstream namespaces (the `needs` column): every edge whose
-            // head is this stage. Name-sorted; empty for a root.
-            let mut needs: Vec<&str> = report
-                .dag
-                .edges
-                .iter()
-                .filter(|(_, to)| to == &stage.namespace)
-                .map(|(from, _)| from.as_str())
-                .collect();
-            needs.sort_unstable();
-            needs.dedup();
-
-            // The `open` BUGs blocking this stage (ADR-037 § WIRE-004:
-            // blocker_stages maps BUG → blocked namespaces; invert here).
-            let mut blocked_by: Vec<&str> = report
-                .blocker_stages
-                .iter()
-                .filter(|(_, nss)| nss.iter().any(|n| n == &stage.namespace))
-                .map(|(bug, _)| bug.as_str())
-                .collect();
-            blocked_by.sort_unstable();
-
-            let n = stage.docs.len();
-            let unit = if n == 1 { "doc" } else { "docs" };
-            out.push_str(&format!(
-                "{:<ns_w$}  {:<state_w$}  {:>count_w$} {}",
-                stage.namespace,
-                stage.state.as_str(),
-                n,
-                unit,
-            ));
-            if !needs.is_empty() {
-                out.push_str("   needs ");
-                out.push_str(&needs.join(", "));
-            }
-            // A dirty terminal document holds the stage (EARS-02.2); an
-            // open BUG blocks it (EARS-03.1). Distinct verbs, distinct
-            // pointer kinds — docs vs BUG ids.
-            if !stage.held.is_empty() {
-                out.push_str("   held by ");
-                out.push_str(&stage.held.join(", "));
-            }
-            if !blocked_by.is_empty() {
-                out.push_str("   blocked by ");
-                out.push_str(&blocked_by.join(", "));
-            }
-            // EARS-04.4: disclose shared members in text — a stage counting a
-            // document another lineage also drives carries the other roots.
-            // Empty (and silent) in the global view, so EARS-04.7 holds.
-            if let Some(roots) = report.shared.get(&stage.namespace) {
-                if !roots.is_empty() {
-                    out.push_str("   shared with ");
-                    out.push_str(&roots.join(", "));
+/// Project per-document readiness (ADR-107 § RDY-001/002/003) off the
+/// `DepGraph` already built for this run — no second graph, no re-parse.
+///
+/// ADR-118 § STG-001: **every** document carrying an id gets a row. The
+/// removed `counted` parameter filtered to namespaces the resolved DAG
+/// staged, which silently omitted every unstaged namespace. `members`
+/// still scopes to a lineage (RDY-003), while `blocked_by` is resolved
+/// against the full graph so an out-of-lineage blocker is named.
+/// Unresolved `depends_on` entries are ignored — that defect is
+/// `core.dep-resolved`'s to report (ADR-106 § DPS-002).
+fn compute_documents(
+    documents: &[Document],
+    graph: &dag::DepGraph<'_>,
+    members: Option<&BTreeSet<DocumentId>>,
+) -> Vec<DocReadiness> {
+    let mut rows: Vec<DocReadiness> = documents
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| members.is_none_or(|m| m.contains(&d.id)))
+        .map(|(i, d)| {
+            // One walk of this document's resolved dependencies feeds both
+            // the readiness predicate (RDY-002) and the document edge set
+            // (ADR-108 § GRN-002) — no second graph pass.
+            let mut deps: Vec<String> = Vec::new();
+            let mut blocked_by: Vec<String> = Vec::new();
+            // A dependency holds this document unless it *arms* it. The
+            // wider settled set is deliberately not used here: resting on a
+            // `rejected` decision must stay visible (ADR-121 § SPL-002).
+            for t in graph.dependencies(i) {
+                deps.push(documents[t].raw_id.clone());
+                if !is_arming_status(doc_status(&documents[t])) {
+                    blocked_by.push(documents[t].raw_id.clone());
                 }
             }
-            out.push('\n');
+            deps.sort();
+            deps.dedup();
+            blocked_by.sort();
+            blocked_by.dedup();
+            let status = doc_status(d);
+            DocReadiness {
+                ready: !is_settled_status(status) && blocked_by.is_empty(),
+                id: d.raw_id.clone(),
+                namespace: d.id.namespace.clone(),
+                status: status.map(str::to_string),
+                blocked_by,
+                deps,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Full `ctxgrd status` text output: a one-line census, then the workable
+/// documents, then the blocked ones with what holds each.
+///
+/// The census leads because the queue is now the whole corpus — 212 rows
+/// is a wall of text, and the two lists a person acts on are short. Nothing
+/// is truncated: every ready and every blocked document is printed, so the
+/// output never implies coverage it does not have.
+pub fn render_report(report: &Report) -> String {
+    let mut out = String::new();
+
+    if let Some(root) = &report.lineage {
+        out.push_str(&format!("lineage: {root}\n"));
+        if !report.shared.is_empty() {
+            out.push_str(&format!("shared with: {}\n", report.shared.join(", ")));
         }
         out.push('\n');
     }
-    // The ready set (the JSON `frontier`): stages workable right now —
-    // labeled `ready:` in the human view, `frontier` on the wire.
-    if !report.frontier.is_empty() {
-        out.push_str("ready: ");
-        out.push_str(&report.frontier.join(", "));
-        out.push('\n');
+
+    let ready: Vec<&DocReadiness> = report.ready().collect();
+    let blocked: Vec<&DocReadiness> = report.blocked().collect();
+    let settled = report
+        .documents
+        .iter()
+        .filter(|d| d.state() == DocState::Done)
+        .count();
+    out.push_str(&format!(
+        "{} documents · {} ready · {} blocked · {} settled\n",
+        report.documents.len(),
+        ready.len(),
+        blocked.len(),
+        settled,
+    ));
+
+    if !ready.is_empty() {
+        let w = ready.iter().map(|d| d.id.len()).max().unwrap_or(0);
+        out.push_str("\nready:\n");
+        for d in &ready {
+            out.push_str(&format!(
+                "  {:<w$}  {}\n",
+                d.id,
+                d.status.as_deref().unwrap_or("none"),
+                w = w
+            ));
+        }
     }
-    out.push_str("next: ");
-    out.push_str(&report.next_action);
-    out.push('\n');
-    // Point tools and agents at the structured projection — this table is
-    // the human view; `--format json` is the machine contract.
-    out.push('\n');
-    out.push_str("tip: --format json for agents, mermaid/dot for diagrams\n");
+
+    if !blocked.is_empty() {
+        let w = blocked.iter().map(|d| d.id.len()).max().unwrap_or(0);
+        out.push_str("\nblocked:\n");
+        for d in &blocked {
+            out.push_str(&format!(
+                "  {:<w$}  {}  ← {}\n",
+                d.id,
+                d.status.as_deref().unwrap_or("none"),
+                d.blocked_by.join(", "),
+                w = w
+            ));
+        }
+    }
+
+    // The disclosure behind the narrowed `blocked:` bucket. These rows are
+    // finished, so they are not work — but they were visible before, and
+    // dropping them silently would trade one false report for another.
+    // Named, not counted (`ADR-059` § LIN-005).
+    let settled_open: Vec<&DocReadiness> = report.settled_on_open_work().collect();
+    if !settled_open.is_empty() {
+        out.push_str("\nsettled on open work:\n");
+        for d in &settled_open {
+            out.push_str(&format!("  {} ← {}\n", d.id, d.blocked_by.join(", ")));
+        }
+        out.push_str("  (enable core.dep-status to gate this)\n");
+    }
+
+    // Gated on the two work buckets only: a settled-on-open-work edge is
+    // a disclosure, not an open item, so it must not make the queue claim
+    // to hold something.
+    if ready.is_empty() && blocked.is_empty() {
+        out.push_str("\nnothing open.\n");
+    }
+
+    out.push_str("\ntip: --format json for agents, mermaid/dot for diagrams\n");
     out
 }
 
-/// `ctxgrd status --format json` (EARS-04.2): a single JSON object
-/// conforming to SPEC-002 § Data model — `source`, `edges`, `stages`
-/// (`namespace`/`state`/`docs`/`verdict`/`gate_met`/`hold`), `frontier`,
-/// `blockers`, `blocker_stages`, `next_action`. The wire shape is a
-/// dedicated struct so the JSON contract is pinned independently of the
-/// in-memory [`Report`]: the internal `dag` field is projected to
-/// `edges`, `held` to `hold`, and `actionable` stays out entirely
-/// (ADR-037 § WIRE-005).
+/// `ctxgrd status --format json` (ADR-107 § RDY-001; ADR-118 § STG-003).
+///
+/// The payload is the work queue and nothing else. `stages`, `edges`,
+/// `frontier`, `blockers`, `blocker_stages` and `next_action` were removed
+/// with the stage layer, and `source`/`source_hint` went with them — both
+/// described the provenance of a namespace DAG that is no longer resolved
+/// or emitted, so keeping them would have named a structure the output no
+/// longer contains.
+///
+/// The wire shape is a dedicated struct so the JSON contract is pinned
+/// independently of the in-memory [`Report`] (ADR-037 § WIRE-005): `deps`
+/// stays internal, and `status` serializes as `null` when absent rather
+/// than being omitted.
 pub fn render_json(report: &Report) -> String {
+    /// One work-queue row (ADR-107 § RDY-001).
     #[derive(serde::Serialize)]
-    struct WireEdge<'a> {
-        from: &'a str,
-        to: &'a str,
-    }
-    #[derive(serde::Serialize)]
-    struct WireStage<'a> {
+    struct WireDocument<'a> {
+        id: &'a str,
         namespace: &'a str,
-        state: &'a str,
-        docs: &'a [String],
-        verdict: &'a str,
-        gate_met: bool,
-        hold: &'a [String],
-        /// Other lineage roots a stage's documents also belong to
-        /// (EARS-04.4). Omitted when empty — so the global view stays
-        /// byte-identical to pre-SPEC-003 (EARS-04.7).
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        shared: Vec<&'a str>,
+        status: Option<&'a str>,
+        ready: bool,
+        blocked_by: &'a [String],
     }
     #[derive(serde::Serialize)]
     struct Wire<'a> {
-        source: &'a str,
-        source_hint: &'a str,
         /// The lineage root id in `--lineage` mode (EARS-04.1). Omitted in
-        /// the global view (EARS-04.7 byte-identity).
+        /// the global view.
         #[serde(skip_serializing_if = "Option::is_none")]
         lineage: Option<&'a str>,
-        edges: Vec<WireEdge<'a>>,
-        stages: Vec<WireStage<'a>>,
-        frontier: &'a [String],
-        blockers: &'a [String],
-        blocker_stages: &'a BTreeMap<String, Vec<String>>,
-        next_action: &'a str,
+        /// ADR-059 § LIN-005 disclosure. Omitted when empty, so the global
+        /// view carries no lineage machinery at all.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        shared: Vec<&'a str>,
+        documents: Vec<WireDocument<'a>>,
     }
     let wire = Wire {
-        source: report.source.as_str(),
-        source_hint: report.source.hint(),
         lineage: report.lineage.as_deref(),
-        edges: report
-            .dag
-            .edges
+        shared: report.shared.iter().map(String::as_str).collect(),
+        documents: report
+            .documents
             .iter()
-            .map(|(from, to)| WireEdge { from, to })
-            .collect(),
-        stages: report
-            .stages
-            .iter()
-            .map(|s| WireStage {
-                namespace: &s.namespace,
-                state: s.state.as_str(),
-                docs: &s.docs,
-                verdict: &s.verdict,
-                gate_met: s.gate_met,
-                hold: &s.held,
-                shared: report
-                    .shared
-                    .get(&s.namespace)
-                    .map(|ids| ids.iter().map(String::as_str).collect())
-                    .unwrap_or_default(),
+            .map(|d| WireDocument {
+                id: &d.id,
+                namespace: &d.namespace,
+                status: d.status.as_deref(),
+                ready: d.ready,
+                blocked_by: &d.blocked_by,
             })
             .collect(),
-        frontier: &report.frontier,
-        blockers: &report.blockers,
-        blocker_stages: &report.blocker_stages,
-        next_action: &report.next_action,
     };
     serde_json::to_string_pretty(&wire).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// `ctxgrd status --format mermaid`: the resolved DAG as Mermaid
-/// `flowchart LR` *source* (output only — never rendered). Stage nodes
-/// are styled by state via `classDef`, dependency edges are solid, and
-/// each open BUG is a node with dashed `blocks` edges to the stage(s) it
-/// holds (`blocker_stages`). Labels are fixed tokens + author ids
-/// (EARS-04.4) — no document body text. Node ids are sanitized to
-/// `[A-Za-z0-9_]` so a hyphenated id like `BUG-008` stays valid Mermaid.
-pub fn render_mermaid(report: &Report) -> String {
-    let mut out = String::from("flowchart LR\n");
-    out.push_str(&format!(
-        "  %% ctxgrd status · source: {} · next: {}\n",
-        report.source.as_str(),
-        report.next_action,
-    ));
-    for stage in &report.stages {
-        let n = stage.docs.len();
-        let unit = if n == 1 { "doc" } else { "docs" };
-        let state = stage.state.as_str();
-        out.push_str(&format!(
-            "  {id}[\"{ns}: {state} ({n} {unit})\"]:::{state}\n",
-            id = mermaid_id(&stage.namespace),
-            ns = stage.namespace,
-        ));
-    }
-    for (from, to) in &report.dag.edges {
-        out.push_str(&format!("  {} --> {}\n", mermaid_id(from), mermaid_id(to)));
-    }
-    for (bug, blocked) in &report.blocker_stages {
-        let bid = mermaid_id(bug);
-        out.push_str(&format!("  {bid}[\"{bug} (open)\"]:::bug\n"));
-        for ns in blocked {
-            out.push_str(&format!("  {bid} -. blocks .-> {}\n", mermaid_id(ns)));
-        }
-    }
+/// The shared Mermaid palette (ADR-038). ADR-118 dropped the `pending` and
+/// `bug` classes with the stage layer: `pending` was a stage state, and the
+/// `bug` class styled the namespace-only tripwire overlay (GRN-004). A
+/// `classDef` for a state that can no longer occur is a claim the output
+/// cannot honour.
+fn push_class_defs(out: &mut String) {
     out.push_str("  classDef done fill:#cde6c5,stroke:#33aa77;\n");
     out.push_str("  classDef current fill:#cfe3ff,stroke:#3377aa;\n");
-    out.push_str("  classDef pending fill:#eeeeee,stroke:#999999;\n");
     out.push_str("  classDef blocked fill:#f6cccc,stroke:#cc3333;\n");
-    out.push_str("  classDef bug fill:#ffe0a3,stroke:#ee9900;\n");
+}
+
+/// The document label shown in both diagram formats: the id as written
+/// plus its `status`, or `none` when the document declares none.
+fn doc_label_status(doc: &DocReadiness) -> &str {
+    doc.status.as_deref().unwrap_or("none")
+}
+
+/// The one-line census both diagram formats carry as a caption.
+fn census(report: &Report) -> String {
+    format!(
+        "{} documents · {} ready · {} blocked",
+        report.documents.len(),
+        report.ready().count(),
+        report.blocked().count(),
+    )
+}
+
+/// The `depends_on` edges to draw: one per resolved relation whose *both*
+/// ends are counted documents, rendered dependency → dependent. Sorted by
+/// (dependency, dependent) for deterministic output.
+fn doc_edges(report: &Report) -> Vec<(&str, &str)> {
+    let nodes: BTreeSet<&str> = report.documents.iter().map(|d| d.id.as_str()).collect();
+    let mut edges: Vec<(&str, &str)> = report
+        .documents
+        .iter()
+        .flat_map(|doc| {
+            doc.deps
+                .iter()
+                .filter(|dep| nodes.contains(dep.as_str()))
+                .map(move |dep| (dep.as_str(), doc.id.as_str()))
+        })
+        .collect();
+    edges.sort_unstable();
+    edges
+}
+
+/// `ctxgrd status --format mermaid` (ADR-108 § GRN-002, ADR-118 § STG-005):
+/// the **document** `depends_on` graph as Mermaid `flowchart LR` source —
+/// one node per counted document, labelled with its id and `status` and
+/// classed by ADR-107 readiness, and one solid edge per resolved relation
+/// between counted documents.
+///
+/// This is the only granularity. The namespace view drew the stage DAG and
+/// was removed with it.
+pub fn render_mermaid(report: &Report) -> String {
+    let mut out = String::from("flowchart LR\n");
+    out.push_str(&format!("  %% ctxgrd status · {}\n", census(report)));
+    for doc in &report.documents {
+        out.push_str(&format!(
+            "  {node}[\"{id}: {status}\"]:::{state}\n",
+            node = mermaid_id(&doc.id),
+            id = doc.id,
+            status = doc_label_status(doc),
+            state = doc.state().as_str(),
+        ));
+    }
+    for (from, to) in doc_edges(report) {
+        out.push_str(&format!("  {} --> {}\n", mermaid_id(from), mermaid_id(to)));
+    }
+    push_class_defs(&mut out);
     out
 }
 
-/// Sanitize an id to a Mermaid-safe node id (`[A-Za-z0-9_]`). Namespaces
-/// are already alphanumeric; hyphenated document ids (`BUG-008`) become
-/// `BUG_008`. The original id is preserved in the node label.
+/// Sanitize an id to a Mermaid-safe node id (`[A-Za-z0-9_]`). Hyphenated
+/// document ids (`BUG-008`) become `BUG_008`; the original id is preserved
+/// in the node label.
 fn mermaid_id(raw: &str) -> String {
     raw.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
 }
 
-/// `ctxgrd status --format dot`: the resolved DAG as Graphviz DOT
-/// *source* (output only — never rendered, never shelling out to `dot`).
-/// Same model as [`render_mermaid`]: state-filled stage nodes, solid
-/// dependency edges, and dashed `blocks` edges from each open BUG. All
-/// node ids are quoted strings, so hyphenated ids need no sanitizing.
+/// `ctxgrd status --format dot` (ADR-108 § GRN-002, ADR-118 § STG-005): the
+/// same document graph [`render_mermaid`] draws, as Graphviz DOT *source*
+/// (output only — never rendered, never shelling out to `dot`). Fill
+/// colours come from [`dot_fill`], so the two formats stay comparable.
 pub fn render_dot(report: &Report) -> String {
-    let mut out = String::from("digraph pipeline {\n");
+    let mut out = String::from("digraph documents {\n");
     out.push_str("  rankdir=LR;\n");
     out.push_str("  labelloc=t;\n");
     out.push_str(&format!(
-        "  label=\"ctxgrd status — source: {} — next: {}\";\n",
-        report.source.as_str(),
-        report.next_action,
+        "  label=\"ctxgrd status — {}\";\n",
+        census(report)
     ));
     out.push_str("  node [shape=box, style=\"rounded,filled\"];\n");
-    for stage in &report.stages {
-        let n = stage.docs.len();
-        let unit = if n == 1 { "doc" } else { "docs" };
+    for doc in &report.documents {
         out.push_str(&format!(
-            "  \"{ns}\" [label=\"{ns}\\n{state} ({n} {unit})\", fillcolor=\"{color}\"];\n",
-            ns = stage.namespace,
-            state = stage.state.as_str(),
-            color = dot_fill(stage.state),
+            "  \"{id}\" [label=\"{id}\\n{status}\", fillcolor=\"{color}\"];\n",
+            id = doc.id,
+            status = doc_label_status(doc),
+            color = dot_fill(doc.state()),
         ));
     }
-    for (from, to) in &report.dag.edges {
+    for (from, to) in doc_edges(report) {
         out.push_str(&format!("  \"{from}\" -> \"{to}\";\n"));
-    }
-    for (bug, blocked) in &report.blocker_stages {
-        out.push_str(&format!(
-            "  \"{bug}\" [label=\"{bug}\\n(open)\", shape=note, fillcolor=\"#ffe0a3\"];\n"
-        ));
-        for ns in blocked {
-            out.push_str(&format!(
-                "  \"{bug}\" -> \"{ns}\" [style=dashed, label=\"blocks\"];\n"
-            ));
-        }
     }
     out.push_str("}\n");
     out
 }
 
-/// Graphviz fill colour for a stage state — mirrors the Mermaid
+/// Graphviz fill colour for a document state — mirrors the Mermaid
 /// `classDef` palette so both formats read the same.
-fn dot_fill(state: StageState) -> &'static str {
+fn dot_fill(state: DocState) -> &'static str {
     match state {
-        StageState::Done => "#cde6c5",
-        StageState::Current => "#cfe3ff",
-        StageState::Pending => "#eeeeee",
-        StageState::Blocked => "#f6cccc",
+        DocState::Done => "#cde6c5",
+        DocState::Current => "#cfe3ff",
+        DocState::Blocked => "#f6cccc",
     }
-}
-
-/// A DAG is a chain when consecutive `order` pairs account for every
-/// edge.
-fn is_chain(dag: &NamespaceDag) -> bool {
-    dag.edges.len() + 1 == dag.order.len()
-        && dag
-            .order
-            .windows(2)
-            .all(|pair| dag.edges.iter().any(|(f, t)| f == &pair[0] && t == &pair[1]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::Ast;
-    use crate::config::{GatePredicate, GateQuantifier, NamespaceConfig, PipelineConfig};
-    use std::collections::BTreeMap;
+    use serde_json::json;
 
     fn doc(raw_id: &str, depends_on: Vec<&str>) -> Document {
         Document {
@@ -1108,891 +647,444 @@ mod tests {
         }
     }
 
-    fn config_with_namespaces(names: &[&str]) -> Config {
-        let mut config = Config::default();
-        for name in names {
-            config
-                .namespaces
-                .insert(name.to_string(), NamespaceConfig::default());
-        }
-        config
-    }
-
-    #[test]
-    fn declared_pipeline_wins_over_edges() {
-        // EARS-01.1: declared order is used verbatim even when dep
-        // edges imply the opposite order.
-        let mut config = config_with_namespaces(&["ADR", "SPEC"]);
-        config.pipeline = Some(PipelineConfig {
-            stages: vec!["SPEC".to_string(), "ADR".to_string()],
-            gates: BTreeMap::new(),
-        });
-        let resolution = resolve_dag(&config).unwrap();
-        assert_eq!(resolution.source, DagSource::Declared);
-        assert_eq!(resolution.dag.order, vec!["SPEC", "ADR"]);
-    }
-
-    /// Add a `core.dep-shape` param table (and the rule) to a namespace.
-    fn with_dep_shape(config: &mut Config, ns: &str, requires: &[&str], allows: &[&str]) {
-        let entry = config.namespaces.entry(ns.to_string()).or_default();
-        entry.rules.push("core.dep-shape".to_string());
-        let mut params = serde_json::Map::new();
-        if !requires.is_empty() {
-            params.insert("requires".to_string(), serde_json::json!(requires));
-        }
-        if !allows.is_empty() {
-            params.insert("allows".to_string(), serde_json::json!(allows));
-        }
-        entry
-            .params
-            .insert("core.dep-shape".to_string(), serde_json::Value::Object(params));
-    }
-
-    #[test]
-    fn dep_shape_requires_assembles_declared_dag() {
-        // ADR-039 § DAG-002: `[SPEC."core.dep-shape"] requires = ["PRD"]`
-        // declares doc-edge SPEC → PRD, lifting to ordering edge
-        // PRD → SPEC (PRD first). The assembled DAG is `source: declared`.
-        let mut config = config_with_namespaces(&["PRD", "ADR", "SPEC", "TASK"]);
-        with_dep_shape(&mut config, "SPEC", &["PRD"], &[]);
-        let resolution = resolve_dag(&config).unwrap();
-        assert_eq!(resolution.source, DagSource::Declared);
-        assert!(
-            resolution.dag.edges.contains(&("PRD".to_string(), "SPEC".to_string())),
-            "requires=[PRD] on SPEC must produce ordering edge PRD → SPEC; got {:?}",
-            resolution.dag.edges
-        );
-    }
-
-    #[test]
-    fn declared_diamond_resolves_without_linearity_error() {
-        // ADR-039 § DAG-001: a declared diamond (PRD → ADR, PRD → SPEC,
-        // ADR → SPEC) must resolve — no linearity assumption. Expressed
-        // via dep-shape: ADR requires PRD; SPEC requires PRD and ADR.
-        let mut config = config_with_namespaces(&["PRD", "ADR", "SPEC"]);
-        with_dep_shape(&mut config, "ADR", &["PRD"], &[]);
-        with_dep_shape(&mut config, "SPEC", &["PRD", "ADR"], &[]);
-        let resolution = resolve_dag(&config).unwrap();
-        assert_eq!(resolution.source, DagSource::Declared);
-        // PRD → SPEC is implied by PRD → ADR → SPEC and reduced away.
-        assert_eq!(
-            resolution.dag.edges,
-            vec![
-                ("ADR".to_string(), "SPEC".to_string()),
-                ("PRD".to_string(), "ADR".to_string()),
-            ]
-        );
-        assert_eq!(resolution.dag.order, vec!["PRD", "ADR", "SPEC"]);
-    }
-
-    #[test]
-    fn no_declaration_falls_back_to_default() {
-        // ADR-039 § DAG-007: runtime resolution is declared-or-default.
-        // A config with active namespaces but no `core.dep-shape` and no
-        // `[pipeline]` resolves to the default ladder — never `inferred`,
-        // regardless of any document edges (which runtime no longer reads).
-        let config = config_with_namespaces(&["ADR", "SPEC"]);
-        let resolution = resolve_dag(&config).unwrap();
-        assert_eq!(resolution.source, DagSource::Default);
-        assert_eq!(resolution.dag.order, vec!["ADR", "SPEC"]);
-    }
-
-    #[test]
-    fn default_ladder_when_no_edges_restricted_to_active() {
-        // EARS-01.3: TASK is not active → ladder is PRD → ADR → SPEC.
-        let config = config_with_namespaces(&["ADR", "PRD", "SPEC"]);
-        let resolution = resolve_dag(&config).unwrap();
-        assert_eq!(resolution.source, DagSource::Default);
-        assert_eq!(resolution.dag.order, vec!["PRD", "ADR", "SPEC"]);
-    }
-
-    #[test]
-    fn namespace_cycle_surfaces_as_status_error() {
-        // ADR-039 § DAG-002/DAG-007: a cycle declared through dep-shape
-        // (ADR requires SPEC and SPEC requires ADR) surfaces as a status
-        // error at resolution time.
-        let mut config = config_with_namespaces(&["ADR", "SPEC"]);
-        with_dep_shape(&mut config, "ADR", &["SPEC"], &[]);
-        with_dep_shape(&mut config, "SPEC", &["ADR"], &[]);
-        let err = resolve_dag(&config).unwrap_err();
-        match err {
-            StatusError::Cycle { members } => assert_eq!(members, vec!["ADR", "SPEC"]),
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    // -- DAG-007: infer_dep_shape_requires lift-direction seam ----------
-
-    /// Write `contents` to `path`, creating parent dirs. Mirrors the
-    /// integration harness so the fixture style matches `tests/status.rs`.
-    fn write_fixture(path: &std::path::Path, contents: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
-    }
-
-    #[test]
-    fn infer_dep_shape_requires_lifts_dependency_into_requires_with_correct_direction() {
-        // ADR-039 § DAG-007: the init-scaffolding seam. A SPEC document
-        // depending on a PRD document must lift to `SPEC requires PRD`
-        // (the downstream namespace requires the upstream one), and a TASK
-        // depending on the SPEC must lift to `TASK requires SPEC`. This
-        // pins the lift DIRECTION: the depended-ON namespace lands in the
-        // depending namespace's `requires` list, never the reverse.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write_fixture(
-            &tmp.path().join("ctxgrd.toml"),
-            "[PRD]\nrules = []\n\n[SPEC]\nrules = []\n\n[TASK]\nrules = []\n",
-        );
-        write_fixture(
-            &tmp.path().join("docs/prds/001-billing-reconciliation.md"),
-            "---\nid: PRD-001\ntitle: Billing reconciliation\nstatus: accepted\n---\n\n# PRD-001\n",
-        );
-        write_fixture(
-            &tmp.path().join("docs/specs/001-reconciliation-engine.md"),
-            "---\nid: SPEC-001\ntitle: Reconciliation engine\nstatus: draft\ndepends_on: [PRD-001]\n---\n\n# SPEC-001\n",
-        );
-        write_fixture(
-            &tmp.path().join("docs/tasks/001-wire-the-engine.md"),
-            "---\nid: TASK-001\ntitle: Wire the engine\nstatus: doing\ndepends_on: [SPEC-001]\n---\n\n# TASK-001\n",
-        );
-
-        let requires = infer_dep_shape_requires(tmp.path()).expect("inference succeeds");
-
-        // SPEC depends on PRD ⇒ SPEC requires PRD (direction guard).
-        // TASK depends on SPEC ⇒ TASK requires SPEC.
-        // PRD depends on nothing ⇒ it has no requires entry at all.
-        let expected: BTreeMap<String, Vec<String>> = BTreeMap::from([
-            ("SPEC".to_string(), vec!["PRD".to_string()]),
-            ("TASK".to_string(), vec!["SPEC".to_string()]),
-        ]);
-        assert_eq!(requires, expected);
-        assert!(
-            !requires.contains_key("PRD"),
-            "the upstream PRD must NOT acquire a requires entry — that would invert the lift; got {requires:?}"
-        );
-    }
-
-    // -- T2.1: effective gate resolution (EARS-02.4) --------------------
-
-    #[test]
-    fn explicit_gate_is_used_when_present() {
-        let mut gates = BTreeMap::new();
-        gates.insert(
-            "ADR".to_string(),
-            GatePredicate {
-                quantifier: GateQuantifier::All,
-                status: "superseded".to_string(),
-            },
-        );
-        let gate = effective_gate("ADR", &gates);
-        assert_eq!(gate.quantifier, GateQuantifier::All);
-        assert_eq!(gate.status, "superseded");
-    }
-
-    #[test]
-    fn default_gate_is_any_accepted_for_non_task() {
-        let gate = effective_gate("ADR", &BTreeMap::new());
-        assert_eq!(gate.quantifier, GateQuantifier::Any);
-        assert_eq!(gate.status, "accepted");
-    }
-
-    #[test]
-    fn default_gate_is_all_done_for_task() {
-        // TASK is the only built-in namespace whose terminal status is
-        // `done` (SPEC-002 § Data model, EARS-02.4).
-        let gate = effective_gate("TASK", &BTreeMap::new());
-        assert_eq!(gate.quantifier, GateQuantifier::All);
-        assert_eq!(gate.status, "done");
-    }
-
-    // -- T2.2: gate evaluation (EARS-02.1/02.2/02.5) --------------------
-
-    fn view(id: &str, status: Option<&str>, clean: bool) -> DocView {
-        DocView {
-            id: id.to_string(),
-            status: status.map(str::to_string),
-            clean,
-        }
-    }
-
-    fn any_accepted() -> GatePredicate {
-        GatePredicate {
-            quantifier: GateQuantifier::Any,
-            status: "accepted".to_string(),
-        }
-    }
-
-    fn all_done() -> GatePredicate {
-        GatePredicate {
-            quantifier: GateQuantifier::All,
-            status: "done".to_string(),
-        }
-    }
-
-    #[test]
-    fn any_gate_done_when_one_matching_clean_doc() {
-        let docs = [view("ADR-001", Some("accepted"), true), view("ADR-002", Some("draft"), true)];
-        let eval = evaluate_gate(&any_accepted(), &docs);
-        assert!(eval.done);
-        assert!(eval.held.is_empty());
-    }
-
-    #[test]
-    fn any_gate_unsatisfied_when_no_matching_doc() {
-        let docs = [view("ADR-001", Some("draft"), true)];
-        let eval = evaluate_gate(&any_accepted(), &docs);
-        assert!(!eval.done);
-        assert!(eval.held.is_empty(), "a draft is not a held terminal doc");
-    }
-
-    #[test]
-    fn any_gate_held_when_matching_doc_is_dirty() {
-        // EARS-02.2: the accepted doc carries the terminal status but
-        // has a diagnostic → not done, and it is named as held.
-        let docs = [view("SPEC-001", Some("accepted"), false)];
-        let eval = evaluate_gate(&any_accepted(), &docs);
-        assert!(!eval.done);
-        assert_eq!(eval.held, vec!["SPEC-001"]);
-    }
-
-    #[test]
-    fn any_gate_ignores_dirty_non_matching_docs() {
-        // A dirty draft does not hold an any:accepted gate — only docs
-        // carrying the gate's status are counted (EARS-02.1).
-        let docs = [view("ADR-001", Some("accepted"), true), view("ADR-002", Some("draft"), false)];
-        let eval = evaluate_gate(&any_accepted(), &docs);
-        assert!(eval.done);
-        assert!(eval.held.is_empty());
-    }
-
-    #[test]
-    fn all_gate_done_when_every_doc_matches_and_clean() {
-        let docs = [view("TASK-001", Some("done"), true), view("TASK-002", Some("done"), true)];
-        let eval = evaluate_gate(&all_done(), &docs);
-        assert!(eval.done);
-    }
-
-    #[test]
-    fn all_gate_not_done_when_one_doc_unfinished() {
-        let docs = [view("TASK-001", Some("done"), true), view("TASK-002", Some("doing"), true)];
-        let eval = evaluate_gate(&all_done(), &docs);
-        assert!(!eval.done);
-        assert!(eval.held.is_empty(), "an unfinished task is not held");
-    }
-
-    #[test]
-    fn all_gate_held_names_dirty_terminal_doc() {
-        let docs = [view("TASK-001", Some("done"), false), view("TASK-002", Some("done"), true)];
-        let eval = evaluate_gate(&all_done(), &docs);
-        assert!(!eval.done);
-        assert_eq!(eval.held, vec!["TASK-001"]);
-    }
-
-    #[test]
-    fn all_gate_over_empty_namespace_is_unsatisfied() {
-        // EARS-02.5: an `all:` gate with no documents is unsatisfied —
-        // not vacuously true.
-        let eval = evaluate_gate(&all_done(), &[]);
-        assert!(!eval.done);
-    }
-
-    #[test]
-    fn any_gate_over_empty_namespace_is_unsatisfied() {
-        // SPEC-003 EARS-03.1 (the pin): `any:` over a namespace with zero
-        // counted documents is unsatisfied too — a pruned/empty lineage stage
-        // holds rather than passing vacuously, matching `all:`-over-empty.
-        let eval = evaluate_gate(&any_accepted(), &[]);
-        assert!(!eval.done);
-        assert!(eval.held.is_empty());
-    }
-
-    #[test]
-    fn held_docs_are_name_sorted() {
-        let docs = [view("ADR-009", Some("accepted"), false), view("ADR-002", Some("accepted"), false)];
-        let eval = evaluate_gate(&any_accepted(), &docs);
-        assert_eq!(eval.held, vec!["ADR-002", "ADR-009"]);
-    }
-
-    // -- T2.2: stage report (no parent gating yet — that is T2.3) --------
-
     fn doc_with_status(raw_id: &str, status: &str, depends_on: Vec<&str>) -> Document {
         let mut d = doc(raw_id, depends_on);
-        d.metadata
-            .insert("status".to_string(), serde_json::json!(status));
+        d.metadata.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
         d
     }
 
-    #[test]
-    fn single_stage_accepted_clean_is_done() {
-        let config = config_with_namespaces(&["SPEC"]);
-        let docs = vec![doc_with_status("SPEC-001", "accepted", vec![])];
-        let resolution = resolve_dag(&config).unwrap();
-        let stages = compute_stages(&resolution.dag, &config, &docs, &[], None);
-        assert_eq!(stages.len(), 1);
-        assert_eq!(stages[0].namespace, "SPEC");
-        assert_eq!(stages[0].state, StageState::Done);
-        assert!(stages[0].held.is_empty());
+    /// The readiness rows for a document set, global (unscoped) view.
+    fn readiness(documents: &[Document]) -> Vec<DocReadiness> {
+        let graph = dag::DepGraph::new(documents);
+        compute_documents(documents, &graph, None)
     }
 
-    #[test]
-    fn single_stage_accepted_dirty_is_current_and_held() {
-        // Scenario 4 at the unit level: the SPEC doc is dirty (a
-        // diagnostic anchored at its location), so the stage is the
-        // current, held stage.
-        let config = config_with_namespaces(&["SPEC"]);
-        let docs = vec![doc_with_status("SPEC-001", "accepted", vec![])];
-        let diag = crate::diagnostic::Diagnostic::error(
-            "core.required-headings",
-            "spec-001.md", // matches doc().location = "<lower-id>.md"
-            1,
-            0,
-            "missing heading",
-        );
-        let stages = compute_stages(&resolution_dag(&config), &config, &docs, &[diag], None);
-        assert_eq!(stages[0].state, StageState::Current);
-        assert_eq!(stages[0].held, vec!["SPEC-001"]);
-    }
-
-    fn resolution_dag(config: &Config) -> NamespaceDag {
-        resolve_dag(config).unwrap().dag
-    }
-
-    #[test]
-    fn join_stage_waits_on_unfinished_parent() {
-        // EARS-02.6: SPEC's own gate is satisfied (accepted) but the
-        // DESIGN parent is a draft → SPEC pending, DESIGN current. The
-        // diamond is declared via dep-shape (SPEC requires ADR + DESIGN).
-        let mut config = config_with_namespaces(&["ADR", "DESIGN", "SPEC"]);
-        with_dep_shape(&mut config, "SPEC", &["ADR", "DESIGN"], &[]);
-        let docs = vec![
-            doc_with_status("ADR-001", "accepted", vec![]),
-            doc_with_status("DESIGN-001", "draft", vec![]),
-            doc_with_status("SPEC-001", "accepted", vec!["ADR-001", "DESIGN-001"]),
-        ];
-        let resolution = resolve_dag(&config).unwrap();
-        let stages = compute_stages(&resolution.dag, &config, &docs, &[], None);
-        let by_ns: std::collections::BTreeMap<&str, StageState> =
-            stages.iter().map(|s| (s.namespace.as_str(), s.state)).collect();
-        assert_eq!(by_ns["ADR"], StageState::Done);
-        assert_eq!(by_ns["DESIGN"], StageState::Current);
-        assert_eq!(
-            by_ns["SPEC"],
-            StageState::Pending,
-            "a join stage with one unfinished parent must not be done"
-        );
-    }
-
-    #[test]
-    fn join_stage_done_when_all_parents_done() {
-        let mut config = config_with_namespaces(&["ADR", "DESIGN", "SPEC"]);
-        with_dep_shape(&mut config, "SPEC", &["ADR", "DESIGN"], &[]);
-        let docs = vec![
-            doc_with_status("ADR-001", "accepted", vec![]),
-            doc_with_status("DESIGN-001", "accepted", vec![]),
-            doc_with_status("SPEC-001", "accepted", vec!["ADR-001", "DESIGN-001"]),
-        ];
-        let resolution = resolve_dag(&config).unwrap();
-        let stages = compute_stages(&resolution.dag, &config, &docs, &[], None);
-        assert!(stages.iter().all(|s| s.state == StageState::Done));
-    }
-
-    #[test]
-    fn cold_start_first_empty_stage_is_current() {
-        // Default ladder PRD → ADR → SPEC → TASK with only an accepted
-        // PRD: PRD done, ADR current (no accepted ADR), rest pending.
-        let config = config_with_namespaces(&["PRD", "ADR", "SPEC", "TASK"]);
-        let docs = vec![doc_with_status("PRD-001", "accepted", vec![])];
-        let resolution = resolve_dag(&config).unwrap();
-        let stages = compute_stages(&resolution.dag, &config, &docs, &[], None);
-        let by_ns: std::collections::BTreeMap<&str, StageState> =
-            stages.iter().map(|s| (s.namespace.as_str(), s.state)).collect();
-        assert_eq!(by_ns["PRD"], StageState::Done);
-        assert_eq!(by_ns["ADR"], StageState::Current);
-        assert_eq!(by_ns["SPEC"], StageState::Pending);
-        assert_eq!(by_ns["TASK"], StageState::Pending);
-    }
-
-    // -- T3.1: BUG tripwire (EARS-03.1/03.2) ----------------------------
-
-    fn ast_with_cross_ref(namespace: &str, number: u32) -> Ast {
-        let mut ast = Ast::default();
-        ast.cross_ref_tokens.push(crate::ast::CrossRefToken {
-            token: format!("{namespace}-{number}"),
-            namespace: namespace.to_string(),
-            number,
-            line: 1,
-            col: 0,
-            in_code: false,
-            in_strikethrough: false,
-        });
-        ast
-    }
-
-    #[test]
-    fn open_bug_citing_lineage_via_depends_on_blocks_the_stage() {
-        // EARS-03.1: an `open` BUG whose depends_on points at a lineage
-        // SPEC blocks the SPEC stage and is named as a blocker.
-        let dag = dag::chain_dag(&["SPEC".to_string()]);
-        let docs = vec![
-            doc_with_status("SPEC-001", "draft", vec![]),
-            doc_with_status("BUG-001", "open", vec!["SPEC-001"]),
-        ];
-        let trip = sweep_tripwire(&dag, &docs, None);
-        assert_eq!(trip.blockers, vec!["BUG-001".to_string()]);
-        assert!(trip.blocked_namespaces.contains("SPEC"));
-        // ADR-037 § WIRE-004: the sweep retains per-BUG attribution.
-        assert_eq!(
-            trip.blocker_stages,
-            BTreeMap::from([("BUG-001".to_string(), vec!["SPEC".to_string()])])
-        );
-    }
-
-    #[test]
-    fn open_bug_citing_lineage_via_body_token_blocks() {
-        // The other pointer kind: a non-suppressed body cross-ref token
-        // to a lineage document counts as a citation too.
-        let dag = dag::chain_dag(&["SPEC".to_string()]);
-        let spec = doc_with_status("SPEC-001", "draft", vec![]);
-        let mut bug = doc_with_status("BUG-001", "open", vec![]);
-        bug.ast = Some(ast_with_cross_ref("SPEC", 1));
-        let docs = vec![spec, bug];
-        let trip = sweep_tripwire(&dag, &docs, None);
-        assert_eq!(trip.blockers, vec!["BUG-001".to_string()]);
-        assert!(trip.blocked_namespaces.contains("SPEC"));
-    }
-
-    #[test]
-    fn non_open_bug_does_not_block() {
-        // EARS-03.2: a BUG that has left `open` no longer blocks — the
-        // sweep only counts `open` BUGs, so the state clears for free.
-        let dag = dag::chain_dag(&["SPEC".to_string()]);
-        let docs = vec![
-            doc_with_status("SPEC-001", "draft", vec![]),
-            doc_with_status("BUG-001", "fixed", vec!["SPEC-001"]),
-        ];
-        let trip = sweep_tripwire(&dag, &docs, None);
-        assert!(trip.blockers.is_empty());
-        assert!(trip.blocked_namespaces.is_empty());
-    }
-
-    #[test]
-    fn open_bug_citing_outside_the_lineage_does_not_block() {
-        // ADR is not a staged namespace here, so a BUG citing ADR-001
-        // touches nothing in the active lineage and must not block.
-        let dag = dag::chain_dag(&["SPEC".to_string()]);
-        let docs = vec![
-            doc_with_status("SPEC-001", "draft", vec![]),
-            doc_with_status("ADR-001", "accepted", vec![]),
-            doc_with_status("BUG-001", "open", vec!["ADR-001"]),
-        ];
-        let trip = sweep_tripwire(&dag, &docs, None);
-        assert!(trip.blockers.is_empty());
-        assert!(trip.blocked_namespaces.is_empty());
-    }
-
-    #[test]
-    fn suppressed_body_token_does_not_block() {
-        // A cross-ref token inside code/strikethrough is suppressed —
-        // it must not count as a citation (mirrors find_references).
-        let dag = dag::chain_dag(&["SPEC".to_string()]);
-        let spec = doc_with_status("SPEC-001", "draft", vec![]);
-        let mut bug = doc_with_status("BUG-001", "open", vec![]);
-        let mut ast = Ast::default();
-        ast.cross_ref_tokens.push(crate::ast::CrossRefToken {
-            token: "SPEC-1".to_string(),
-            namespace: "SPEC".to_string(),
-            number: 1,
-            line: 1,
-            col: 0,
-            in_code: true,
-            in_strikethrough: false,
-        });
-        bug.ast = Some(ast);
-        let docs = vec![spec, bug];
-        let trip = sweep_tripwire(&dag, &docs, None);
-        assert!(trip.blockers.is_empty());
-    }
-
-    #[test]
-    fn render_report_lists_blockers() {
-        let report = Report {
-            source: DagSource::Declared,
-            dag: dag::chain_dag(&["SPEC".to_string()]),
-            stages: vec![Stage {
-                namespace: "SPEC".to_string(),
-                state: StageState::Blocked,
-                docs: vec!["SPEC-001".to_string()],
-                verdict: "draft".to_string(),
-                gate_met: false,
-                held: vec![],
-                actionable: Some("SPEC-001".to_string()),
-            }],
-            frontier: vec!["SPEC".to_string()],
-            blockers: vec!["BUG-001".to_string()],
-            blocker_stages: BTreeMap::from([("BUG-001".to_string(), vec!["SPEC".to_string()])]),
-            next_action: "resolve BUG-001".to_string(),
-            lineage: None,
-            shared: BTreeMap::new(),
-        };
-        let out = render_report(&report);
-        assert!(out.contains("SPEC"), "out:\n{out}");
-        assert!(out.contains("blocked"), "out:\n{out}");
-        assert!(out.contains("blocked by BUG-001"), "out:\n{out}");
-        assert!(out.contains("next: resolve BUG-001"), "out:\n{out}");
-    }
-
-    // -- T3.2: next_action fixed template (EARS-04.3/04.4) ---------------
-
-    #[test]
-    fn next_action_resolves_blocker_first() {
-        let stages = vec![stage("SPEC", StageState::Blocked, "draft", Some("SPEC-001"))];
-        let action = next_action(
-            &stages,
-            Some("SPEC"),
-            &["BUG-001".to_string()],
-            &Config::default(),
-        );
-        assert_eq!(action, "resolve BUG-001");
-    }
-
-    #[test]
-    fn next_action_accepts_the_draft_in_the_current_stage() {
-        let stages = vec![stage("ADR", StageState::Current, "draft", Some("ADR-001"))];
-        let action = next_action(&stages, Some("ADR"), &[], &Config::default());
-        assert_eq!(action, "accept ADR-001");
-    }
-
-    #[test]
-    fn next_action_completes_a_task_stage() {
-        // TASK's terminal status is `done`, so the verb is `complete`.
-        let mut config = Config::default();
-        config.pipeline = Some(PipelineConfig {
-            stages: vec!["TASK".to_string()],
-            gates: BTreeMap::new(),
-        });
-        let stages = vec![stage("TASK", StageState::Current, "doing", Some("TASK-001"))];
-        let action = next_action(&stages, Some("TASK"), &[], &config);
-        assert_eq!(action, "complete TASK-001");
-    }
-
-    #[test]
-    fn next_action_fixes_a_held_stage() {
-        let stages = vec![stage("SPEC", StageState::Current, "held", Some("SPEC-001"))];
-        let action = next_action(&stages, Some("SPEC"), &[], &Config::default());
-        assert_eq!(action, "fix SPEC-001");
-    }
-
-    #[test]
-    fn next_action_creates_the_first_doc_in_an_empty_stage() {
-        let stages = vec![stage("ADR", StageState::Current, "empty", None)];
-        let action = next_action(&stages, Some("ADR"), &[], &Config::default());
-        assert_eq!(action, "create the first ADR document");
-    }
-
-    #[test]
-    fn next_action_complete_when_pipeline_done() {
-        let stages = vec![stage("ADR", StageState::Done, "accepted", None)];
-        let action = next_action(&stages, None, &[], &Config::default());
-        assert_eq!(action, "pipeline complete");
-    }
-
-    fn stage(ns: &str, state: StageState, verdict: &str, actionable: Option<&str>) -> Stage {
-        Stage {
-            namespace: ns.to_string(),
-            state,
-            docs: actionable.iter().map(|s| s.to_string()).collect(),
-            verdict: verdict.to_string(),
-            // Default: a done stage has its gate met. Tests needing the
-            // gate-met-but-not-done case build a Stage literal directly.
-            gate_met: matches!(state, StageState::Done),
-            held: Vec::new(),
-            actionable: actionable.map(str::to_string),
+    fn row(id: &str, status: Option<&str>, ready: bool, blocked_by: &[&str], deps: &[&str]) -> DocReadiness {
+        DocReadiness {
+            id: id.to_string(),
+            namespace: id.split('-').next().unwrap_or(id).to_string(),
+            status: status.map(str::to_string),
+            ready,
+            blocked_by: blocked_by.iter().map(|s| s.to_string()).collect(),
+            deps: deps.iter().map(|s| s.to_string()).collect(),
         }
     }
 
+    // --- ADR-107 § RDY-002: the readiness predicate ---------------------
+
     #[test]
-    fn render_json_emits_the_data_model_schema() {
-        // EARS-04.2 + ADR-037 + ADR-039 § DAG-006: the JSON object carries
-        // source / edges / stages (namespace, state, docs, verdict,
-        // gate_met, hold) / frontier / blockers / blocker_stages /
-        // next_action and nothing from the internal Report under its
-        // internal field names.
-        let report = Report {
-            source: DagSource::Declared,
-            dag: dag::chain_dag(&["ADR".to_string(), "SPEC".to_string()]),
-            stages: vec![
-                stage("ADR", StageState::Done, "accepted", None),
-                stage("SPEC", StageState::Current, "draft", Some("SPEC-001")),
-            ],
-            frontier: vec!["SPEC".to_string()],
-            blockers: Vec::new(),
-            blocker_stages: BTreeMap::new(),
-            next_action: "accept SPEC-001".to_string(),
-            lineage: None,
-            shared: BTreeMap::new(),
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
-        assert_eq!(parsed["source"], "declared");
-        assert_eq!(parsed["source_hint"], "order you set in ctxgrd.toml");
-        // ADR-039 § DAG-006: `frontier` is a sorted array; `current` is gone.
-        assert_eq!(parsed["frontier"], serde_json::json!(["SPEC"]));
-        assert!(parsed.get("current").is_none(), "the `current` field is removed");
-        assert_eq!(parsed["next_action"], "accept SPEC-001");
-        assert!(parsed["blockers"].as_array().unwrap().is_empty());
-        let stages = parsed["stages"].as_array().unwrap();
-        assert_eq!(stages.len(), 2);
-        assert_eq!(stages[1]["namespace"], "SPEC");
-        assert_eq!(stages[1]["state"], "current");
-        assert_eq!(stages[1]["verdict"], "draft");
-        assert_eq!(stages[1]["docs"][0], "SPEC-001");
-        // ADR-037 § WIRE-001: edges mirror the resolved DAG as {from,to}.
-        assert_eq!(parsed["edges"], serde_json::json!([{"from": "ADR", "to": "SPEC"}]));
-        // ADR-037 § WIRE-002/003: per-stage gate result and hold list.
-        assert_eq!(stages[0]["gate_met"], true, "ADR is done → its gate is met");
-        assert_eq!(stages[1]["gate_met"], false, "SPEC draft → gate not met");
-        assert!(stages[1]["hold"].as_array().unwrap().is_empty());
-        // ADR-037 § WIRE-004: blocker_stages is a (here empty) object.
-        assert_eq!(parsed["blocker_stages"], serde_json::json!({}));
-        // Internal field names never leak to the wire (WIRE-005).
-        assert!(parsed.get("dag").is_none());
-        assert!(stages[1].get("held").is_none());
-        assert!(stages[1].get("actionable").is_none());
+    fn readiness_is_true_when_every_dependency_is_terminal() {
+        let documents = vec![
+            doc_with_status("ADR-001", "accepted", vec![]),
+            doc_with_status("SPEC-001", "draft", vec!["ADR-001"]),
+        ];
+        let rows = readiness(&documents);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].id, "SPEC-001");
+        assert_eq!(rows[1].namespace, "SPEC");
+        assert_eq!(rows[1].status, Some("draft".to_string()));
+        assert!(rows[1].ready);
+        assert_eq!(rows[1].blocked_by, Vec::<String>::new());
     }
 
     #[test]
-    fn dag_source_hint_glosses_both_variants() {
-        // EARS-01.4: `source_hint` is the plain-language companion to the
-        // stable `source` enum, for a person or LLM reading `--format json`.
-        assert_eq!(DagSource::Declared.hint(), "order you set in ctxgrd.toml");
+    fn readiness_is_false_and_names_the_non_terminal_dependency() {
+        let documents = vec![
+            doc_with_status("ADR-001", "draft", vec![]),
+            doc_with_status("SPEC-001", "draft", vec!["ADR-001"]),
+        ];
+        let rows = readiness(&documents);
+        assert_eq!(rows[1].id, "SPEC-001");
+        assert!(!rows[1].ready);
+        assert_eq!(rows[1].blocked_by, vec!["ADR-001".to_string()]);
+    }
+
+    #[test]
+    fn a_settled_document_is_not_ready_and_not_blocked() {
+        // RDY-002, and the shape `BUG-036` R1 mistook for a defect: done is
+        // `ready: false` with an empty `blocked_by`, and `status` is in the
+        // row precisely so a consumer can tell that from stuck.
+        let documents = vec![doc_with_status("ADR-001", "accepted", vec![])];
+        let rows = readiness(&documents);
+        assert!(!rows[0].ready);
+        assert_eq!(rows[0].blocked_by, Vec::<String>::new());
+        assert_eq!(rows[0].status, Some("accepted".to_string()));
+        assert_eq!(rows[0].state(), DocState::Done);
+    }
+
+    #[test]
+    fn a_document_without_a_status_is_ready_and_reports_none() {
+        let documents = vec![doc("ADR-002", vec![])];
+        let rows = readiness(&documents);
+        assert_eq!(rows[0].status, None);
+        assert!(rows[0].ready);
+        assert_eq!(rows[0].blocked_by, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_dependency_without_a_status_blocks() {
+        let documents = vec![
+            doc("ADR-002", vec![]),
+            doc_with_status("SPEC-002", "draft", vec!["ADR-002"]),
+        ];
+        let rows = readiness(&documents);
+        assert_eq!(rows[1].id, "SPEC-002");
+        assert!(!rows[1].ready);
+        assert_eq!(rows[1].blocked_by, vec!["ADR-002".to_string()]);
+    }
+
+    #[test]
+    fn unresolved_dependencies_are_ignored() {
+        // A dangling `depends_on` is `core.dep-resolved`'s diagnostic to
+        // emit, not a second report of the same defect here.
+        let documents = vec![doc_with_status("SPEC-003", "draft", vec!["ADR-404"])];
+        let rows = readiness(&documents);
+        assert_eq!(rows[0].blocked_by, Vec::<String>::new());
+        assert!(rows[0].ready);
+    }
+
+    #[test]
+    fn terminal_comparison_is_case_insensitive() {
+        let documents = vec![
+            doc_with_status("ADR-003", "Accepted", vec![]),
+            doc_with_status("SPEC-004", "draft", vec!["ADR-003"]),
+        ];
+        let rows = readiness(&documents);
+        assert!(!rows[0].ready);
+        assert!(rows[1].ready);
+        assert_eq!(rows[1].blocked_by, Vec::<String>::new());
+    }
+
+    #[test]
+    fn blocked_by_is_id_sorted() {
+        let documents = vec![
+            doc_with_status("ADR-004", "draft", vec![]),
+            doc_with_status("ADR-005", "draft", vec![]),
+            doc_with_status("SPEC-005", "draft", vec!["ADR-005", "ADR-004"]),
+        ];
+        let rows = readiness(&documents);
+        assert_eq!(rows[2].id, "SPEC-005");
         assert_eq!(
-            DagSource::Default.hint(),
-            "ctxgrd's default order (you haven't set one)"
+            rows[2].blocked_by,
+            vec!["ADR-004".to_string(), "ADR-005".to_string()]
+        );
+    }
+
+    // --- ADR-118 § STG-001: the queue covers every namespace ------------
+
+    #[test]
+    fn stg001_an_unstaged_namespace_gets_a_row() {
+        // The defect half of the pair. Before ADR-118 the queue was filtered
+        // to `resolution.dag.order` — the staged namespaces — so BUG-001
+        // produced no row at all and an agent asking what was open was told
+        // the bug did not exist (`BUG-036` R1).
+        let documents = vec![
+            doc_with_status("ADR-006", "accepted", vec![]),
+            doc_with_status("BUG-001", "open", vec![]),
+            doc_with_status("HANDOFF-001", "pending", vec![]),
+        ];
+        let ids: Vec<String> = readiness(&documents).into_iter().map(|d| d.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ADR-006".to_string(),
+                "BUG-001".to_string(),
+                "HANDOFF-001".to_string()
+            ]
         );
     }
 
     #[test]
-    fn render_json_gate_met_is_true_on_a_parent_gated_pending_stage() {
-        // ADR-037 § WIRE-002: the load-bearing distinction. SPEC's own
-        // gate is met (accepted+clean) but it is `pending` because a
-        // parent is unfinished (EARS-02.6); `verdict` renders a
-        // non-terminal token, so `gate_met` is the field that tells the
-        // truth about SPEC's own gate.
-        let report = Report {
-            source: DagSource::Declared,
-            dag: dag::chain_dag(&["ADR".to_string(), "SPEC".to_string()]),
-            stages: vec![
-                stage("ADR", StageState::Current, "draft", Some("ADR-001")),
-                Stage {
-                    namespace: "SPEC".to_string(),
-                    state: StageState::Pending,
-                    docs: vec!["SPEC-001".to_string()],
-                    verdict: "superseded".to_string(),
-                    gate_met: true,
-                    held: Vec::new(),
-                    actionable: None,
-                },
-            ],
-            frontier: vec!["ADR".to_string()],
-            blockers: Vec::new(),
-            blocker_stages: BTreeMap::new(),
-            next_action: "accept ADR-001".to_string(),
-            lineage: None,
-            shared: BTreeMap::new(),
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
-        let spec = &parsed["stages"][1];
-        assert_eq!(spec["state"], "pending");
-        assert_eq!(spec["verdict"], "superseded");
-        assert_eq!(spec["gate_met"], true, "own gate is met despite pending state");
+    fn stg001_an_unstaged_namespace_row_carries_real_readiness() {
+        // The other half: presence alone is not the fix. The new rows must
+        // carry a computed verdict, not a placeholder — an open BUG with a
+        // settled dependency is workable, and one with a draft dependency
+        // is not.
+        let documents = vec![
+            doc_with_status("ADR-007", "accepted", vec![]),
+            doc_with_status("ADR-008", "draft", vec![]),
+            doc_with_status("BUG-002", "open", vec!["ADR-007"]),
+            doc_with_status("BUG-003", "open", vec!["ADR-008"]),
+        ];
+        let rows = readiness(&documents);
+        let by_id = |id: &str| rows.iter().find(|r| r.id == id).expect("row present").clone();
+        assert!(by_id("BUG-002").ready);
+        assert_eq!(by_id("BUG-002").blocked_by, Vec::<String>::new());
+        assert!(!by_id("BUG-003").ready);
+        assert_eq!(by_id("BUG-003").blocked_by, vec!["ADR-008".to_string()]);
     }
 
     #[test]
-    fn render_json_blocker_stages_attributes_each_bug_to_its_stages() {
-        // ADR-037 § WIRE-004: the map keys are the blockers and the
-        // values name the stages each BUG blocks.
+    fn lineage_scopes_the_rows_but_blocked_by_reads_the_full_graph() {
+        // RDY-003: a blocker outside the lineage is still named — omitting
+        // it would report a document as unblocked when it is not.
+        let documents = vec![
+            doc_with_status("ADR-007", "accepted", vec![]),
+            doc_with_status("ADR-008", "draft", vec![]),
+            doc_with_status("SPEC-006", "draft", vec!["ADR-007", "ADR-008"]),
+        ];
+        let graph = dag::DepGraph::new(&documents);
+        let members: BTreeSet<DocumentId> = ["ADR-007", "SPEC-006"]
+            .iter()
+            .map(|id| id.parse().expect("valid id"))
+            .collect();
+        let rows = compute_documents(&documents, &graph, Some(&members));
+        let ids: Vec<String> = rows.iter().map(|d| d.id.clone()).collect();
+        assert_eq!(ids, vec!["ADR-007".to_string(), "SPEC-006".to_string()]);
+        assert!(!rows[1].ready);
+        assert_eq!(rows[1].blocked_by, vec!["ADR-008".to_string()]);
+    }
+
+    // --- ADR-118 § STG-004: the done-signal ------------------------------
+
+    #[test]
+    fn stg004_unblocked_is_true_when_nothing_is_held() {
+        // `BUG-036` R2: a feature that is accepted, shipped, and depended on
+        // by nothing must be able to certify. Under the stage layer this
+        // exited 1 both globally and for its own lineage.
         let report = Report {
-            source: DagSource::Declared,
-            dag: dag::chain_dag(&["ADR".to_string(), "SPEC".to_string()]),
-            stages: vec![
-                stage("ADR", StageState::Blocked, "accepted", None),
-                stage("SPEC", StageState::Blocked, "draft", Some("SPEC-001")),
-            ],
-            frontier: vec!["ADR".to_string(), "SPEC".to_string()],
-            blockers: vec!["BUG-001".to_string(), "BUG-002".to_string()],
-            blocker_stages: BTreeMap::from([
-                ("BUG-001".to_string(), vec!["ADR".to_string()]),
-                ("BUG-002".to_string(), vec!["ADR".to_string(), "SPEC".to_string()]),
-            ]),
-            next_action: "resolve BUG-001".to_string(),
             lineage: None,
-            shared: BTreeMap::new(),
+            shared: Vec::new(),
+            documents: vec![
+                row("ADR-117", Some("accepted"), false, &[], &[]),
+                row("BUG-001", Some("open"), true, &[], &[]),
+            ],
         };
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
-        assert_eq!(
-            parsed["blocker_stages"],
-            serde_json::json!({"BUG-001": ["ADR"], "BUG-002": ["ADR", "SPEC"]})
-        );
-        // The flat v1 list is still present, unchanged (WIRE-005).
-        assert_eq!(parsed["blockers"], serde_json::json!(["BUG-001", "BUG-002"]));
+        assert!(report.unblocked());
     }
 
     #[test]
-    fn render_json_frontier_is_empty_when_complete() {
-        // ADR-039 § DAG-006: a complete pipeline reports an empty frontier
-        // (the ready set is empty); the `current` field no longer exists.
+    fn stg004_unblocked_is_false_when_a_document_is_held() {
+        // The paired half — the signal must still be able to fail, or it
+        // certifies everything and means nothing.
         let report = Report {
-            source: DagSource::Default,
-            dag: dag::chain_dag(&["ADR".to_string()]),
-            stages: vec![stage("ADR", StageState::Done, "accepted", None)],
-            frontier: Vec::new(),
-            blockers: Vec::new(),
-            blocker_stages: BTreeMap::new(),
-            next_action: "pipeline complete".to_string(),
             lineage: None,
-            shared: BTreeMap::new(),
+            shared: Vec::new(),
+            documents: vec![
+                row("ADR-008", Some("draft"), true, &[], &[]),
+                row("SPEC-006", Some("draft"), false, &["ADR-008"], &["ADR-008"]),
+            ],
         };
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
-        assert_eq!(parsed["frontier"], serde_json::json!([]));
-        assert!(parsed.get("current").is_none());
+        assert!(!report.unblocked());
     }
 
-    /// A two-stage chain with one open-BUG blocker — shared fixture for
-    /// the diagram renderers.
-    fn diagram_report() -> Report {
+    // --- ADR-118 § STG-003: the JSON contract ----------------------------
+
+    fn queue_report() -> Report {
         Report {
-            source: DagSource::Declared,
-            dag: dag::chain_dag(&["ADR".to_string(), "SPEC".to_string()]),
-            stages: vec![
-                stage("ADR", StageState::Blocked, "accepted", None),
-                stage("SPEC", StageState::Current, "draft", Some("SPEC-001")),
-            ],
-            frontier: vec!["SPEC".to_string()],
-            blockers: vec!["BUG-008".to_string()],
-            blocker_stages: BTreeMap::from([("BUG-008".to_string(), vec!["ADR".to_string()])]),
-            next_action: "resolve BUG-008".to_string(),
             lineage: None,
-            shared: BTreeMap::new(),
+            shared: Vec::new(),
+            documents: vec![
+                row("ADR-001", Some("accepted"), false, &[], &[]),
+                row("SPEC-001", None, false, &["ADR-002"], &["ADR-002"]),
+            ],
         }
     }
 
     #[test]
-    fn render_mermaid_emits_flowchart_with_state_classes_and_blocker() {
-        let out = render_mermaid(&diagram_report());
-        assert!(out.starts_with("flowchart LR\n"), "out:\n{out}");
-        // Stage nodes carry state class + doc count; SPEC has 1 doc.
-        assert!(
-            out.contains("ADR[\"ADR: blocked (0 docs)\"]:::blocked"),
-            "out:\n{out}"
+    fn stg003_json_is_the_work_queue_and_nothing_else() {
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&queue_report())).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "documents": [
+                    {"id": "ADR-001", "namespace": "ADR", "status": "accepted",
+                     "ready": false, "blocked_by": []},
+                    {"id": "SPEC-001", "namespace": "SPEC", "status": null,
+                     "ready": false, "blocked_by": ["ADR-002"]}
+                ]
+            })
         );
-        assert!(
-            out.contains("SPEC[\"SPEC: current (1 doc)\"]:::current"),
-            "out:\n{out}"
-        );
-        assert!(out.contains("ADR --> SPEC"), "out:\n{out}");
-        // The open BUG is a node with a sanitized id (BUG-008 -> BUG_008)
-        // and a dashed `blocks` edge to the stage it cites.
-        assert!(out.contains("BUG_008[\"BUG-008 (open)\"]:::bug"), "out:\n{out}");
-        assert!(out.contains("BUG_008 -. blocks .-> ADR"), "out:\n{out}");
-        assert!(out.contains("classDef blocked"), "out:\n{out}");
     }
 
     #[test]
-    fn render_dot_emits_digraph_with_fill_colors_and_blocker() {
-        let out = render_dot(&diagram_report());
-        assert!(out.starts_with("digraph pipeline {\n"), "out:\n{out}");
-        assert!(out.contains("rankdir=LR;"), "out:\n{out}");
-        // Blocked ADR is filled with the blocked palette colour.
-        assert!(
-            out.contains("\"ADR\" [label=\"ADR\\nblocked (0 docs)\", fillcolor=\"#f6cccc\"];"),
-            "out:\n{out}"
-        );
-        assert!(out.contains("\"ADR\" -> \"SPEC\";"), "out:\n{out}");
-        // BUG nodes keep their hyphen (DOT ids are quoted) and dash-block.
-        assert!(
-            out.contains("\"BUG-008\" [label=\"BUG-008\\n(open)\", shape=note"),
-            "out:\n{out}"
-        );
-        assert!(
-            out.contains("\"BUG-008\" -> \"ADR\" [style=dashed, label=\"blocks\"];"),
-            "out:\n{out}"
-        );
-        assert!(out.ends_with("}\n"), "out:\n{out}");
+    fn stg003_the_removed_stage_fields_are_absent() {
+        // Named individually rather than asserted as "only `documents`
+        // remains", so a future field that reintroduces one of them by name
+        // fails here and not merely in a whole-object comparison somebody
+        // might update by hand.
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&queue_report())).unwrap();
+        for gone in [
+            "stages",
+            "edges",
+            "frontier",
+            "blockers",
+            "blocker_stages",
+            "next_action",
+            "source",
+            "source_hint",
+        ] {
+            assert!(parsed.get(gone).is_none(), "`{gone}` survived STG-003");
+        }
     }
 
     #[test]
-    fn render_report_full_ladder_snapshot() {
-        // Cold-start ladder: PRD done, ADR current (empty), the rest
-        // pending. Pins the whole text rendering (EARS-04.1).
-        let report = Report {
-            source: DagSource::Default,
-            dag: dag::chain_dag(&[
-                "PRD".to_string(),
-                "ADR".to_string(),
-                "SPEC".to_string(),
-                "TASK".to_string(),
-            ]),
-            stages: vec![
-                stage("PRD", StageState::Done, "accepted", None),
-                stage("ADR", StageState::Current, "empty", None),
-                stage("SPEC", StageState::Pending, "empty", None),
-                stage("TASK", StageState::Pending, "empty", None),
-            ],
-            frontier: vec!["ADR".to_string()],
-            blockers: Vec::new(),
-            blocker_stages: BTreeMap::new(),
-            next_action: "create the first ADR document".to_string(),
+    fn lineage_and_shared_appear_only_when_scoped() {
+        let global: serde_json::Value =
+            serde_json::from_str(&render_json(&queue_report())).unwrap();
+        assert!(global.get("lineage").is_none());
+        assert!(global.get("shared").is_none());
+
+        let mut scoped = queue_report();
+        scoped.lineage = Some("ADR-001".to_string());
+        scoped.shared = vec!["ADR-042".to_string()];
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&scoped)).unwrap();
+        assert_eq!(parsed["lineage"], json!("ADR-001"));
+        assert_eq!(parsed["shared"], json!(["ADR-042"]));
+    }
+
+    // --- ADR-118 § STG-005: the document graph is the only graph --------
+
+    fn diagram_report(adr_status: &str) -> Report {
+        let settled = adr_status == "accepted";
+        Report {
             lineage: None,
-            shared: BTreeMap::new(),
-        };
-        // No `source:` line — provenance moved to the JSON contract; the human
-        // table leads straight with the per-stage rows (EARS-01.4).
-        insta::assert_snapshot!(render_report(&report), @r"
-        PRD   done     0 docs
-        ADR   current  0 docs   needs PRD
-        SPEC  pending  0 docs   needs ADR
-        TASK  pending  0 docs   needs SPEC
+            shared: Vec::new(),
+            documents: vec![
+                row("ADR-001", Some(adr_status), !settled, &[], &[]),
+                row(
+                    "SPEC-001",
+                    Some("draft"),
+                    settled,
+                    if settled { &[] } else { &["ADR-001"] },
+                    &["ADR-001"],
+                ),
+            ],
+        }
+    }
 
-        ready: ADR
-        next: create the first ADR document
+    #[test]
+    fn render_mermaid_draws_one_node_per_document_and_one_edge_per_dep() {
+        let expected = "flowchart LR\n\
+             \x20 %% ctxgrd status · 2 documents · 1 ready · 0 blocked\n\
+             \x20 ADR_001[\"ADR-001: accepted\"]:::done\n\
+             \x20 SPEC_001[\"SPEC-001: draft\"]:::current\n\
+             \x20 ADR_001 --> SPEC_001\n\
+             \x20 classDef done fill:#cde6c5,stroke:#33aa77;\n\
+             \x20 classDef current fill:#cfe3ff,stroke:#3377aa;\n\
+             \x20 classDef blocked fill:#f6cccc,stroke:#cc3333;\n";
+        assert_eq!(render_mermaid(&diagram_report("accepted")), expected);
+    }
+
+    #[test]
+    fn render_mermaid_blocks_a_dependent_when_its_dependency_is_unsettled() {
+        let out = render_mermaid(&diagram_report("draft"));
+        assert!(out.contains("  ADR_001[\"ADR-001: draft\"]:::current\n"), "out:\n{out}");
+        assert!(
+            out.contains("  SPEC_001[\"SPEC-001: draft\"]:::blocked\n"),
+            "out:\n{out}"
+        );
+        assert!(out.contains("  ADR_001 --> SPEC_001\n"), "out:\n{out}");
+    }
+
+    #[test]
+    fn render_dot_draws_the_same_graph_with_the_shared_palette() {
+        let expected = "digraph documents {\n\
+             \x20 rankdir=LR;\n\
+             \x20 labelloc=t;\n\
+             \x20 label=\"ctxgrd status — 2 documents · 1 ready · 0 blocked\";\n\
+             \x20 node [shape=box, style=\"rounded,filled\"];\n\
+             \x20 \"ADR-001\" [label=\"ADR-001\\naccepted\", fillcolor=\"#cde6c5\"];\n\
+             \x20 \"SPEC-001\" [label=\"SPEC-001\\ndraft\", fillcolor=\"#cfe3ff\"];\n\
+             \x20 \"ADR-001\" -> \"SPEC-001\";\n\
+             }\n";
+        assert_eq!(render_dot(&diagram_report("accepted")), expected);
+    }
+
+    #[test]
+    fn render_dot_fills_a_blocked_dependent_with_the_blocked_colour() {
+        let out = render_dot(&diagram_report("draft"));
+        assert!(
+            out.contains("\"SPEC-001\" [label=\"SPEC-001\\ndraft\", fillcolor=\"#f6cccc\"];"),
+            "out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_absent_status_is_labelled_none() {
+        let mut report = diagram_report("accepted");
+        report.documents[1].status = None;
+        let out = render_mermaid(&report);
+        assert!(out.contains("  SPEC_001[\"SPEC-001: none\"]:::current\n"), "out:\n{out}");
+    }
+
+    #[test]
+    fn edges_to_uncounted_documents_are_dropped() {
+        // One edge per resolved dep *between counted documents*: a
+        // `--lineage` scope that excludes ADR-001 leaves SPEC-001 alone.
+        let mut report = diagram_report("accepted");
+        report.documents.remove(0);
+        let out = render_mermaid(&report);
+        assert!(out.contains("  SPEC_001[\"SPEC-001: draft\"]:::current\n"), "out:\n{out}");
+        assert!(!out.contains("-->"), "out:\n{out}");
+    }
+
+    #[test]
+    fn stg005_a_bug_is_an_ordinary_node_with_no_dashed_overlay() {
+        // GRN-004 held that the dashed `blocks` overlay was namespace-only.
+        // With the namespace view gone the overlay has no view to live in,
+        // and a BUG draws exactly like any other document.
+        let report = Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![row("BUG-008", Some("open"), true, &[], &[])],
+        };
+        let out = render_mermaid(&report);
+        assert!(out.contains("  BUG_008[\"BUG-008: open\"]:::current\n"), "out:\n{out}");
+        assert!(!out.contains("blocks"), "out:\n{out}");
+        assert!(!render_dot(&report).contains("style=dashed"));
+    }
+
+    // --- the text report -------------------------------------------------
+
+    #[test]
+    fn render_report_leads_with_a_census_then_lists_both_queues() {
+        let report = Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![
+                row("ADR-001", Some("accepted"), false, &[], &[]),
+                row("BUG-003", Some("open"), true, &[], &[]),
+                row("SPEC-006", Some("draft"), false, &["ADR-008"], &["ADR-008"]),
+            ],
+        };
+        insta::assert_snapshot!(render_report(&report), @r"
+        3 documents · 1 ready · 1 blocked · 1 settled
+
+        ready:
+          BUG-003  open
+
+        blocked:
+          SPEC-006  draft  ← ADR-008
 
         tip: --format json for agents, mermaid/dot for diagrams
         ");
     }
 
     #[test]
-    fn render_names_the_source_and_chains_on_one_line() {
-        let resolution = Resolution {
-            dag: dag::chain_dag(&["PRD".to_string(), "ADR".to_string()]),
-            source: DagSource::Default,
+    fn render_report_says_so_when_nothing_is_open() {
+        let report = Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![row("ADR-001", Some("accepted"), false, &[], &[])],
         };
-        assert_eq!(render_text(&resolution), "source: default\nPRD → ADR\n");
+        let out = render_report(&report);
+        assert!(out.contains("1 documents · 0 ready · 0 blocked · 1 settled"), "out:\n{out}");
+        assert!(out.contains("nothing open."), "out:\n{out}");
     }
 
     #[test]
-    fn render_branching_dag_prints_one_edge_per_line() {
-        // A declared diamond (ADR/DESIGN require PRD; SPEC requires both)
-        // renders one edge per line — the branching shape is not a chain.
-        let mut config = config_with_namespaces(&["ADR", "DESIGN", "PRD", "SPEC"]);
-        with_dep_shape(&mut config, "ADR", &["PRD"], &[]);
-        with_dep_shape(&mut config, "DESIGN", &["PRD"], &[]);
-        with_dep_shape(&mut config, "SPEC", &["ADR", "DESIGN"], &[]);
-        let resolution = resolve_dag(&config).unwrap();
-        assert_eq!(
-            render_text(&resolution),
-            "source: declared\n\
-             ADR → SPEC\n\
-             DESIGN → SPEC\n\
-             PRD → ADR\n\
-             PRD → DESIGN\n"
-        );
-    }
-
-    #[test]
-    fn render_empty_dag_says_no_stages() {
-        let resolution = Resolution {
-            dag: dag::chain_dag(&[]),
-            source: DagSource::Default,
+    fn render_report_names_the_lineage_and_its_shared_roots() {
+        let report = Report {
+            lineage: Some("ADR-117".to_string()),
+            shared: vec!["ADR-115".to_string()],
+            documents: vec![row("ADR-117", Some("accepted"), false, &[], &[])],
         };
-        assert_eq!(render_text(&resolution), "source: default\n(no stages)\n");
+        let out = render_report(&report);
+        assert!(out.contains("lineage: ADR-117"), "out:\n{out}");
+        assert!(out.contains("shared with: ADR-115"), "out:\n{out}");
     }
 }

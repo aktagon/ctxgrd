@@ -33,6 +33,21 @@ scan = [
 Without `[references]`, the scanner is dormant — ctxgrd's behaviour
 matches earlier versions exactly.
 
+### Rule enablement and dedup
+
+Scanner hits are diagnostics of the same `core.cross-ref` rule code
+that checks markdown bodies, and the per-namespace `rules` lists gate
+both sides: the scanner runs only when **at least one** namespace
+enables `core.cross-ref` (in zero-config mode it is enabled by
+default). Removing the rule from every namespace silences code-file
+hits too — no need to delete the `[references]` block.
+
+Dedup also mirrors the markdown side: a stale ID mentioned several
+times in one file yields **one** diagnostic per `(file, target)`,
+anchored at the first occurrence, with the total mention count in the
+note. Mentions in different files, or of different targets, are
+separate diagnostics.
+
 ### Do NOT include markdown documents
 
 The walker already tokenises every document body, with code-span and

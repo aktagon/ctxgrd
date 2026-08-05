@@ -23,8 +23,10 @@
 pub(crate) mod agent_guide;
 pub(crate) mod ast;
 pub(crate) mod builtin_rules;
+pub use builtin_rules::builtin_param_names;
 pub mod changelog;
 pub mod config;
+pub(crate) mod coverage;
 pub(crate) mod dag;
 pub mod diagnostic;
 pub mod document;
@@ -43,6 +45,7 @@ pub mod reporter;
 pub(crate) mod rules;
 pub mod run;
 pub mod scaffold;
+pub mod serve;
 pub mod source;
 pub mod status;
 pub(crate) mod subprocess;

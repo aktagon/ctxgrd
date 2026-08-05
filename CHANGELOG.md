@@ -6,6 +6,113 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-08-05
+
+### Changed
+
+- Bind core.acceptance-complete where a terminal status means delivered, and let a namespace require checkboxes (ADR-122)
+
+### Fixed
+
+- `docs/guides/cli-reference.md` documents the `changelog` and `serve` commands, and points at `ctxgrd rules` instead of carrying a hand-copied rule list that had drifted since 0.46.0 (BUG-044)
+- `ctxgrd status --help` describes what the command actually reports; it had still been advertising the stage machinery removed in ADR-118 (BUG-045)
+- ADR-119 still cites `--format claude-stop` as the turn-end selector five weeks after ADR-062 removed it, and the removal was never recorded in CHANGELOG.md at all (BUG-047)
+- Config discovery does not walk up, so running ctxgrd from a subdirectory silently degrades to zero-config and still reports `ok` — and ctxgrd is the only member of the family that behaves this way (BUG-048)
+- `ctxgrd rules` reports an empty rule set for a zero-config run that `lint` says applied six rules, so the two commands contradict each other about the same tree (BUG-049)
+- every exit-2 path emits nothing on stdout, so `--format json` yields an empty stream and the contract ctxgrd authored makes its own `exit_code: 2` unreachable (BUG-058)
+
+## [2.0.1] — 2026-08-02
+
+### Changed
+
+- Split the settled vocabulary from the arming one (ADR-121)
+
+### Fixed
+
+- `ctxgrd status` no longer reports `rejected` or `deferred` documents as ready — the readiness census now reads its own settled vocabulary instead of the one that arms the dependency rules (BUG-037)
+
+## [2.0.0] — 2026-08-02
+
+### Changed
+
+- Commit-pinned document validity via a namespace-agnostic core.commit-freshness rule (ADR-040)
+- A framework-neutral security pack modeling the security-document lifecycle (ADR-041)
+- Keep the lint engine in-crate; defer crate extraction (ADR-065)
+- Per-regulation compliance packs (gdpr, hipaa) over the security base, not a monolithic compliance pack (ADR-066)
+- No behaviour change — `core.successor-link` shipped in v0.48.0 and is bound on [ADR], [PRD] and [PMR]. This records the decision, whose status had lagged the implementation by three releases; the release note stays under [0.48.0], where the rule landed (ADR-073)
+- Claude Code SessionStart mode — a non-blocking status inject for agent orientation (ADR-074)
+- A c4 pack — architecture-diagram docs typed by the C4 model level (ADR-075)
+- Packs as the single source of truth for authoring skills, with namespace coverage gates (ADR-076)
+- A checklist pack (generic completion gate); stripe structure deferred (ADR-078)
+- An intake pack — CR (JSM-Change-shaped) and FEEDBACK (ceremony-light), superseding the fold-CR-into-project-docs idea (ADR-079)
+- Agent-scoped verification — a pack/namespace scope flag on lint (ADR-080)
+- Git-derived changelog generation from the document graph (ADR-084)
+- A GitHub App checklist recipe (developer + integrator), grounded and freshness-checked (ADR-090)
+- AXI agent-experience corrections (ADR-094)
+- core.dep-status — a terminal document may not depend on a non-terminal one (ADR-106)
+- Per-document readiness in status --format json — the work queue an agent reads (ADR-107)
+- Document-granularity graph export — draw the depends_on graph, not the namespace chain (ADR-108)
+- core.file-budget — a document stays under its character budget (ADR-109)
+- Bind core.dep-status on the pack namespaces whose documents declare edges (ADR-110)
+- The conditional link rules must resolve their own target, and may not accept the host document's own id (ADR-112)
+- pack show --format json emits the complete namespace contract (ADR-113)
+- POLICY requires its freshness field, the compliance status vocabulary stays open by decision, and the family spells the review field one way (ADR-114)
+- A nis2 pack — the Article 21(2) measures register and the Article 23 incident register (ADR-115)
+- An eu-ai-act pack — the obligation register and the Article 27 fundamental rights impact assessment (ADR-116)
+- A ccpa pack — a separate sibling of gdpr, pivoting on the sale/sharing determination (ADR-117)
+- Remove the namespace stage layer — readiness comes from depends_on, not from a declared stage order (ADR-118)
+- An empty claim must not report clean (ADR-119)
+- `consumed` is now part of the shared terminal-status vocabulary, so a consumed HANDOFF counts as settled in `ctxgrd status` and may be depended upon without `core.dep-status` firing. BREAKING for any project whose `consumed` documents were relied on being non-terminal. `deferred` was proposed alongside it and declined: it is terminal for the claim protocol but not for dependency, because deferred work has not happened (ADR-120)
+
+### Fixed
+
+- Pipeline is modeled as a list, not a DAG: a total order forced on a partial order (BUG-008)
+- A nested ctxgrd.toml is silently ignored by a parent (non-recursive) run, which governs its subtree with the parent's rules (BUG-017)
+- `ctxgrd pack add checklist` now produces a config that resolves. The generated `[CHECKLIST]` block ships `[CHECKLIST."core.required-headings"]` with an empty `headings` list instead of leaving the params table commented out, which made every subsequent command in the repo exit 2 with `cfg.rule-params-missing`. A new test walks every shipped pack through init + add + rules (BUG-020)
+- An inline `@TODO.md` import is eager to Claude Code but invisible to agents.context-headings, which reports the opposite problem and can be silenced into a clean-but-eager state (BUG-029)
+- A `depends_on` reference to a document that does not exist satisfies every conditional evidence rule in the compliance and security packs; the rules test token presence, never resolution (BUG-030)
+- security.remediation-link is satisfied by the finding's own id, and `ctxgrd new VULN` scaffolds an H1 containing it, so every mitigated finding self-satisfies from birth (BUG-031)
+- A path-claim glob with a literal leading segment un-prunes every ignored directory beneath it, so `node_modules` is ingested despite `[ignore]` (BUG-034)
+- The work queue is filtered to the staged namespaces, so 91 of 212 documents — every `BUG` and every `HANDOFF` among them — never reach it, and `status --exit-code` cannot certify a finished feature (BUG-036)
+- The `found:` trailer now counts kernel messages as well as diagnostics, and is emitted for a kernel-only run. Previously a run whose only finding was a kernel message printed the message, no `found:` line (the renderer returned early on empty diagnostics) and no `ok:` line either (suppressed by that same message), leaving the finding on screen with nothing summarising it (BUG-039)
+- New kernel error `cfg.rule-inert`: a namespace that binds a file-level rule alongside `core.id` is now reported at config load instead of having the rule silently skipped while `ctxgrd rules` listed it as active and the lint summary counted it. BREAKING — a config in that state now emits an error where it previously ran quiet (BUG-040)
+- `status --format json` emits a shape its own published schema rejects, so `make check` is red and any agent validating against the contract fails on every run (BUG-041)
+- `ctxgrd status`'s three census buckets now partition the corpus: `ready`, `blocked` and `settled` are all keyed on `DocState`, so a terminal document pointing at open work is counted once (settled) instead of twice, and is disclosed by name under `settled on open work:` rather than printed under `blocked:`. BREAKING — `status --exit-code` now returns 0 for a corpus whose only block is a finished document pointing at open work; gating that edge is `core.dep-status`'s job and it is opt-in (BUG-042)
+
+## [0.69.0] — 2026-07-20
+
+### Changed
+
+- The stripe-integration-web pack (INTSTRIPE) — ctxgrd's presence leg of the Stripe verification triad (ADR-085)
+- The *grd family command-output contract (ADR-086)
+- Add @stripe.app-scope — the shared-account webhook-scoping anchor (INTSTRIPE) (ADR-087)
+- A ROADMAP namespace — Now-Next-Later initiatives on the dependency graph (ADR-088)
+- PRD mandatory when enabled — bind core.min-docs on the PRD namespace (ADR-089)
+- core.file-name — the filename number must match the id number (ADR-091)
+- A governance pack — the DEC program decision register, distinct from ADR (ADR-092)
+- research pack — evidence-honest deep-research reports (ADR-093)
+- rules document their configurable attributes (structured params + self-lint) (ADR-095)
+- full command-surface review against the agent-native output contract (ADR-096)
+- ctxgrd serve — local graph-aware doc viewer (ADR-097)
+- qa pack — pinned Test Completion Report namespace (ADR-098)
+- Bind core.acceptance-complete on the ADR namespace (Open Questions) (ADR-099)
+- marketing pack — CAMPAIGN/PERSONA/POSITIONING/ICP strategy artifacts (ADR-100)
+- enforcement ladder — prefer compile-time contracts over CI drift-tests (ADR-101)
+- agents.ai-fingerprints — a deterministic AI-writing-fingerprint rule for the instruction-file packs (ADR-102)
+- serve renders id-less file-level documents (ADR-103)
+- A PRODUCT namespace — linting the strategic half of the design-context pair (ADR-104)
+- A HANDOFF namespace — governing the session-continuity store (ADR-105)
+
+### Fixed
+
+- Namespaces listing core.id stay on the id pipeline even when they enable the generic file-level rules (core.required-headings/anchors) — restores core.frontmatter/core.id on claimed files (BUG-001 regression), ends double-linting, and un-inflates the document count. core.required-headings now matches normalized (enumerator stripped, trailing colon dropped, case-insensitive) on BOTH dispatch paths, as ADR-078 documents (BUG-021)
+- `ctxgrd refs` now matches depends_on entries and reference-scanner hits on the parsed (namespace, number) pair, so the hit set no longer depends on the query's zero-padding (BUG-022)
+- Inline code spans now contribute their text to heading/link/strikethrough text (as rendered, without backticks), so core.required-headings matches headings like `## Run \`make check\` first` configured markup-free (BUG-023)
+- An unreadable file no longer aborts the whole lint: a path-claimed file that cannot be read gets a per-file src.markdown-read diagnostic (exit 1) and the walk continues; an unclaimed one is skipped, mirroring the BUG-011 decode policy (BUG-024)
+- Scanner-side core.cross-ref is now gated on at least one namespace enabling the rule (disabling it everywhere silences code-file hits too) and dedupes per (file, target) — one diagnostic at the first occurrence with the mention count in the note, mirroring the markdown side (BUG-025)
+- A closing frontmatter fence with trailing spaces/tabs (`--- `) is now accepted; YAML's `...` document-end marker stays rejected (wontfix) but the error now names the near-miss instead of the generic missing-fence text (BUG-026)
+- The Tarjan SCC module comment now says recursive (it claimed iterative) and states the stack-depth bound; the explicit-stack rewrite is deferred to the LSP work (BUG-027)
+
 <!-- ctxgrd:cutover — hand-authored history below is not regenerated (ADR-084 § CHG-006) -->
 
 ## [0.52.0] — 2026-07-06

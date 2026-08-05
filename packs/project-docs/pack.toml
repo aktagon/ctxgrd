@@ -1,4 +1,4 @@
-# summary: ADR, PRD, RFC, BUG doc types plus the TODO state file and the README front door — engineering doc lifecycle with status vocabularies, required headings, and a README that links the entry guide.
+# summary: ADR, PRD, ROADMAP, RFC, BUG doc types plus the TODO state file and the README front door — engineering doc lifecycle with status vocabularies, required headings, and a README that links the entry guide.
 
 [ADR]
 paths = ["docs/adrs/**"]
@@ -8,15 +8,45 @@ rules = [
   "core.id-unique",
   "core.dep-resolved",
   "core.dep-cycle",
+  "core.dep-status",
   "core.cross-ref",
   "core.required-headings",
   "core.required-metadata",
   "core.allowed-values",
   "core.successor-link",
+  "core.acceptance-complete",
 ]
 
 [ADR."core.required-headings"]
 headings = ["Status", "Context", "Requirements", "Consequences", "Open Questions", "References", "Change log"]
+
+# An accepted/rejected/superseded ADR must resolve every `- [ ]` checkbox under
+# Open Questions (ADR-099). ADRs carry neither Acceptance nor Definition of Done,
+# so scan Open Questions instead of the rule's default headings.
+#
+# `require_checkboxes` below extends that to plain `-`/`*` bullets, so read the
+# two settings together: with the flag on, a prose bullet under Open Questions
+# is an error too. Lines inside fenced code blocks and thematic breaks
+# (`- - -`) are excluded — an example is not a question.
+#
+# Two known gaps, both deliberate: `1.` numbered items and `+` bullets are not
+# counted (widening the match would fail previously-clean documents — BUG-055),
+# and `rejected` is not a terminal status here, so a rejected ADR is never
+# gated at all.
+[ADR."core.acceptance-complete"]
+headings = ["Open Questions"]
+# ADR-122 § ACC-006. Without this the rule only sees GFM task items, so an Open
+# Questions section written as prose bullets is invisible and the ADR reports
+# clean because nothing is *checkable* — not because anything is resolved. That
+# was the dominant case: 94 of ctxgrd's own 119 terminal ADRs, making the
+# ADR-099 binding ~93% inert in the repo that shipped it.
+#
+# Shipped ON in the pack because a greenfield project pays nothing for it — it
+# has no ADRs yet, so there is no migration, and `ctxgrd init` gives it a check
+# that works from the first document. An existing repo is unaffected until it
+# runs `pack migrate` (copy-not-reference, ADR 013 § PACK-001), and adoption is
+# consumer-initiated precisely so the migration lands when that repo chooses.
+require_checkboxes = true
 
 [ADR."core.required-metadata"]
 keys = ["id", "title", "status", "date"]
@@ -32,12 +62,14 @@ rules = [
   "core.id-unique",
   "core.dep-resolved",
   "core.dep-cycle",
+  "core.dep-status",
   "core.cross-ref",
   "core.required-headings",
   "core.required-metadata",
   "core.allowed-values",
   "core.successor-link",
   "ears.clause-syntax",
+  "core.min-docs",
 ]
 
 [PRD."core.required-headings"]
@@ -49,6 +81,35 @@ keys = ["id", "title", "status"]
 [PRD."core.allowed-values"]
 status = ["draft", "accepted", "superseded"]
 
+# ROADMAP — Now-Next-Later initiatives (ADR-088). One id-claimed file per
+# initiative; the NNL horizon is carried as `status`, and cross-initiative
+# blocking rides `depends_on` (core.dep-resolved/dep-cycle) rather than a
+# "Dependencies" heading. Mandatory when enabled (core.min-docs, RDM-006) —
+# a project that claims ROADMAP but writes no initiatives drops the rule or
+# does not claim the namespace, mirroring the [README] precedent.
+[ROADMAP]
+paths = ["docs/roadmap/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.min-docs",
+]
+
+[ROADMAP."core.required-headings"]
+headings = ["Problem", "Outcome", "Ideas", "Success Metrics"]
+
+[ROADMAP."core.required-metadata"]
+keys = ["id", "title", "status", "date", "owner"]
+
+[ROADMAP."core.allowed-values"]
+status = ["now", "next", "later", "done", "dropped"]
+
 [RFC]
 paths = ["docs/rfcs/**"]
 rules = [
@@ -57,6 +118,7 @@ rules = [
   "core.id-unique",
   "core.dep-resolved",
   "core.dep-cycle",
+  "core.dep-status",
   "core.cross-ref",
   "core.required-headings",
   "core.required-metadata",
@@ -101,9 +163,13 @@ keys = ["id", "title", "status"]
 [BUG."core.allowed-values"]
 status = ["open", "fixed", "wontfix", "invalid", "duplicate"]
 
+# core.file-budget (ADR-109 § BDG-004): TODO.md is the file that grows without
+# bound — appended to every session, never pruned — and the one a reader hits a
+# ceiling on first. The default budget is 150000 characters (Claude Code's own
+# read-time warning threshold); set `max_chars` below to tighten it.
 [TODO]
 paths = ["TODO.md"]
-rules = ["todo.freshness", "todo.structure"]
+rules = ["todo.freshness", "todo.structure", "core.file-budget"]
 
 [TODO."todo.freshness"]
 stale_days = 30

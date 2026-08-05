@@ -8,7 +8,7 @@
 # file is Claude-specific.
 [CLAUDE]
 paths = ["CLAUDE.md"]
-rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
+rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache", "writing.ai-fingerprints"]
 
 # CLAUDESKILLS — Claude Code SKILL.md definitions (agentskills.io convention).
 # Path-claimed, id-less: SKILL.md has name/description but no id:, so it lints via

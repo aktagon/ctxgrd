@@ -1,0 +1,117 @@
+# summary: marketing — the markdown-documentable marketing-strategy artifacts on the dependency-free side of the CRM line: CAMPAIGN briefs, buyer PERSONAs, POSITIONING, and the ICP, each a structured record grounded in a named framework.
+#
+# The marketing strategy artifacts that live as docs-as-code — durable,
+# reviewable, framework-grounded records — as opposed to the operational
+# marketing data (individual prospect/lead records, lead scores, UTM tables,
+# per-contact enrichment) that belongs in the CRM (Salesforce/HubSpot), NOT in
+# markdown. That CRM/markdown line is the pack's scope boundary: if a user wants
+# lead data linted, that is external-source-script territory, never a namespace.
+# ADR-100.
+#
+# Four path-claimed, id-less namespaces (the filename is the slug, like the
+# GUIDE/RESEARCH packs — these artifacts are singleton strategy docs, not an
+# id-keyed dependency graph). The greenfield default globs are docs/marketing/**;
+# a project that keeps its strategy elsewhere overrides `paths` (this repo points
+# them at docs/strategy/**, exactly as the governance pack points [DEC] at
+# docs/strategy/decisions/).
+#
+# One custom rule, everything else core.*. `marketing.frontmatter` exists for a
+# single hard reason: the genre discriminator must be nested (`marketing.type`)
+# to avoid the SSG-reserved top-level `type:` (BUG-015), and core.allowed-values
+# validates top-level keys only. It is a monotonic opt-in (the research.type
+# shape, ADR-093): a doc MAY declare `marketing.type`, and when it does the value
+# must be in the `types` allowlist; absent, it adds nothing — which is why the one
+# live, frontmatter-less CAMPAIGN placeholder binds it harmlessly. The four genres
+# are config-driven, not baked into the binary.
+#
+# The required-headings skeletons are sourced, not imagined (ADR-100 research):
+#   PERSONA     — Adele Revella's 5 Rings of Buying Insight (Buyer Personas, 2015)
+#   POSITIONING — Geoffrey Moore ∩ April Dunford (the five cross-framework universals)
+#   ICP         — the consolidated B2B firmographic/technographic standard
+# CAMPAIGN is deliberately minimal today: its one real brief is a frontmatter-less
+# placeholder, so it binds only core.min-docs and a LOOSE core.required-headings
+# (Overview + Success metrics, both present in the live file). Tightening
+# required-headings is a breaking MAJOR bump, so the greenfield genres pin only
+# the framework-universal sections and CAMPAIGN is tightened once a real brief
+# format exists.
+
+# CAMPAIGN — a campaign brief. Deliberately minimal and id-less today (ADR-100):
+# the one live brief is a frontmatter-less placeholder, so this binds only a loose
+# structure. marketing.frontmatter is bound for uniformity — monotonic, so it is a
+# no-op on a brief that declares no `marketing.type`.
+[CAMPAIGN]
+paths = ["docs/marketing/campaigns/**"]
+rules = ["marketing.frontmatter", "core.required-headings", "core.min-docs"]
+
+[CAMPAIGN."marketing.frontmatter"]
+types = ["campaign", "persona", "positioning", "icp"]
+
+# Loose on purpose — the two sections every campaign brief already carries.
+# Tightening this list is a MAJOR bump; extract the full brief shape from real
+# briefs before adding to it (ADR-100).
+[CAMPAIGN."core.required-headings"]
+headings = ["Overview", "Success metrics"]
+
+# PERSONA — a buyer persona. The five sections are Adele Revella's 5 Rings of
+# Buying Insight (Buyer Personas, Wiley 2015; Buyer Persona Institute), the
+# framework-universal, indivisible ring set. Demographics/role are context, not
+# rings, and are deliberately not required. Config-overridable if your persona
+# model differs.
+[PERSONA]
+paths = ["docs/marketing/personas/**"]
+rules = ["marketing.frontmatter", "core.required-headings", "core.min-docs"]
+
+[PERSONA."marketing.frontmatter"]
+types = ["campaign", "persona", "positioning", "icp"]
+
+[PERSONA."core.required-headings"]
+headings = [
+    "Priority Initiatives",
+    "Success Factors",
+    "Perceived Barriers",
+    "Buyer's Journey",
+    "Decision Criteria",
+]
+
+# POSITIONING — a positioning statement/canvas. The five sections are the
+# cross-framework universals where Geoffrey Moore's positioning statement
+# (Crossing the Chasm) and April Dunford's positioning canvas (Obviously Awesome)
+# agree. Moore-only (a literal Positioning Statement heading) and Dunford-only
+# (Relevant Trends) sections were verified and excluded to keep the skeleton
+# stable.
+[POSITIONING]
+paths = ["docs/marketing/positioning/**"]
+rules = ["marketing.frontmatter", "core.required-headings", "core.min-docs"]
+
+[POSITIONING."marketing.frontmatter"]
+types = ["campaign", "persona", "positioning", "icp"]
+
+[POSITIONING."core.required-headings"]
+headings = [
+    "Target Customer",
+    "Market Category",
+    "Competitive Alternatives",
+    "Unique Attributes",
+    "Key Benefit",
+]
+
+# ICP — the Ideal Customer Profile: an account-level definition, not a person.
+# The five sections are the consolidated B2B standard (firmographic/technographic
+# segmentation — Gartner/ZoomInfo/Kalungi/TK Kader), the sections universal across
+# named sources. Macro Trends (vendor-specific) and Buying Committee (overlaps the
+# persona, edges to individual-level) were verified and excluded.
+[ICP]
+paths = ["docs/marketing/icp/**"]
+rules = ["marketing.frontmatter", "core.required-headings", "core.min-docs"]
+
+[ICP."marketing.frontmatter"]
+types = ["campaign", "persona", "positioning", "icp"]
+
+[ICP."core.required-headings"]
+headings = [
+    "Firmographics",
+    "Technographics",
+    "Pain Points",
+    "Buying Triggers",
+    "Disqualification Criteria",
+]

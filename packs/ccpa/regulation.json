@@ -1,0 +1,97 @@
+{
+  "_note": "Catalog read off the California Civil Code as published by the California Legislative Counsel (leginfo.legislature.ca.gov), Division 3, Part 4, Title 1.81.5 -- the CCPA as amended by the CPRA -- retrieved 2026-07-30. Not an EUR-Lex regime: the authority is the California statute, and the retrieval path is codes_displaySection.xhtml?lawCode=CIV&sectionNum=<n>. Verified section subjects: 1798.100 general duties and notice at collection; 1798.105 right to delete; 1798.106 right to correct; 1798.110 right to know/access; 1798.115 right to know what is sold or shared and to whom; 1798.120 right to opt out of sale or sharing; 1798.121 right to limit use and disclosure of sensitive personal information; 1798.125 non-retaliation; 1798.130 notice, disclosure, correction and deletion methods; 1798.135 methods of limiting sale, sharing and use; 1798.136 opt-out preference signal; 1798.140 definitions; 1798.145 exemptions. Two definitions are load-bearing and were quoted from 1798.140: 'sell' at subdivision (ad) turns on transfer to a THIRD PARTY for monetary or other valuable consideration; 'share' at subdivision (ah) turns on transfer to a third party for CROSS-CONTEXT BEHAVIORAL ADVERTISING. They are separate definitions with separate triggers, so a category of personal information can be BOTH sold and shared -- CR-007 proposed `disposition = sold | shared | neither` and that enumeration is incomplete; `both` is added. 1798.140 also separates 'service provider' (ag), 'contractor' (j) and 'third party' (ai): a disclosure to a service provider or contractor under a conforming written contract is not a sale, which is exactly what the SPA register exists to evidence. 1798.100(a)(3) requires the retention period (or the criteria for determining it) in the notice at collection, which is why `retention_period` is required metadata here. 1798.130 sets a 45-day response deadline for a verifiable consumer request with a further 45-day extension; the consumer request log is deliberately NOT modelled -- see the CCPA namespace comment.",
+  "edition": "California Civil Code, Division 3, Part 4, Title 1.81.5 (CCPA as amended by the CPRA)",
+  "summary": "CCPA/CPRA processing register (CCPA) and service-provider agreement register (SPA) over the security base — California Civil Code Title 1.81.5, Cal. Civ. Code §§ 1798.100/1798.140. Paperwork existence/metadata/freshness only, never legal adequacy.",
+  "depends": [
+    "security"
+  ],
+  "vocabularies": {
+    "disposition": {
+      "cite": "Cal. Civ. Code § 1798.140(ad) ('sell') and § 1798.140(ah) ('share') — separate definitions, so a category may be both",
+      "values": [
+        "sold",
+        "shared",
+        "both",
+        "neither"
+      ]
+    },
+    "recipient_class": {
+      "cite": "Cal. Civ. Code § 1798.140(ag) ('service provider'), (j) ('contractor'), (ai) ('third party')",
+      "values": [
+        "service-provider",
+        "contractor",
+        "third-party"
+      ]
+    }
+  },
+  "namespaces": [
+    {
+      "name": "CCPA",
+      "comment": "CCPA/CPRA notice-at-collection and processing-purpose register (Cal. Civ. Code § 1798.100, ADR-117). ROPA-shaped, with the pivotal difference held in a closed vocabulary: the CCPA has no lawful basis, it has a sale/sharing determination. `disposition` is the field the Do-Not-Sell/Do-Not-Share and opt-out-preference-signal duties hang off (§§ 1798.120, 1798.135, 1798.136), and getting it wrong is the highest-value defect this register can catch — the same structural role `lawful_basis` plays in gdpr's ROPA. Four values, not three: § 1798.140(ad) defines 'sell' by transfer to a third party for valuable consideration and § 1798.140(ah) defines 'share' by transfer for cross-context behavioral advertising, so one category can be both. `retention_period` is required because § 1798.100(a)(3) requires the retention period, or the criteria for determining it, in the notice at collection itself. THE CONSUMER REQUEST LOG IS DELIBERATELY NOT MODELLED: verifiable consumer requests are high-volume operational records on a 45-day clock (§ 1798.130), one markdown document per request is the wrong instrument, and a namespace inviting it would produce a register nobody maintains. The PROCEDURE for handling them is a POLICY this register cross-refs. ctxgrd checks that a disposition was recorded, never that it was determined correctly — whether a given disclosure is a sale is a legal question. The `status` vocabulary is open (ADR-114 § STV-001); the freshness field is `reviewed_date` (ADR-114 § FLD-001).",
+      "paths": [
+        "docs/compliance/ccpa/processing/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.dep-resolved",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "core.calendar-freshness"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "purpose",
+        "disposition",
+        "retention_period",
+        "owner",
+        "reviewed_date"
+      ],
+      "allowed_values": [
+        "disposition"
+      ],
+      "calendar_freshness": {
+        "field": "reviewed_date",
+        "stale_days": 365
+      }
+    },
+    {
+      "name": "SPA",
+      "comment": "CCPA service-provider / contractor agreement register (Cal. Civ. Code § 1798.100(d) and the § 1798.140(ag)/(j)/(ai) definitions, ADR-117). DPA-shaped: the contractual terms that keep a disclosure from being a sale. `recipient_class` is the field that matters — § 1798.140 separates 'service provider' (ag), 'contractor' (j) and 'third party' (ai), and a disclosure to the first two under a conforming written contract is not a sale while the same disclosure to a third party is. So a CCPA processing record whose `disposition` is `neither` is asserting, implicitly, that every recipient is a service provider or contractor under contract; this register is where that assertion is evidenced. ctxgrd checks that an agreement record exists, is dated, and names its party and class. It does NOT read the contract, and the § 1798.100(d) term list is not checkable from frontmatter — a green lint here means the paperwork exists, never that the contract contains the required terms.",
+      "paths": [
+        "docs/compliance/ccpa/agreements/**"
+      ],
+      "rules": [
+        "core.frontmatter",
+        "core.id",
+        "core.id-unique",
+        "core.dep-resolved",
+        "core.cross-ref",
+        "core.required-metadata",
+        "core.allowed-values",
+        "core.calendar-freshness"
+      ],
+      "required_metadata": [
+        "id",
+        "title",
+        "status",
+        "party",
+        "recipient_class",
+        "executed_date",
+        "owner",
+        "reviewed_date"
+      ],
+      "allowed_values": [
+        "recipient_class"
+      ],
+      "calendar_freshness": {
+        "field": "reviewed_date",
+        "stale_days": 365
+      }
+    }
+  ]
+}

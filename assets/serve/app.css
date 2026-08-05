@@ -1,0 +1,281 @@
+/* ctxgrd serve — read-only doc viewer (ADR-097 § SRV-003).
+   Theme-neutral, no external fonts or assets. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #6a6a6a;
+  --line: #e2e2e2;
+  --accent: #2957d6;
+  --code-bg: #f5f5f7;
+  --done: #2e7d32;
+  --current: #2957d6;
+  --pending: #8a8a8a;
+  --blocked: #c62828;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16171a;
+    --fg: #e8e8ea;
+    --muted: #9a9aa2;
+    --line: #2c2e33;
+    --accent: #7fa0ff;
+    --code-bg: #202226;
+    --done: #6fce74;
+    --current: #7fa0ff;
+    --pending: #9a9aa2;
+    --blocked: #ff7b7b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--fg);
+  background: var(--bg);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.55;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.5rem;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+
+.topbar .brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  text-decoration: none;
+  color: var(--fg);
+}
+
+.topbar nav a {
+  margin-right: 1rem;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.topbar nav a:hover {
+  color: var(--accent);
+}
+
+main {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+h1 {
+  font-size: 1.6rem;
+}
+
+h2 {
+  font-size: 1.2rem;
+  margin-top: 2rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.3rem;
+}
+
+.doc-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+}
+
+.doc-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.doc-list a {
+  font-weight: 600;
+  text-decoration: none;
+  min-width: 6rem;
+}
+
+.doc-list .title {
+  color: var(--muted);
+  flex: 1;
+}
+
+.badge {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.doc-head {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.doc-id {
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.deps {
+  margin-top: 0.6rem;
+  font-size: 0.9rem;
+}
+
+.deps-label {
+  color: var(--muted);
+  margin-right: 0.3rem;
+}
+
+.dep {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  text-decoration: none;
+  margin-right: 0.3rem;
+}
+
+.dep-unresolved {
+  color: var(--muted);
+  border-style: dashed;
+}
+
+.doc-body pre {
+  background: var(--code-bg);
+  padding: 0.9rem 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+}
+
+.doc-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}
+
+.doc-body :not(pre) > code {
+  background: var(--code-bg);
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.3rem;
+}
+
+.doc-body table {
+  border-collapse: collapse;
+}
+
+.doc-body th,
+.doc-body td {
+  border: 1px solid var(--line);
+  padding: 0.35rem 0.6rem;
+}
+
+.xref {
+  text-decoration: none;
+  border-bottom: 1px dotted var(--accent);
+}
+
+/* Pipeline stage-columns (SRV-003). */
+.pipeline-source {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.stage {
+  flex: 1 1 10rem;
+  min-width: 9rem;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--pending);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+}
+
+.stage-done {
+  border-top-color: var(--done);
+}
+
+.stage-current {
+  border-top-color: var(--current);
+}
+
+.stage-blocked {
+  border-top-color: var(--blocked);
+}
+
+.stage h2 {
+  margin: 0;
+  border: none;
+  font-size: 1.05rem;
+}
+
+.stage-state {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+.stage-docs {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+}
+
+.stage-docs a {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  text-decoration: none;
+}
+
+.stage-held {
+  color: var(--blocked);
+  font-size: 0.82rem;
+  margin: 0.4rem 0 0;
+}
+
+.blockers {
+  border: 1px solid var(--blocked);
+  border-radius: 0.5rem;
+  padding: 0.5rem 1rem;
+  margin: 1rem 0;
+}
+
+.blockers a {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.next-action {
+  font-weight: 600;
+}
+
+.empty {
+  color: var(--muted);
+}

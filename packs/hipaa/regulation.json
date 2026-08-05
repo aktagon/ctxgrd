@@ -61,6 +61,7 @@
         "core.frontmatter",
         "core.id",
         "core.id-unique",
+        "core.dep-resolved",
         "core.cross-ref",
         "core.required-metadata",
         "core.allowed-values",
@@ -87,6 +88,7 @@
         "core.frontmatter",
         "core.id",
         "core.id-unique",
+        "core.dep-resolved",
         "core.cross-ref",
         "core.required-metadata",
         "core.calendar-freshness"

@@ -1,0 +1,50 @@
+# summary: CCPA/CPRA processing register (CCPA) and service-provider agreement register (SPA) over the security base — California Civil Code Title 1.81.5, Cal. Civ. Code §§ 1798.100/1798.140. Paperwork existence/metadata/freshness only, never legal adequacy.
+# depends: security
+
+# CCPA/CPRA notice-at-collection and processing-purpose register (Cal. Civ. Code § 1798.100, ADR-117). ROPA-shaped, with the pivotal difference held in a closed vocabulary: the CCPA has no lawful basis, it has a sale/sharing determination. `disposition` is the field the Do-Not-Sell/Do-Not-Share and opt-out-preference-signal duties hang off (§§ 1798.120, 1798.135, 1798.136), and getting it wrong is the highest-value defect this register can catch — the same structural role `lawful_basis` plays in gdpr's ROPA. Four values, not three: § 1798.140(ad) defines 'sell' by transfer to a third party for valuable consideration and § 1798.140(ah) defines 'share' by transfer for cross-context behavioral advertising, so one category can be both. `retention_period` is required because § 1798.100(a)(3) requires the retention period, or the criteria for determining it, in the notice at collection itself. THE CONSUMER REQUEST LOG IS DELIBERATELY NOT MODELLED: verifiable consumer requests are high-volume operational records on a 45-day clock (§ 1798.130), one markdown document per request is the wrong instrument, and a namespace inviting it would produce a register nobody maintains. The PROCEDURE for handling them is a POLICY this register cross-refs. ctxgrd checks that a disposition was recorded, never that it was determined correctly — whether a given disclosure is a sale is a legal question. The `status` vocabulary is open (ADR-114 § STV-001); the freshness field is `reviewed_date` (ADR-114 § FLD-001).
+[CCPA]
+paths = ["docs/compliance/ccpa/processing/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.calendar-freshness",
+]
+
+[CCPA."core.required-metadata"]
+keys = ["id", "title", "status", "purpose", "disposition", "retention_period", "owner", "reviewed_date"]
+
+[CCPA."core.allowed-values"]
+disposition = ["sold", "shared", "both", "neither"]
+
+[CCPA."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 365
+
+# CCPA service-provider / contractor agreement register (Cal. Civ. Code § 1798.100(d) and the § 1798.140(ag)/(j)/(ai) definitions, ADR-117). DPA-shaped: the contractual terms that keep a disclosure from being a sale. `recipient_class` is the field that matters — § 1798.140 separates 'service provider' (ag), 'contractor' (j) and 'third party' (ai), and a disclosure to the first two under a conforming written contract is not a sale while the same disclosure to a third party is. So a CCPA processing record whose `disposition` is `neither` is asserting, implicitly, that every recipient is a service provider or contractor under contract; this register is where that assertion is evidenced. ctxgrd checks that an agreement record exists, is dated, and names its party and class. It does NOT read the contract, and the § 1798.100(d) term list is not checkable from frontmatter — a green lint here means the paperwork exists, never that the contract contains the required terms.
+[SPA]
+paths = ["docs/compliance/ccpa/agreements/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.calendar-freshness",
+]
+
+[SPA."core.required-metadata"]
+keys = ["id", "title", "status", "party", "recipient_class", "executed_date", "owner", "reviewed_date"]
+
+[SPA."core.allowed-values"]
+recipient_class = ["service-provider", "contractor", "third-party"]
+
+[SPA."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 365

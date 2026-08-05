@@ -8,6 +8,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "core.allowed-values",
@@ -28,6 +29,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "core.calendar-freshness",
@@ -47,6 +49,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
 ]

@@ -1,0 +1,54 @@
+# summary: NIS2 cybersecurity risk-management register (NIS2) and Article 23 incident register (NIS2INC) over the security base — Directive (EU) 2022/2555 Arts. 20, 21(2) and 23. Paperwork existence/metadata/freshness only, never conformance to the statutory reporting clock.
+# depends: security
+
+# NIS2 cybersecurity risk-management register (Directive (EU) 2022/2555 Arts. 20 and 21, ADR-115). One document per Article 21(2) measure, the measure id projected from the closed ten-point catalog into core.allowed-values. The cleanest closed vocabulary in this family: Article 21(2) enumerates exactly ten measures, (a) through (j), and cannot grow without an amending act. `entity_class` (essential or important, Art. 3(1)/(2)) rides every row because it selects the supervision model and the reporting duties, so a register that does not record which class it was built against cannot say whether it is complete. core.evidence-link over `measure` requires each in-scope measure to cite an implementing POLICY/ADR or an `evidence_link`. Measure 21(2)(f) — assessing the EFFECTIVENESS of the measures — is the row clients skip, and it is the one whose evidence is properly a SECREV record rather than a policy: a policy asserting that effectiveness is assessed is not an assessment. Article 20(1) requires the MANAGEMENT BODY to approve the Article 21 measures, so the register's highest-value cross-ref is a dated approval (a POLICY or a DEC record) — ctxgrd checks that one is cited, never that the body was competent to give it. The `status` vocabulary is deliberately open (ADR-114 § STV-001); the freshness field is `reviewed_date`, one spelling across this family (ADR-114 § FLD-001).
+[NIS2]
+paths = ["docs/compliance/nis2/measures/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.calendar-freshness",
+  "core.evidence-link",
+]
+
+[NIS2."core.required-metadata"]
+keys = ["id", "title", "status", "measure", "entity_class", "owner", "reviewed_date"]
+
+[NIS2."core.allowed-values"]
+measure = ["21(2)(a)", "21(2)(b)", "21(2)(c)", "21(2)(d)", "21(2)(e)", "21(2)(f)", "21(2)(g)", "21(2)(h)", "21(2)(i)", "21(2)(j)"]
+entity_class = ["essential", "important"]
+
+[NIS2."core.calendar-freshness"]
+field = "reviewed_date"
+stale_days = 365
+
+[NIS2."core.evidence-link"]
+field = "measure"
+evidence-fields = ["evidence_link"]
+out-of-scope-status = ["not-applicable"]
+
+# NIS2 Article 23 significant-incident register (ADR-115). One document per significant incident, carrying the staged reporting record: `awareness_date` (the anchor for Art. 23(4)(a) and (b)), `notification_date` (the anchor the final report runs from under Art. 23(4)(d) — NOT awareness), `report_stage`, and `significance_basis` from the closed two-limb Art. 23(3) test. WHAT CTXGRD CHECKS HERE IS THE RECORD, NOT THE CLOCK. Article 23(4) sets 24 hours for the early warning and 72 hours for the incident notification, both from becoming aware; ctxgrd's date primitives are day-granular (YYYY-MM-DD), so it cannot distinguish 2 elapsed hours from 46 across one date boundary and does not pretend to. It requires the dates to be present and well-formed so a human or an auditor can compute conformance; a rule that scored the hour-granular deadline from dates alone would be a false green, which is the defect class ADR-112 exists to close. The one-month final-report window IS day-expressible and is filed for `core.date-interval` (ADR-115 Open Questions), not shipped. NO core.min-docs binding, deliberately: most entities have never filed a report, and a namespace seeded with a minimum-document count would pressure an entity to invent one. The artifact actually under review is the PROCEDURE — who declares an incident significant, against which criteria, and who files — which belongs in a POLICY the register cross-refs. Trust service providers get 24 hours rather than 72 under the Art. 23(4) derogation; that distinction is not modelled because it changes an hour-granular deadline ctxgrd does not score.
+[NIS2INC]
+paths = ["docs/compliance/nis2/incidents/**"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.cross-ref",
+  "core.required-metadata",
+  "core.allowed-values",
+]
+
+[NIS2INC."core.required-metadata"]
+keys = ["id", "title", "status", "entity_class", "significance_basis", "report_stage", "awareness_date", "owner"]
+
+[NIS2INC."core.allowed-values"]
+entity_class = ["essential", "important"]
+significance_basis = ["23(3)(a)", "23(3)(b)"]
+report_stage = ["early-warning", "incident-notification", "intermediate-report", "final-report", "progress-report"]

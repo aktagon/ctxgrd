@@ -1,0 +1,10 @@
+# pack: marketing
+[CAMPAIGN]
+paths = ["docs/marketing/campaigns/**"]
+rules = ["marketing.frontmatter", "core.required-headings", "core.min-docs"]
+
+[CAMPAIGN."marketing.frontmatter"]
+types = ["campaign", "persona", "positioning", "icp"]
+
+[CAMPAIGN."core.required-headings"]
+headings = ["Overview", "Success metrics"]

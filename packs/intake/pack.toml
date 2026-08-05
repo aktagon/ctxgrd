@@ -16,6 +16,7 @@ rules = [
     "core.frontmatter",
     "core.id",
     "core.id-unique",
+    "core.dep-status",
     "core.cross-ref",
     "core.required-headings",
     "core.required-metadata",

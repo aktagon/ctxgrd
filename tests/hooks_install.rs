@@ -29,77 +29,7 @@ fn run_hooks_install(root: &Path, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn install_writes_executable_precommit_hook_that_runs_ctxgrd() {
-    let tmp = git_repo_tempdir();
-
-    let output = run_hooks_install(tmp.path(), &[]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "install exits 0 in a git repo"
-    );
-
-    let hook = tmp.path().join(".git/hooks/pre-commit");
-    assert!(hook.is_file(), "pre-commit hook written");
-
-    let body = fs::read_to_string(&hook).expect("hook readable");
-    assert!(body.starts_with("#!/bin/sh"), "hook is a POSIX sh script");
-    assert!(
-        body.contains("exec ctxgrd --root"),
-        "hook delegates to ctxgrd; got:\n{body}"
-    );
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&hook).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o755, "hook is executable (0o755)");
-    }
-}
-
-#[test]
-fn install_refuses_to_clobber_existing_hook_without_force() {
-    let tmp = git_repo_tempdir();
-    let hooks_dir = tmp.path().join(".git/hooks");
-    fs::create_dir_all(&hooks_dir).unwrap();
-    let hook = hooks_dir.join("pre-commit");
-    let original = "#!/bin/sh\necho existing\n";
-    fs::write(&hook, original).unwrap();
-
-    let output = run_hooks_install(tmp.path(), &[]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "refusing to clobber exits 2 (kernel error)"
-    );
-    assert_eq!(
-        fs::read_to_string(&hook).unwrap(),
-        original,
-        "existing hook is left byte-identical"
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("--force"), "error names the --force remedy");
-}
-
-#[test]
-fn install_force_overwrites_existing_hook() {
-    let tmp = git_repo_tempdir();
-    let hooks_dir = tmp.path().join(".git/hooks");
-    fs::create_dir_all(&hooks_dir).unwrap();
-    let hook = hooks_dir.join("pre-commit");
-    fs::write(&hook, "#!/bin/sh\necho existing\n").unwrap();
-
-    let output = run_hooks_install(tmp.path(), &["--force"]);
-    assert_eq!(output.status.code(), Some(0), "--force install exits 0");
-    let body = fs::read_to_string(&hook).unwrap();
-    assert!(
-        body.contains("exec ctxgrd --root"),
-        "hook overwritten with the ctxgrd hook"
-    );
-}
-
-#[test]
-fn dry_run_prints_script_and_writes_nothing() {
+fn dry_run_previews_the_plan_and_writes_nothing() {
     let tmp = git_repo_tempdir();
 
     let output = run_hooks_install(tmp.path(), &["--dry-run"]);
@@ -107,8 +37,20 @@ fn dry_run_prints_script_and_writes_nothing() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("exec ctxgrd --root"),
-        "dry-run prints the hook script; got:\n{stdout}"
+        stdout.contains("would install"),
+        "dry-run previews the plan; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("10-ctxgrd"),
+        "dry-run names the composable fragment; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("core.hooksPath .githooks"),
+        "dry-run says it would set core.hooksPath; got:\n{stdout}"
+    );
+    assert!(
+        !tmp.path().join(".githooks").exists(),
+        "dry-run writes no .githooks tree"
     );
     assert!(
         !tmp.path().join(".git/hooks/pre-commit").exists(),
@@ -181,6 +123,162 @@ fn git_repo_with_hooks_path(dir: &str) -> Option<tempfile::TempDir> {
     git(tmp.path(), &["init", "-q"]);
     git(tmp.path(), &["config", "core.hooksPath", dir]);
     Some(tmp)
+}
+
+/// A real git repo with `core.hooksPath` left unset — the fresh-repo default the
+/// installer establishes. Returns `None` (test skips) when `git` is unavailable.
+fn git_repo_default() -> Option<tempfile::TempDir> {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return None;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    git(tmp.path(), &["init", "-q"]);
+    Some(tmp)
+}
+
+/// Read `git config --get core.hooksPath`, trimmed; empty string when unset.
+fn read_hooks_path(root: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "core.hooksPath"])
+        .output()
+        .expect("git config runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+// HOOK-010: the fresh-repo default installs the tracked `.githooks/` composable
+// hook and sets `core.hooksPath` — wrkgrd's posture — never an untracked
+// `.git/hooks/pre-commit`.
+
+#[test]
+fn default_install_writes_tracked_githooks_and_sets_hooks_path() {
+    let Some(tmp) = git_repo_default() else {
+        return;
+    };
+
+    let output = run_hooks_install(tmp.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "default install exits 0");
+
+    let fragment = tmp.path().join(".githooks/pre-commit.d/10-ctxgrd");
+    let runner = tmp.path().join(".githooks/pre-commit");
+    let setup = tmp.path().join("scripts/setup-hooks.sh");
+    assert!(fragment.is_file(), "ctxgrd installed as 10-ctxgrd fragment");
+    assert!(runner.is_file(), "shared run-parts runner written");
+    assert!(setup.is_file(), "fresh-clone bootstrap written");
+    assert!(
+        !tmp.path().join(".git/hooks/pre-commit").exists(),
+        "never writes an untracked .git/hooks/pre-commit"
+    );
+    assert_eq!(
+        read_hooks_path(tmp.path()),
+        ".githooks",
+        "core.hooksPath is set to the tracked directory"
+    );
+
+    let body = fs::read_to_string(&fragment).expect("fragment readable");
+    assert!(
+        body.contains("exec ctxgrd --root \".\""),
+        "fragment ends in the ctxgrd invocation; got:\n{body}"
+    );
+    let setup_body = fs::read_to_string(&setup).expect("setup readable");
+    assert!(
+        setup_body.contains("config core.hooksPath .githooks"),
+        "bootstrap sets core.hooksPath; got:\n{setup_body}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in [&fragment, &runner, &setup] {
+            let mode = fs::metadata(f).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{} is executable (0o755)", f.display());
+        }
+    }
+}
+
+#[test]
+fn default_install_leaves_a_preexisting_git_hooks_precommit_untouched() {
+    let Some(tmp) = git_repo_default() else {
+        return;
+    };
+    // A stale hand-written hook under the *untracked* .git/hooks — the installer
+    // moves to .githooks and must not touch it (it clobbers nothing).
+    let stale = tmp.path().join(".git/hooks/pre-commit");
+    let original = "#!/bin/sh\necho pre-existing hook\n";
+    fs::write(&stale, original).unwrap();
+
+    let output = run_hooks_install(tmp.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "install exits 0");
+    assert_eq!(
+        fs::read_to_string(&stale).unwrap(),
+        original,
+        "the pre-existing .git/hooks/pre-commit is left byte-identical"
+    );
+    assert!(
+        tmp.path().join(".githooks/pre-commit.d/10-ctxgrd").is_file(),
+        "ctxgrd's gate lands in the tracked .githooks tree"
+    );
+}
+
+#[test]
+fn force_is_a_noop_and_reinstall_is_idempotent() {
+    let Some(tmp) = git_repo_default() else {
+        return;
+    };
+    assert_eq!(run_hooks_install(tmp.path(), &[]).status.code(), Some(0));
+    let fragment = tmp.path().join(".githooks/pre-commit.d/10-ctxgrd");
+    let first = fs::read_to_string(&fragment).unwrap();
+
+    // Re-running with --force is accepted and changes nothing (the drop-in never
+    // clobbers, so there is nothing to force).
+    assert_eq!(
+        run_hooks_install(tmp.path(), &["--force"]).status.code(),
+        Some(0),
+        "--force re-install exits 0 (no refuse-without-force in the drop-in path)"
+    );
+    assert_eq!(
+        fs::read_to_string(&fragment).unwrap(),
+        first,
+        "re-install leaves ctxgrd's fragment byte-identical"
+    );
+    assert_eq!(
+        read_hooks_path(tmp.path()),
+        ".githooks",
+        "core.hooksPath stays .githooks"
+    );
+}
+
+#[test]
+fn custom_hookspath_is_respected_not_overridden() {
+    let Some(tmp) = git_repo_with_hooks_path(".myhooks") else {
+        return;
+    };
+
+    let output = run_hooks_install(tmp.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "install exits 0");
+
+    assert!(
+        tmp.path().join(".myhooks/pre-commit.d/10-ctxgrd").is_file(),
+        "ctxgrd composes into the user's custom hooksPath"
+    );
+    assert!(
+        !tmp.path().join(".githooks").exists(),
+        "does not create a .githooks tree beside the custom hooksPath"
+    );
+    assert!(
+        !tmp.path().join("scripts/setup-hooks.sh").exists(),
+        "does not write a bootstrap that would fight the custom hooksPath"
+    );
+    assert_eq!(
+        read_hooks_path(tmp.path()),
+        ".myhooks",
+        "the user's custom core.hooksPath is left unchanged"
+    );
 }
 
 #[test]

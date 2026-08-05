@@ -1,0 +1,67 @@
+# summary: DEC — a program/governance decision register (docs/decisions/[0-9]*.md): one id-keyed markdown record per material program decision, carrying the decision, its rationale, cross-cutting impact, and the approving authority. First member of the RAID+ register family (ADR-092).
+#
+# One markdown doc per material decision (docs/decisions/NNN-<slug>.md), id-keyed,
+# carrying the decision, its rationale, cross-cutting impact, and the approving
+# authority. The directory listing IS the decision register; a human index at
+# docs/decisions/README.md co-exists (the glob claims only numbered docs).
+#
+# Filenames are NNN-<slug>.md — numbered, with the namespace carried by the id
+# (`id: DEC-<n>`) and not repeated in the filename, the same convention as
+# ADR/PRD/RFC/BUG/CR/PORT. The [0-9]* shape is what reserves the directory for
+# records while leaving README.md (and any other non-record page) unclaimed —
+# the same technique the port pack uses on docs/ports/[0-9]*.md (CR-006).
+#
+# Deliberately NOT the ADR namespace: an ADR records a technical/architecture
+# decision (status proposed/accepted/superseded; Context/Decision/Consequences;
+# owned by engineering at docs/adrs/). A DECISION is a program/strategic/governance
+# decision — it emphasizes AUTHORITY (who decided) and cross-cutting IMPACT (scope,
+# cost, schedule, benefits, risk, stakeholders) over technical consequences, and
+# runs a governance lifecycle (proposed -> pending -> approved/rejected/deferred ->
+# superseded). Grounded in the program-management decision-register standard
+# (UK Gov project-delivery guidance; PMO RAID / decision-log practice).
+#
+# id-keyed series: docs/decisions/[0-9]*.md is a glob (a directory of documents), so
+# ctxgrd treats it like ADR/ROADMAP/PMR — each doc carries `id: DEC-<n>`. `depends_on`
+# edges hold ONLY DEC->DEC supersession links (acyclicity enforced by core.dep-cycle;
+# core.dep-resolved/core.cross-ref key off the same ids). External evidence — a board
+# paper, change request, or meeting minute — goes in a free-form `evidence:` key, NOT
+# depends_on, so a reference to a non-ctxgrd artifact never trips dep-resolved. A
+# superseded decision must name its successor (core.successor-link). No core.min-docs:
+# installing the pack never forces a decision to exist, so it is safe to install ahead
+# of writing one. Reusable across any project; point `paths` at your decisions dir if
+# it differs (e.g. the ceo skill uses docs/strategy/decisions/[0-9]*.md).
+
+[DEC]
+paths = ["docs/decisions/[0-9]*.md"]
+rules = [
+  "core.frontmatter",
+  "core.id",
+  "core.id-unique",
+  "core.dep-resolved",
+  "core.dep-cycle",
+  "core.cross-ref",
+  "core.required-headings",
+  "core.required-metadata",
+  "core.allowed-values",
+  "core.successor-link",
+]
+
+# Decision:  what was decided (the outcome).
+# Rationale: why this option — the deciding reasoning.
+# Impact:    the cross-cutting consequences — scope, cost, schedule, benefits, risk,
+#            stakeholders. This is what distinguishes a program decision from a
+#            technical one.
+# Approval:  the deciding authority and the date decided.
+[DEC."core.required-headings"]
+headings = ["Decision", "Rationale", "Impact", "Approval"]
+
+# id / title / status as usual; `decision-maker` names the accountable authority (the
+# DECISION-distinguishing field — a decision without a decision-maker is not governed);
+# `date` is the date decided / last-reviewed.
+[DEC."core.required-metadata"]
+keys = ["id", "title", "status", "decision-maker", "date"]
+
+# Governance lifecycle: proposed -> pending (awaiting authority) -> approved | rejected
+# | deferred -> superseded (replaced by a newer decision; link it via depends_on).
+[DEC."core.allowed-values"]
+status = ["proposed", "pending", "approved", "rejected", "deferred", "superseded"]

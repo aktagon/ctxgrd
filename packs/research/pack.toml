@@ -1,0 +1,39 @@
+# summary: RESEARCH — deep-research reports (docs/research/**) kept evidence-honest: a sources/evidence section is required and a limitations/data-gaps section is nudged, with optional per-genre skeleton routing.
+# Deep-research reports (ChatGPT/Claude/Gemini research mode, the `deep-research`
+# skill) are a distinct genre: a multi-source cited synthesis. They are
+# path-claimed at docs/research/**, id-less and frontmatter-light — the filename
+# slug is the identity, no `id:` is required (like the GUIDE namespace, ADR-055,
+# not the id-claim ADR/PRD shape). The surveyed corpus confirms none carry
+# frontmatter today.
+#
+# The genre's trust signal is not link density (citations are deep-research
+# cite-tokens, not markdown links — the corpus has zero links) but disclosed
+# provenance. `research.evidence` therefore lints structure only, at two
+# severities that track the genre's standard:
+#   - evidence/sources section missing  → error   (References/citations/Works
+#     Cited is standard across academic, market, and AI-report genres)
+#   - limitations/data-gaps section missing → warning (a dedicated gaps heading
+#     is good practice but not an industry convention; tune via the rule's
+#     `severity` / `gaps_headings` params)
+# core.min-docs nudges that an adopted docs/research/ folder is non-empty.
+#
+# OPTIONAL per-genre routing (monotonic opt-in). A report may declare its genre
+# with a `research.type` frontmatter field, nested under a `research` object
+# (never a top-level `type:`, which SSGs reserve, BUG-015):
+#     research:
+#       type: academic   # or: market | deep-research
+# Absent → only the baseline above runs (the common case). Present and valid →
+# `research.evidence` ADDITIONALLY warns once per missing genre-skeleton heading
+# (academic → method/result, market → methodology/recommendation, deep-research
+# → summary/conclusion). Present and invalid → one error. The field only ever
+# ADDS findings — it never unlocks a passing state — so an author optimising for
+# a clean lint has every incentive to omit it. See `ctxgrd rules
+# research.evidence` for the full param and vocabulary reference.
+#
+# No dependency rules (dep-resolved/dep-cycle/cross-ref/successor-link) — id-less
+# reports have no `depends_on` graph. No core.allowed-values — the rule
+# self-validates `research.type` against its closed vocabulary. ADR-093.
+
+[RESEARCH]
+paths = ["docs/research/**"]
+rules = ["research.evidence", "core.min-docs"]

@@ -8,4 +8,4 @@
 # Gemini-specific.
 [GEMINI]
 paths = ["GEMINI.md"]
-rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache"]
+rules = ["agents.context-headings", "agents.context-budget", "agents.context-cache", "writing.ai-fingerprints"]

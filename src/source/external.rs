@@ -129,18 +129,29 @@ pub(crate) fn run_activated_sources(
     root: &Path,
     discovered: &BTreeMap<String, DiscoveredSource>,
     activations: &BTreeMap<String, Value>,
+    expect_min: &BTreeMap<String, u32>,
 ) -> SourceRunResult {
     let mut result = SourceRunResult::default();
     for (name, params) in activations {
         let Some(source) = discovered.get(name) else {
             continue;
         };
-        run_one(source, params, root, &mut result);
+        let floor = expect_min
+            .get(name)
+            .copied()
+            .unwrap_or(crate::config::DEFAULT_SOURCE_EXPECT_MIN);
+        run_one(source, params, root, floor, &mut result);
     }
     result
 }
 
-fn run_one(source: &DiscoveredSource, params: &Value, root: &Path, result: &mut SourceRunResult) {
+fn run_one(
+    source: &DiscoveredSource,
+    params: &Value,
+    root: &Path,
+    expect_min: u32,
+    result: &mut SourceRunResult,
+) {
     let env = build_env(params, &source.name);
     let spawn_result = subprocess::run(&source.run_path, &[], &env, root, SOURCE_TIMEOUT);
 
@@ -184,7 +195,36 @@ fn run_one(source: &DiscoveredSource, params: &Value, root: &Path, result: &mut 
         }
     }
 
+    // ADR-119 § CLM-002. Every failure path above returns early, so
+    // reaching here is exactly the precondition the requirement names:
+    // the source ran to completion. Counting the delta rather than
+    // filtering by name keeps this exact when several sources are active.
+    let before = result.envelopes.len();
     parse_envelopes(&source.name, &output.stdout_utf8(), result);
+    let emitted = result.envelopes.len() - before;
+
+    if emitted < expect_min as usize {
+        result.messages.push(
+            KernelMessage::warning(
+                "src.too-few-documents",
+                format!(
+                    "source '{}' emitted {} of an expected minimum of {}",
+                    source.name, emitted, expect_min
+                ),
+            )
+            .with_help(format!(
+                "check the `run` script for source '{}', or lower `expect_min` \
+                 under [sources.{}] — 0 accepts a source that may legitimately \
+                 emit nothing",
+                source.name, source.name
+            ))
+            .with_note(
+                "the source exited cleanly, so nothing else reports this — \
+                 without the floor the run would be indistinguishable from \
+                 one where every document passed",
+            ),
+        );
+    }
 }
 
 fn build_env(params: &Value, name: &str) -> Env {
@@ -268,12 +308,74 @@ printf '%s\n' '{"id":"JIRA-2","body":"","location":"y"}'
         let discovered = discover_sources(tmp.path());
         let mut activations: BTreeMap<String, Value> = BTreeMap::new();
         activations.insert("stub".to_string(), Value::Object(Default::default()));
-        let result = run_activated_sources(tmp.path(), &discovered, &activations);
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &BTreeMap::new());
 
         assert!(result.messages.is_empty());
         assert_eq!(result.envelopes.len(), 2);
         assert_eq!(result.envelopes[0].1.id, "JIRA-1");
         assert_eq!(result.envelopes[1].1.id, "JIRA-2");
+    }
+
+    /// ADR-119 § CLM-002, the FEEDBACK-008 repro: a source that exits 0
+    /// without writing to stdout. Before the floor this run was
+    /// byte-identical to one where every document passed.
+    #[test]
+    fn run_warns_when_a_source_emits_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_source(tmp.path(), "statute", "#!/bin/sh\nexit 0\n");
+        let discovered = discover_sources(tmp.path());
+        let mut activations = BTreeMap::new();
+        activations.insert("statute".to_string(), Value::Object(Default::default()));
+
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &BTreeMap::new());
+
+        assert!(result.envelopes.is_empty());
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].code, "src.too-few-documents");
+        assert_eq!(
+            result.messages[0].severity,
+            crate::diagnostic::Severity::Warning
+        );
+        assert!(result.messages[0].message.contains("statute"));
+    }
+
+    /// The escape hatch for a source that may legitimately emit nothing.
+    #[test]
+    fn run_stays_silent_when_expect_min_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_source(tmp.path(), "optional", "#!/bin/sh\nexit 0\n");
+        let discovered = discover_sources(tmp.path());
+        let mut activations = BTreeMap::new();
+        activations.insert("optional".to_string(), Value::Object(Default::default()));
+        let expect_min = BTreeMap::from([("optional".to_string(), 0u32)]);
+
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &expect_min);
+
+        assert!(result.messages.is_empty());
+    }
+
+    /// The partial-emit case `core.min-docs` cannot express: a source
+    /// that emits some documents but not all of them. FEEDBACK-008 item 2.
+    #[test]
+    fn run_warns_when_a_source_emits_fewer_than_declared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+printf '%s\n' '{"id":"CLAUSE-1","body":"","location":"a"}'
+printf '%s\n' '{"id":"CLAUSE-2","body":"","location":"b"}'
+printf '%s\n' '{"id":"CLAUSE-3","body":"","location":"c"}'
+"#;
+        write_source(tmp.path(), "statute", script);
+        let discovered = discover_sources(tmp.path());
+        let mut activations = BTreeMap::new();
+        activations.insert("statute".to_string(), Value::Object(Default::default()));
+        let expect_min = BTreeMap::from([("statute".to_string(), 8u32)]);
+
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &expect_min);
+
+        assert_eq!(result.envelopes.len(), 3);
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].code, "src.too-few-documents");
+        assert!(result.messages[0].message.contains("3 of an expected minimum of 8"));
     }
 
     #[test]
@@ -285,7 +387,7 @@ printf '%s\n' '{"id":"JIRA-2","body":"","location":"y"}'
         let mut activations = BTreeMap::new();
         activations.insert("broken".to_string(), Value::Object(Default::default()));
 
-        let result = run_activated_sources(tmp.path(), &discovered, &activations);
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &BTreeMap::new());
         assert!(result.envelopes.is_empty());
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].code, "src.runtime-error");
@@ -305,7 +407,7 @@ printf '%s\n' '{"id":"JIRA-2","body":"","location":"y"}'
         let mut activations = BTreeMap::new();
         activations.insert("chatty".to_string(), Value::Object(Default::default()));
 
-        let result = run_activated_sources(tmp.path(), &discovered, &activations);
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &BTreeMap::new());
         assert_eq!(result.envelopes.len(), 2);
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].code, "src.doc-malformed");
@@ -328,7 +430,7 @@ printf '%s\n' '{"id":"JIRA-2","body":"","location":"y"}'
         let params: Value = serde_json::json!({"key": "val"});
         activations.insert("echo-env".to_string(), params);
 
-        let _ = run_activated_sources(tmp.path(), &discovered, &activations);
+        let _ = run_activated_sources(tmp.path(), &discovered, &activations, &BTreeMap::new());
 
         let written = fs::read_to_string(&marker).expect("script wrote env file");
         let lines: Vec<&str> = written.lines().collect();
@@ -342,7 +444,7 @@ printf '%s\n' '{"id":"JIRA-2","body":"","location":"y"}'
         let discovered = discover_sources(tmp.path());
         let mut activations = BTreeMap::new();
         activations.insert("phantom".to_string(), Value::Object(Default::default()));
-        let result = run_activated_sources(tmp.path(), &discovered, &activations);
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &BTreeMap::new());
         assert!(result.envelopes.is_empty());
         assert!(result.messages.is_empty());
     }
@@ -363,7 +465,7 @@ printf '%s\n' '{"id":"JIRA-2","body":"","location":"y"}'
         let mut activations = BTreeMap::new();
         activations.insert("noexec".to_string(), Value::Object(Default::default()));
 
-        let result = run_activated_sources(tmp.path(), &discovered, &activations);
+        let result = run_activated_sources(tmp.path(), &discovered, &activations, &BTreeMap::new());
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].code, "src.runtime-error");
         // Message mentions the source name.

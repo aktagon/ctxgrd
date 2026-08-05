@@ -11,11 +11,11 @@
 # ancestor check (`fetch-depth: 0`); it degrades to a warning in a shallow clone
 # rather than a false error.
 #
-# core.required-headings is generic and config-driven: bound here but shipped with
-# no `headings` (a bare checklist requires no particular sections). Supply the
-# section set per project — e.g. the seven-phase Stripe integration shape below,
-# uncommented. The state lives under `status`, never a top-level `type:` (an
-# SSG-reserved layout key, BUG-015). ADR-078.
+# core.required-headings is generic and config-driven: bound here and shipped with
+# an empty `headings` list (a bare checklist requires no particular sections).
+# Supply the section set per project — e.g. the seven-phase Stripe integration
+# shape below, uncommented. The state lives under `status`, never a top-level
+# `type:` (an SSG-reserved layout key, BUG-015). ADR-078.
 
 [CHECKLIST]
 paths = ["docs/checklists/**"]
@@ -28,17 +28,25 @@ rules = [
 
 # Required H2 sections. Config-driven, not baked into the binary: matching strips a
 # leading enumerator (`1.`, `A.`) and is case-insensitive, so a heading may be
-# numbered (`## 1. Plan / account structure`) while the config is not. Left empty
-# by default — a bare checklist asserts no particular sections. Uncomment and adapt
-# to require a shape, e.g. the Stripe web-integration checklist (ADR-078 § CHK-006):
+# numbered (`## 1. Plan / account structure`) while the config is not.
 #
-# [CHECKLIST."core.required-headings"]
-# headings = [
-#     "Plan / account structure",
-#     "API key provisioning",
-#     "Secret storage",
-#     "Implement",
-#     "Test",
-#     "Go-live",
-#     "Post-go-live",
-# ]
+# Empty by default — a bare checklist asserts no particular sections. The table
+# must be present even so: `core.required-headings` is a parameterised rule, and a
+# binding without its params sub-table is a hard `cfg.rule-params-missing` at
+# config load, which took down every subsequent command in the repo the pack was
+# added to (BUG-020). "Requires no sections" is an empty list, not an absent table.
+#
+# Replace with a real shape to gate one, e.g. the Stripe web-integration checklist
+# (ADR-078 § CHK-006):
+#
+#     headings = [
+#         "Plan / account structure",
+#         "API key provisioning",
+#         "Secret storage",
+#         "Implement",
+#         "Test",
+#         "Go-live",
+#         "Post-go-live",
+#     ]
+[CHECKLIST."core.required-headings"]
+headings = []

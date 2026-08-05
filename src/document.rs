@@ -52,7 +52,7 @@ pub struct Document {
 /// Every entry in `locations` is the `location` field of a colliding
 /// document. The vector is sorted so the reporter output is stable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdCollision {
+pub(crate) struct IdCollision {
     pub id: DocumentId,
     pub locations: Vec<String>,
 }
@@ -62,7 +62,7 @@ pub struct IdCollision {
 ///
 /// Output is sorted by `DocumentId` (namespace then number) so the
 /// caller's diagnostic output is byte-reproducible across runs.
-pub fn find_id_collisions(docs: &[Document]) -> Vec<IdCollision> {
+pub(crate) fn find_id_collisions(docs: &[Document]) -> Vec<IdCollision> {
     let mut buckets: BTreeMap<DocumentId, Vec<String>> = BTreeMap::new();
     for d in docs {
         buckets

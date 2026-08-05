@@ -202,6 +202,7 @@ mod tests {
             params: BTreeMap::new(),
             paths: Some(glob_set(patterns)),
             path_patterns: patterns.iter().map(|s| (*s).to_owned()).collect(),
+            owner: None,
         }
     }
 
@@ -211,6 +212,7 @@ mod tests {
             params: BTreeMap::new(),
             paths: None,
             path_patterns: Vec::new(),
+            owner: None,
         }
     }
 

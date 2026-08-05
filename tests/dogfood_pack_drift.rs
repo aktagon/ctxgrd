@@ -2,6 +2,9 @@
 //! packs for the namespaces both define (`project-docs`: ADR, PRD;
 //! `ops`: RUN, PMR).
 //!
+//! `project-docs` also ships ROADMAP (ADR-088), but this repo does not
+//! claim it locally yet — so there is nothing to compare for it here.
+//!
 //! Packs are applied by copy, not by reference (ADR-013 PACK-001), so
 //! nothing at lint time reconciles the dogfood config with the pack.
 //! This test is that reconciliation: edit one shape without the other
@@ -48,6 +51,32 @@ fn assert_shapes_match(pack_toml: &str, pack_label: &str, namespaces: &[&str]) {
 #[test]
 fn repo_config_adr_prd_shapes_match_project_docs_pack() {
     assert_shapes_match(PROJECT_DOCS_PACK, "project-docs", &["ADR", "PRD"]);
+}
+
+/// The `[ADR."core.acceptance-complete"]` sub-block (ADR-099) is not a member of
+/// `SHAPE_TABLES` — those are uniform across every namespace, and only ADR binds
+/// this rule. Guard its `headings` param here so the pack and this repo's
+/// `ctxgrd.toml` cannot drift apart silently.
+#[test]
+fn repo_config_adr_acceptance_complete_matches_project_docs_pack() {
+    let repo: Value = REPO_CONFIG.parse().expect("repo ctxgrd.toml is valid TOML");
+    let pack: Value = PROJECT_DOCS_PACK
+        .parse()
+        .expect("project-docs pack.toml is valid TOML");
+    let table = "core.acceptance-complete";
+    let repo_table = repo
+        .get("ADR")
+        .and_then(|v| v.get(table))
+        .unwrap_or_else(|| panic!("ctxgrd.toml [ADR.\"{table}\"] missing"));
+    let pack_table = pack
+        .get("ADR")
+        .and_then(|v| v.get(table))
+        .unwrap_or_else(|| panic!("project-docs pack.toml [ADR.\"{table}\"] missing"));
+    assert_eq!(
+        repo_table, pack_table,
+        "[ADR.\"{table}\"] drifted between ctxgrd.toml and \
+         packs/project-docs/pack.toml — update both together"
+    );
 }
 
 #[test]

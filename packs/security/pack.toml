@@ -12,6 +12,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-headings",
   "core.required-metadata",
@@ -41,6 +42,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "core.allowed-values",
@@ -52,6 +54,18 @@ rules = [
 [VULN."core.required-metadata"]
 keys = ["id", "title", "status", "severity", "discovered_date"]
 
+# VULN is the ONE namespace in this family with a declared `status`
+# vocabulary, and that is deliberate — its four values are read by rules
+# (`security.risk-expiry` keys on `accepted`, `security.remediation-link` on
+# `mitigated`), so a typo would silently disarm a check.
+#
+# Do not generalise from it (ADR-114 § STV-001). `status` is free text in every
+# other namespace here and in the gdpr/hipaa/soc2/iso-27001/nist-800-53 packs:
+# `status: banana` on a POLICY or a control lints clean. That is a decision, not
+# an omission — a compliance program's lifecycle words are its own, and forcing
+# one set would push authors to mislabel rather than to describe. The one
+# machine-read value elsewhere is `not-applicable` on the three control
+# registers; see their `out-of-scope-status` blocks.
 [VULN."core.allowed-values"]
 severity = ["critical", "high", "medium", "low", "info"]
 status = ["open", "mitigated", "accepted", "false-positive"]
@@ -70,10 +84,20 @@ severity = "error"
 require-when-status = "accepted"
 exempt-when-links = "RISK"
 
-# A mitigated finding must cross-ref (or depend_on) its remediation —
-# an ADR or tracker id — so the fix is falsifiable, not "trust me".
+# A mitigated finding must cross-ref (or depend_on) its remediation, so the
+# fix is falsifiable, not "trust me". Both vocabularies are declared rather
+# than left to their defaults because the vocabulary IS the rule (BUG-031):
+# the link must resolve to a real ADR in this tree, or the fix must be named
+# explicitly in `remediation_link` as an external tracker reference. Before
+# BUG-031 any token satisfied this — including the finding's OWN id, which
+# `ctxgrd new VULN` scaffolds into the body H1, so every scaffolded finding
+# passed the moment it was marked `mitigated`. Widen `accepted-namespaces`
+# if remediations land here as some other document type; do NOT widen it
+# back to "any id", which is the state that made the rule decorative.
 [VULN."security.remediation-link"]
 require-when-status = "mitigated"
+accepted-namespaces = ["ADR"]
+remediation-fields = ["remediation_link"]
 
 # Risk acceptances (ADR-041 SEC-005): signed and time-boxed. Every
 # acceptance carries an approver, a rationale, and a future-dated
@@ -85,6 +109,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "security.risk-expiry",
@@ -103,6 +128,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "core.allowed-values",
@@ -129,6 +155,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "core.commit-freshness",
@@ -149,13 +176,22 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "core.calendar-freshness",
 ]
 
+# `reviewed_date` is required, not optional (ADR-114 § FRS-001). It is the
+# field core.calendar-freshness ages, and while it was absent from these keys
+# the rule was unreachable in the worst direction: a three-year-old date
+# *warned*, while deleting the field entirely was silent and clean — so the
+# cheapest way to clear the warning was to destroy the evidence of review.
+# Every sibling namespace carrying a freshness field already requires it
+# (SECREV, DPIA, BAA, and the three control registers); POLICY was the only
+# exception.
 [POLICY."core.required-metadata"]
-keys = ["id", "title", "status", "owner", "approved_by"]
+keys = ["id", "title", "status", "owner", "approved_by", "reviewed_date"]
 
 [POLICY."core.calendar-freshness"]
 field = "reviewed_date"
@@ -169,6 +205,7 @@ rules = [
   "core.frontmatter",
   "core.id",
   "core.id-unique",
+  "core.dep-resolved",
   "core.cross-ref",
   "core.required-metadata",
   "core.allowed-values",

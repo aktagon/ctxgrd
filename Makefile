@@ -28,7 +28,7 @@ endif
 
 BIN := $(TARGET_DIR)/$(TARGET)/ctxgrd
 
-.PHONY: help build install install-debug uninstall test ci check lint fmt clean run-example
+.PHONY: help build install install-debug uninstall test ci check lint fmt clean run-example adr-lint changelog-check command-json-check release-status
 
 help:
 	@echo "ctxgrd — Makefile targets"
@@ -39,10 +39,14 @@ help:
 	@echo "  uninstall    Remove ctxgrd from $(BINDIR)/"
 	@echo "  test         Run all tests"
 	@echo "  ci           check + test — the canonical gate"
-	@echo "  check        cargo check + cargo clippy -D warnings"
+	@echo "  check        adr-lint + changelog-check + command-json-check,"
+	@echo "               then cargo check --all-targets and"
+	@echo "               cargo clippy --lib --no-deps -D warnings"
 	@echo "  fmt          Format every file with rustfmt"
 	@echo "  clean        cargo clean"
 	@echo "  run-example  Build and lint examples/"
+	@echo "  release-status  Where every release channel sits, and whether"
+	@echo "               scripts/publish-release.sh would run. Exit 1 on drift."
 	@echo
 	@echo "Variables:"
 	@echo "  PREFIX=$(PREFIX)"
@@ -79,7 +83,7 @@ test:
 # scenarios in tests/status.rs). Point CI at this single target.
 ci: check test
 
-check: adr-lint changelog-check
+check: adr-lint changelog-check command-json-check
 	$(CARGO) check --all-targets
 	$(CARGO) clippy --lib --no-deps -- -D warnings
 
@@ -105,6 +109,18 @@ changelog-check:
 	  $(CARGO) run --quiet -- changelog --check; \
 	fi
 
+# Gate the command-surface `--format json` shapes against the per-command
+# schema (ADR-096 § CMD-005 / ADR-086 § WIRE-008). Uses the installed `ctxgrd`
+# from $$PATH (run `make install` once before this works), like adr-lint.
+# Mutations run in a throwaway temp dir — the real repo is never touched.
+command-json-check:
+	@if command -v ctxgrd > /dev/null 2>&1; then \
+	  python3 -B scripts/check-command-json.py; \
+	else \
+	  echo "ctxgrd not on PATH — run \`make install\` before command-json-check"; \
+	  exit 1; \
+	fi
+
 lint: check
 
 fmt:
@@ -115,3 +131,12 @@ clean:
 
 run-example: build
 	$(BIN) --root examples
+
+# Where every release channel sits: local tag, private remote, public mirror,
+# crates.io, and the deployed website banner — plus whether
+# scripts/publish-release.sh would run right now.
+#
+# Exists because "did you publish?" was four checks across two repos and a web
+# request, so it got guessed. Read-only; exits 1 when any channel is behind.
+release-status:
+	@./scripts/release-status.sh

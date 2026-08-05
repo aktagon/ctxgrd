@@ -325,8 +325,10 @@ fn parse_diagnostics_batch(
                     severity: sev,
                     message: raw.message,
                     location: doc.location.clone(),
-                    line: raw.line,
-                    col: raw.col,
+                    // External rules use `0` for "no position"; map it to
+                    // `None` for the wire (ADR-086 § WIRE-004).
+                    line: (raw.line > 0).then_some(raw.line),
+                    col: (raw.col > 0).then_some(raw.col),
                     help: None,
                     note: None,
                     span_len: None,
