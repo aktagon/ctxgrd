@@ -121,7 +121,7 @@ pub fn render_rich(
 /// undeclared` when nonzero. Reachable on a clean run because
 /// `[ignore].namespaces` silences the warning without zeroing the count:
 /// `ok: … 0 diagnostics` alone reads as "every document ran every rule",
-/// which is false whenever a namespace is linting under the six
+/// which is false whenever a namespace is linting under the
 /// zero-config rules. Omitted at zero so the common line stays quiet.
 ///
 /// `kernel_messages` suppresses the trailer on the same terms as
@@ -369,7 +369,7 @@ mod tests {
 
     /// ADR-076 § OWN-005: the coverage field is conditional on the human
     /// line — silent at zero, explicit when a namespace is linting under
-    /// the six zero-config rules.
+    /// the zero-config rules.
     #[test]
     fn ok_summary_reports_undeclared_namespaces() {
         assert_eq!(

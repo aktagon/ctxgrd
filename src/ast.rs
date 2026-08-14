@@ -27,6 +27,23 @@ pub struct Ast {
     pub req_ref_tokens: Vec<CrossRefToken>,
     pub list_items: Vec<ListItem>,
     pub links: Vec<Link>,
+    /// Image destinations (`![alt](path)`), same shape as [`Link`] with
+    /// `text` holding the alt text. Separate from `links` because the two
+    /// answer different questions — a rule may lint prose references
+    /// without linting asset paths (ADR-125 § LNK-004).
+    ///
+    /// `serde(default)` so an external source written against the
+    /// pre-ADR-125 envelope still deserialises; the field is always
+    /// *emitted*, keeping the "empty arrays, never omissions" invariant
+    /// this module's docs state.
+    #[serde(default)]
+    pub images: Vec<Link>,
+    /// Reference-style links whose definition is missing — `[text][ref]`
+    /// with no `[ref]: <url>` line. Such a link produces no [`Link`] at
+    /// all (it renders as literal text), so it is invisible to anything
+    /// reading `links` (ADR-125 § LNK-005).
+    #[serde(default)]
+    pub broken_refs: Vec<BrokenRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +115,24 @@ pub struct Link {
     pub col: u32,
 }
 
+/// A reference-style link with no matching definition.
+///
+/// `reference` is the label as written — the `bar` in `[foo][bar]`, or
+/// the `foo` in `[foo][]`. Bare shortcut links (`[foo]`) are deliberately
+/// *not* recorded: prose in these repos is full of `[ADR-046]`-style
+/// bracketed tokens that were never meant as links (ADR-125 § LNK-005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokenRef {
+    pub reference: String,
+    pub line: u32,
+    pub col: u32,
+    /// True when the reference was written `![alt][ref]` rather than
+    /// `[text][ref]`. pulldown reports both as `LinkType::Reference`, so
+    /// without this a consumer cannot honour an images-only switch.
+    #[serde(default)]
+    pub is_image: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +151,8 @@ mod tests {
             "req_ref_tokens",
             "list_items",
             "links",
+            "images",
+            "broken_refs",
         ] {
             assert!(obj.contains_key(key), "missing top-level key {key}");
             assert!(
@@ -221,9 +258,36 @@ mod tests {
                 line: 30,
                 col: 3,
             }],
+            images: vec![Link {
+                href: "assets/rule_tour.json".into(),
+                text: "the rule tour".into(),
+                line: 34,
+                col: 1,
+            }],
+            broken_refs: vec![BrokenRef {
+                reference: "brief-001".into(),
+                line: 38,
+                col: 5,
+                is_image: false,
+            }],
         };
         let json = serde_json::to_string(&ast).unwrap();
         let back: Ast = serde_json::from_str(&json).unwrap();
         assert_eq!(ast, back);
+    }
+
+    #[test]
+    fn ast_from_a_pre_adr125_envelope_still_deserialises() {
+        // An external source written before `images`/`broken_refs` existed
+        // omits both keys. `serde(default)` is what keeps its envelopes
+        // valid; without it every such source breaks at the wire.
+        let json = r#"{
+            "headings": [], "code_blocks": [], "inline_code_spans": [],
+            "strikethrough_spans": [], "cross_ref_tokens": [], "req_ref_tokens": [],
+            "list_items": [], "links": []
+        }"#;
+        let ast: Ast = serde_json::from_str(json).expect("legacy envelope must deserialise");
+        assert!(ast.images.is_empty());
+        assert!(ast.broken_refs.is_empty());
     }
 }

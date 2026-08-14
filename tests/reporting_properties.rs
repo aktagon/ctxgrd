@@ -64,6 +64,13 @@ fn doc_strategy() -> impl Strategy<Value = DocReadiness> {
             DocReadiness {
                 id: format!("{namespace}-{number:03}"),
                 namespace: namespace.to_string(),
+                // Over 60 characters for every namespace and number, so
+                // the `BUG-046` title column is *fitted* on every generated
+                // report — the properties below then hold over truncated
+                // rows and not only over short ones.
+                title: format!(
+                    "Reconcile the {namespace} ledger for period {number} and reissue the statement"
+                ),
                 status,
                 ready,
                 blocked_by,
@@ -151,9 +158,9 @@ proptest! {
     /// must not be told different things (the ADR-086 output contract).
     #[test]
     fn text_and_json_agree_on_the_counts(report in report_strategy()) {
-        let text = ctxgrd::status::render_report(&report);
+        let text = ctxgrd::status::render_report(&report, true);
         let json: serde_json::Value =
-            serde_json::from_str(&ctxgrd::status::render_json(&report)).expect("valid JSON");
+            serde_json::from_str(&ctxgrd::status::render_json(&report, true)).expect("valid JSON");
 
         let rows = json["documents"].as_array().expect("documents array");
         prop_assert_eq!(rows.len(), report.documents.len());
@@ -185,7 +192,7 @@ proptest! {
     /// never implies coverage it does not have").
     #[test]
     fn the_text_report_names_every_document_it_counts(report in report_strategy()) {
-        let text = ctxgrd::status::render_report(&report);
+        let text = ctxgrd::status::render_report(&report, true);
         for doc in report.ready().chain(report.blocked()) {
             prop_assert!(
                 text.contains(doc.id.as_str()),

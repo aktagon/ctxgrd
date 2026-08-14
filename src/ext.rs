@@ -112,7 +112,7 @@ pub(crate) fn run_rule_batch(
     let mut path_to_doc: BTreeMap<PathBuf, &Document> = BTreeMap::new();
     let mut stdin_buf: Vec<u8> = Vec::new();
     for doc in docs {
-        let body_path = ensure_body_path(doc, root, tmp)?;
+        let body_path = ensure_body_path(doc, tmp)?;
         let record = serde_json::json!({
             "path": body_path,
             "context": {
@@ -207,12 +207,11 @@ pub(crate) fn run_rule_batch(
     Ok(out)
 }
 
-fn ensure_body_path(doc: &Document, root: &Path, tmp: &RunTempDir) -> io::Result<PathBuf> {
-    // If `location` resolves to a real file under root, that's a
-    // `markdown-file` doc — pass the real path through.
-    let on_disk = root.join(&doc.location);
-    if on_disk.is_file() {
-        return Ok(canonicalize_or_leave(&on_disk));
+fn ensure_body_path(doc: &Document, tmp: &RunTempDir) -> io::Result<PathBuf> {
+    // If ingest resolved a real file for this document, pass the real
+    // path through (ADR-123 § LOC-005 — the probe already happened).
+    if let Some(on_disk) = doc.file.as_deref() {
+        return Ok(canonicalize_or_leave(on_disk));
     }
     // Otherwise materialise into the temp dir and cache for re-use.
     let key = format!("{}-{}", doc.id.namespace, doc.id.number);
@@ -381,6 +380,8 @@ mod tests {
             id: DocumentId::new("ADR", n),
             raw_id: format!("ADR-{n:03}"),
             location: format!("adrs/ADR-{n:03}.md"),
+            // As ingest would leave it: this document is file-backed.
+            file: Some(md),
             depends_on: vec![],
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
@@ -395,7 +396,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let tmp = RunTempDir::in_parent(root.path()).unwrap();
         let doc = file_doc(root.path(), 1);
-        let path = ensure_body_path(&doc, root.path(), &tmp).unwrap();
+        let path = ensure_body_path(&doc, &tmp).unwrap();
         assert!(path.starts_with(
             fs::canonicalize(root.path()).unwrap_or_else(|_| root.path().to_path_buf())
         ));
@@ -410,6 +411,7 @@ mod tests {
             id: DocumentId::new("JIRA", 100),
             raw_id: "JIRA-100".to_string(),
             location: "https://jira.example/100".to_string(),
+            file: None,
             depends_on: vec![],
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
@@ -417,7 +419,7 @@ mod tests {
             ast: None,
             body: "synthetic body".to_string(),
         };
-        let path = ensure_body_path(&doc, root.path(), &tmp).unwrap();
+        let path = ensure_body_path(&doc, &tmp).unwrap();
         // After RUL-006 fix the materialised branch canonicalises too,
         // so on macOS `path` resolves through /private/var/folders/...
         // while tmp.path() is /var/folders/... — compare canonical forms.

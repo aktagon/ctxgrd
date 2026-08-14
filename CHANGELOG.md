@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-08-14
+
+### Changed
+
+- Resolve a document's location to an optional file at ingest (ADR-123)
+- Detect broken internal links (ADR-125)
+
+### Fixed
+
+- `ctxgrd status` names each row with its document title, and carries the untruncated `title` on the wire in `--format json`, so a reader who does not already know the corpus can pick work from the queue and an agent need not re-run `ctxgrd list` to recover it — `--no-titles` restores the bare-ID report (BUG-046)
+- `core.file-name` errors on every source-provided document, because it parses a filename out of a `location` that ADR-005 explicitly allows to be a non-path (BUG-059)
+
 ## [2.1.0] — 2026-08-05
 
 ### Changed

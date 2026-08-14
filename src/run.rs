@@ -93,7 +93,7 @@ fn resolve_scope(root: &Path, config: &Config, selector: &ScopeSelector) -> Resu
 
     // A namespace the config never declares can still be governed — an
     // id-claimed document pulls it in and it lints under the zero-config
-    // six. `ctxgrd rules` reports exactly those (BUG-049), so rejecting
+    // set. `ctxgrd rules` reports exactly those (BUG-049), so rejecting
     // them here made the obvious follow-up fail: enumerate namespaces from
     // `rules --format json`, then `lint --namespace <each>`, and every
     // zero-config row exits 2.
@@ -706,7 +706,7 @@ pub(crate) fn ingest_scoped(
     // failures so downstream renderers handle both uniformly.
     for (_source_name, envelope) in source_run.envelopes {
         let loc = envelope.location.clone();
-        match envelope.into_document() {
+        match envelope.into_document(root) {
             Ok(doc) => documents.push(doc),
             Err(EnvelopeError::IdMalformed { raw_id }) => {
                 parse_diagnostics.push(ParseDiagnostic {
@@ -780,7 +780,7 @@ pub fn discover_config_roots(root: &Path) -> Vec<PathBuf> {
 /// namespace set from the *documents* and resolves each through
 /// [`Config::namespace_config`], which falls back to
 /// [`crate::config::ZERO_CONFIG_RULES`] — so an id-claimed namespace no
-/// config declares is really linted with six rules. Introspection that
+/// config declares is really linted with the zero-config set. Introspection that
 /// reads `config.namespaces` alone cannot see those, and reports an
 /// empty set for a tree `lint` is actively governing.
 ///
@@ -1005,6 +1005,18 @@ pub(crate) fn lint_run_scoped(
             // default when the namespace lists it without a params block.
             if code == "core.file-budget" {
                 diagnostics.extend(agent_guide::check_file_budget(
+                    doc,
+                    ns_cfg.params.get(code),
+                    root,
+                ));
+                continue;
+            }
+            // ADR-125 § LNK-007: the id-keyed half of `core.link-resolved`.
+            // Registered `Level::File` so it reaches README/CLAUDE/guides,
+            // it needs this arm to reach ADRs and PRDs — which is where
+            // links rot fastest. Params are optional throughout.
+            if code == "core.link-resolved" {
+                diagnostics.extend(agent_guide::check_link_resolved(
                     doc,
                     ns_cfg.params.get(code),
                     root,
@@ -1391,8 +1403,8 @@ pub fn find_references(root: &Path, target_id: &str) -> Result<Vec<ReferenceHit>
         .iter()
         .find(|d| d.id.namespace == target.namespace && d.id.number == target.number)
     {
-        // File-backed when location resolves under root.
-        if root.join(&doc.location).is_file() {
+        // File-backed when ingest resolved a file for it (ADR-123 § LOC-005).
+        if doc.file.is_some() {
             hits.push(ReferenceHit {
                 file: doc.location.clone(),
                 line: 0,

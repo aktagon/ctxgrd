@@ -17,13 +17,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use pulldown_cmark::{CodeBlockKind as CmarkKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    BrokenLink, CodeBlockKind as CmarkKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
+};
 use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::ast::{
-    Ast, CodeBlock, CodeBlockKind, CrossRefToken, Heading, InlineCodeSpan, Link, ListItem,
-    StrikethroughSpan,
+    Ast, BrokenRef, CodeBlock, CodeBlockKind, CrossRefToken, Heading, InlineCodeSpan, Link,
+    ListItem, StrikethroughSpan,
 };
 use crate::document::Document;
 use crate::frontmatter::{self, Frontmatter};
@@ -172,7 +174,13 @@ pub fn scan(
             Err(_) => ParseOutcome::Skip,
         };
         match outcome {
-            ParseOutcome::Document(doc) => documents.push(doc),
+            ParseOutcome::Document(mut doc) => {
+                // ADR-123 § LOC-002: the walker reached this document by
+                // reading `path`, so file-backedness is already proven.
+                // Record the path in hand rather than re-probing it.
+                doc.file = Some(path);
+                documents.push(doc);
+            }
             ParseOutcome::Diagnostic(diag) => parse_diagnostics.push(diag),
             ParseOutcome::Conflict(conflict) => path_conflicts.push(conflict),
             ParseOutcome::Skip => {}
@@ -197,6 +205,10 @@ pub fn scan(
 /// positives. A path-claimed file is a ctxgrd document by configured
 /// intent, so a missing fence or broken YAML there is a real defect and
 /// produces [`ParseOutcome::Diagnostic`] (ADR-007 § DOC-002 (e)).
+///
+/// This is a pure function of the body: it leaves `Document::file` as
+/// `None`. [`scan`] fills it in from the path it opened (ADR-123 §
+/// LOC-002), which keeps the only filesystem knowledge in the walker.
 pub(crate) fn parse_one(body: &str, location: String, path_claims: &PathClaims) -> ParseOutcome {
     // ADR-007 § DOC-001: a markdown file is a document candidate only
     // when it claims intent — either an `id:` field (id-claim, checked
@@ -304,6 +316,8 @@ pub(crate) fn parse_one(body: &str, location: String, path_claims: &PathClaims) 
         id,
         raw_id: raw_id.to_owned(),
         location,
+        // Filled in by `scan` from the path it opened (ADR-123 § LOC-002).
+        file: None,
         depends_on: fm.depends_on,
         frontmatter_lines,
         metadata: fm.metadata,
@@ -327,11 +341,55 @@ pub fn parse_ast(body: &str) -> Ast {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
 
-    for (event, range) in Parser::new_ext(markdown, opts).into_offset_iter() {
+    // A reference-style link with no definition emits no `Tag::Link` at
+    // all — it renders as literal text — so the only place to see it is
+    // this callback (ADR-125 § LNK-005). Recording it here keeps the
+    // single-pass discipline of ADR-029 § PIP-001: no rule re-scans the
+    // body to find what the parser already knew.
+    //
+    // Returning `None` declines to synthesise a destination, so parsing
+    // proceeds exactly as it did before the callback existed.
+    let broken = std::cell::RefCell::new(Vec::new());
+    let callback = |link: BrokenLink<'_>| -> Option<(CowStr<'_>, CowStr<'_>)> {
+        // The callback receives the *original* link type — pulldown maps
+        // it through `to_unknown()` only on the value the callback
+        // returns, so matching on `ReferenceUnknown` here never fires.
+        //
+        // `Shortcut` (`[foo]`) is excluded on purpose: bracketed prose
+        // tokens like `[ADR-046]` are pervasive and were never links.
+        if matches!(link.link_type, LinkType::Reference | LinkType::Collapsed) {
+            // `![alt][ref]` arrives with the same link type as `[t][ref]`;
+            // the only thing distinguishing them is the leading `!`, which
+            // the span covers (a link's span opens at its `[`).
+            let is_image = markdown.as_bytes().get(link.span.start) == Some(&b'!');
+            broken
+                .borrow_mut()
+                .push((link.reference.to_string(), link.span.start, is_image));
+        }
+        None
+    };
+
+    let parser = Parser::new_with_broken_link_callback(markdown, opts, Some(callback));
+    for (event, range) in parser.into_offset_iter() {
         builder.on_event(event, range);
     }
     builder.finish_ref_tokens();
-    builder.into_ast()
+
+    let mut ast = builder.into_ast();
+    ast.broken_refs = broken
+        .into_inner()
+        .into_iter()
+        .map(|(reference, start, is_image)| {
+            let (line, col) = byte_to_line_col(start + body_start, &line_starts);
+            BrokenRef {
+                reference,
+                line,
+                col,
+                is_image,
+            }
+        })
+        .collect();
+    ast
 }
 
 // -- line-position helpers ---------------------------------------------
@@ -588,6 +646,7 @@ struct AstBuilder<'a> {
     req_ref_tokens: Vec<CrossRefToken>,
     list_items: Vec<ListItem>,
     links: Vec<Link>,
+    images: Vec<Link>,
 
     /// Byte ranges (absolute, in `body`) that count as "code" for
     /// `in_code` — fenced blocks, indented blocks, inline code spans.
@@ -601,6 +660,10 @@ struct AstBuilder<'a> {
     heading_open: Option<HeadingOpen>,
     /// Link currently being collected, same pattern as `heading_open`.
     link_open: Option<LinkOpen>,
+    /// Image currently being collected. A separate slot from `link_open`
+    /// because the two nest: `[![alt](img.png)](target.md)` opens a link,
+    /// then an image, inside it.
+    image_open: Option<LinkOpen>,
     /// Code block currently open; lang (if any) is known from the Start
     /// event.
     code_block_open: Option<CodeBlockOpen>,
@@ -650,10 +713,12 @@ impl<'a> AstBuilder<'a> {
             req_ref_tokens: Vec::new(),
             list_items: Vec::new(),
             links: Vec::new(),
+            images: Vec::new(),
             code_ranges: Vec::new(),
             strikethrough_ranges: Vec::new(),
             heading_open: None,
             link_open: None,
+            image_open: None,
             code_block_open: None,
             strikethrough_open: None,
         }
@@ -811,6 +876,31 @@ impl<'a> AstBuilder<'a> {
                     });
                 }
             }
+            Event::Start(Tag::Image { ref dest_url, .. }) => {
+                let (line, col) = self.pos(range.start);
+                self.image_open = Some(LinkOpen {
+                    href: dest_url.to_string(),
+                    line,
+                    col,
+                    text: String::new(),
+                });
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some(LinkOpen {
+                    href,
+                    line,
+                    col,
+                    text,
+                }) = self.image_open.take()
+                {
+                    self.images.push(Link {
+                        href,
+                        text,
+                        line,
+                        col,
+                    });
+                }
+            }
             Event::Start(Tag::Item) => {
                 let (line, _) = self.pos(range.start);
                 let line_idx = usize::try_from(line)
@@ -848,6 +938,9 @@ impl<'a> AstBuilder<'a> {
                 }
                 if let Some(l) = self.link_open.as_mut() {
                     l.text.push_str(text);
+                }
+                if let Some(i) = self.image_open.as_mut() {
+                    i.text.push_str(text);
                 }
                 if let Some(s) = self.strikethrough_open.as_mut() {
                     s.text.push_str(text);
@@ -968,6 +1061,10 @@ impl<'a> AstBuilder<'a> {
             req_ref_tokens: self.req_ref_tokens,
             list_items: self.list_items,
             links: self.links,
+            images: self.images,
+            // Filled by `parse_ast` from the broken-link callback, which
+            // fires during iteration rather than through `on_event`.
+            broken_refs: Vec::new(),
         }
     }
 }
@@ -1165,6 +1262,80 @@ mod tests {
             .find(|t| t.token == "ADR-042")
             .expect("ADR-042 token present");
         assert!(t.in_code);
+    }
+
+    #[test]
+    fn image_destinations_are_captured_separately_from_links() {
+        let body = "---\nid: ADR-001\n---\n\n\
+             ![the rule tour](assets/rule_tour.json) and [the guide](docs/guides/getting-started.md).\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.images.len(), 1);
+        assert_eq!(ast.images[0].href, "assets/rule_tour.json");
+        assert_eq!(ast.images[0].text, "the rule tour");
+        // The image must not leak into `links` — a namespace that lints
+        // prose references but not asset paths depends on the split.
+        assert_eq!(ast.links.len(), 1);
+        assert_eq!(ast.links[0].href, "docs/guides/getting-started.md");
+    }
+
+    #[test]
+    fn image_nested_in_a_link_records_both_destinations() {
+        let body = "---\nid: ADR-001\n---\n\n\
+             [![badge](assets/badge.svg)](docs/ci.md)\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.images.len(), 1);
+        assert_eq!(ast.images[0].href, "assets/badge.svg");
+        assert_eq!(ast.links.len(), 1);
+        assert_eq!(ast.links[0].href, "docs/ci.md");
+    }
+
+    #[test]
+    fn undefined_reference_link_is_recorded_as_a_broken_ref() {
+        // `[text][ref]` with no `[ref]: …` definition produces no Link
+        // event at all — it renders as literal text. Without the callback
+        // it is invisible to every rule.
+        let body = "---\nid: ADR-001\n---\n\nSee [the kernel brief][brief-001] for the wire shape.\n";
+        let ast = ast_of(body);
+        assert!(
+            ast.links.is_empty(),
+            "an undefined reference must not produce a link: {:?}",
+            ast.links
+        );
+        assert_eq!(ast.broken_refs.len(), 1);
+        assert_eq!(ast.broken_refs[0].reference, "brief-001");
+        assert_eq!(ast.broken_refs[0].line, 5);
+    }
+
+    #[test]
+    fn defined_reference_link_is_a_normal_link_not_a_broken_ref() {
+        let body = "---\nid: ADR-001\n---\n\n\
+             See [the kernel brief][brief-001].\n\n[brief-001]: docs/briefs/001-kernel.md\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.links.len(), 1);
+        assert_eq!(ast.links[0].href, "docs/briefs/001-kernel.md");
+        assert!(ast.broken_refs.is_empty());
+    }
+
+    #[test]
+    fn bracketed_prose_token_is_not_a_broken_ref() {
+        // `[ADR-046]` is a shortcut-style link as far as the parser is
+        // concerned, but in these repos it is prose. Recording it would
+        // make the rule unusable on ctxgrd's own docs.
+        let body = "---\nid: ADR-001\n---\n\nThe claim protocol is defined in [ADR-046].\n";
+        let ast = ast_of(body);
+        assert!(
+            ast.broken_refs.is_empty(),
+            "bracketed prose must not be reported: {:?}",
+            ast.broken_refs
+        );
+    }
+
+    #[test]
+    fn collapsed_reference_without_definition_is_a_broken_ref() {
+        let body = "---\nid: ADR-001\n---\n\nSee [brief-001][] for the wire shape.\n";
+        let ast = ast_of(body);
+        assert_eq!(ast.broken_refs.len(), 1);
+        assert_eq!(ast.broken_refs[0].reference, "brief-001");
     }
 
     #[test]

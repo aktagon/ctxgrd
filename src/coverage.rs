@@ -6,7 +6,7 @@
 //!
 //! - `cfg.namespace-undeclared` (OWN-004) — documents claim a namespace by
 //!   id that the config never declares. Such a namespace silently resolves
-//!   to [`crate::config::ZERO_CONFIG_RULES`] (the six non-parameterized core
+//!   to [`crate::config::ZERO_CONFIG_RULES`] (the non-parameterized core
 //!   rules), so every shape rule — `core.required-headings`,
 //!   `core.required-metadata`, `core.allowed-values`, `core.min-docs` — is
 //!   absent while the run still reports `ok`. A convention a team invents is
@@ -40,7 +40,7 @@ pub(crate) struct Coverage {
     /// How many namespaces documents claim that the config does not
     /// declare — including any exempted via `[ignore].namespaces`. The
     /// exemption silences the *warning*, not the fact: those documents
-    /// really are linting under six rules, and a summary that hid it
+    /// really are linting under the zero-config set, and a summary that hid it
     /// would recreate the false confidence OWN-005 exists to correct.
     pub(crate) namespaces_undeclared: usize,
 }
@@ -246,6 +246,7 @@ mod tests {
             id,
             raw_id: raw_id.to_string(),
             location: location.to_string(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: [("id".to_string(), 2u32)].into_iter().collect(),
             metadata: Default::default(),

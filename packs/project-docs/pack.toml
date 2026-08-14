@@ -15,6 +15,7 @@ rules = [
   "core.allowed-values",
   "core.successor-link",
   "core.acceptance-complete",
+  "core.link-resolved",
 ]
 
 [ADR."core.required-headings"]
@@ -70,6 +71,7 @@ rules = [
   "core.successor-link",
   "ears.clause-syntax",
   "core.min-docs",
+  "core.link-resolved",
 ]
 
 [PRD."core.required-headings"]
@@ -152,6 +154,7 @@ rules = [
   "core.required-headings",
   "core.required-metadata",
   "core.allowed-values",
+  "core.link-resolved",
 ]
 
 [BUG."core.required-headings"]
@@ -184,7 +187,7 @@ stale_days = 30
 # if your entry guide lives elsewhere.
 [README]
 paths = ["README.md"]
-rules = ["core.min-docs", "core.requires-link"]
+rules = ["core.min-docs", "core.requires-link", "core.link-resolved"]
 
 [README."core.requires-link"]
 targets = ["docs/guides/getting-started.md"]

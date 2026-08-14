@@ -210,7 +210,9 @@ fn stg003_json_carries_the_work_queue_and_none_of_the_stage_fields() {
             "STG-003: `{gone}` must be gone; json:\n{parsed:#}"
         );
     }
-    // Each row is exactly the ADR-107 § RDY-001 shape — no more, no less.
+    // Each row is exactly the ADR-107 § RDY-001 shape plus the `BUG-046`
+    // title — no more, no less. (`title` is the one key that can be absent:
+    // `--no-titles` omits it. This run is the default one, so it is here.)
     // Compared as a set: `serde_json::Value` is BTreeMap-backed, so parsing
     // discards emission order and any order assertion here would be testing
     // the parser rather than the contract.
@@ -218,7 +220,7 @@ fn stg003_json_carries_the_work_queue_and_none_of_the_stage_fields() {
     let keys: Vec<&str> = first.as_object().unwrap().keys().map(String::as_str).collect();
     assert_eq!(
         keys,
-        vec!["blocked_by", "id", "namespace", "ready", "status"],
+        vec!["blocked_by", "id", "namespace", "ready", "status", "title"],
         "json:\n{parsed:#}"
     );
 }
@@ -758,4 +760,109 @@ fn every_arming_status_is_also_settled() {
             "`{arming}` arms, so it must settle too; stdout:\n{stdout}"
         );
     }
+}
+
+
+// --- BUG-046: the queue names its documents -----------------------------
+
+#[test]
+fn bug046_the_text_queue_names_each_document_and_keeps_its_verdict() {
+    // The defect end to end: `status` printed `<ID>  <status>` and nothing
+    // else, so `RUN-001` read as queue noise across twelve invocations
+    // while its title was the answer being searched for.
+    //
+    // Paired per `ADR-112` § CLR-007 — a change that printed the title
+    // *instead of* the status would satisfy the first assertion alone, so
+    // the status and the `←` blocker disclosure are asserted beside it.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_corpus(tmp.path());
+
+    let stdout = stdout_of(&status(tmp.path()));
+    assert!(
+        stdout.contains("Reconciliation"),
+        "the blocked row names its document; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Drift"),
+        "and so does a ready one; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("draft"),
+        "the status column survived the new one; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("← ADR-002"),
+        "and so did the blocker disclosure; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn bug046_no_titles_reproduces_the_report_the_queue_printed_before() {
+    // `ADR-074`'s lever. The opt-out must be the old output exactly — a
+    // near-miss with stray padding where the column used to be would still
+    // change every consumer's diff.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_corpus(tmp.path());
+
+    let stdout = stdout_of(&status_args(tmp.path(), &["--no-titles"]));
+    let expected = "5 documents · 3 ready · 1 blocked · 1 settled\n\
+                    \nready:\n\
+                    \x20 ADR-002      draft\n\
+                    \x20 BUG-001      open\n\
+                    \x20 HANDOFF-001  pending\n\
+                    \nblocked:\n\
+                    \x20 SPEC-001  draft  ← ADR-002\n\
+                    \ntip: --format json for agents, mermaid/dot for diagrams\n";
+    assert_eq!(stdout, expected);
+}
+
+#[test]
+fn bug046_json_carries_the_title_so_an_agent_need_not_rerun_list() {
+    // The half that makes this a contract defect rather than a cosmetic
+    // one: with no `title` on the wire an agent could not recover the
+    // difference without a second pass over `ctxgrd list`, which the queue
+    // gave it no reason to make.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_corpus(tmp.path());
+
+    let parsed = status_json(tmp.path());
+    let row = parsed["documents"]
+        .as_array()
+        .expect("documents array")
+        .iter()
+        .find(|d| d["id"] == "SPEC-001")
+        .expect("SPEC-001 present")
+        .clone();
+    assert_eq!(row["title"], serde_json::json!("Reconciliation"));
+    // Paired: the field was added, not substituted.
+    assert_eq!(row["status"], serde_json::json!("draft"));
+    assert_eq!(row["blocked_by"], serde_json::json!(["ADR-002"]));
+}
+
+#[test]
+fn bug046_no_titles_omits_the_json_field_entirely() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_corpus(tmp.path());
+
+    let out = status_args(tmp.path(), &["--no-titles", "--format", "json"]);
+    let text = stdout_of(&out);
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{text}");
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let row = &parsed["documents"][0];
+    assert!(row.get("title").is_none(), "parsed:\n{parsed:#}");
+    assert_eq!(row["id"], serde_json::json!("ADR-001"));
+}
+
+#[test]
+fn bug046_no_titles_composes_with_the_done_signal() {
+    // The flag is a rendering choice, so it must not move the exit code
+    // `--exit-code` projects — an injector that opts out of titles is not
+    // opting out of the gate.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_corpus(tmp.path());
+
+    let with = status_args(tmp.path(), &["--exit-code"]);
+    let without = status_args(tmp.path(), &["--exit-code", "--no-titles"]);
+    assert_eq!(with.status.code(), Some(1), "SPEC-001 is held by ADR-002");
+    assert_eq!(without.status.code(), with.status.code());
 }

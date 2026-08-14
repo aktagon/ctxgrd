@@ -11,6 +11,7 @@
 //! exist only to give subprocess sources a typed wire contract.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,7 +69,13 @@ impl Envelope {
     /// 3. Merge `extra ⊕ body.frontmatter` with frontmatter winning
     ///    on key conflict (CORE-002).
     /// 4. Copy the AST through unchanged.
-    pub(crate) fn into_document(self) -> Result<Document, EnvelopeError> {
+    /// 5. Resolve `file` by probing `root.join(&location)` exactly once
+    ///    (ADR-123 § LOC-003). A source-supplied `location` is only
+    ///    *sometimes* a path — ADR-005 § the envelope schema allows any
+    ///    identifier — so the filesystem is the only arbiter, and the
+    ///    ingest boundary is where that impurity belongs (ADR-040 §
+    ///    PIN-006). Downstream readers are then pure.
+    pub(crate) fn into_document(self, root: &Path) -> Result<Document, EnvelopeError> {
         let id: DocumentId =
             self.id
                 .parse()
@@ -85,10 +92,14 @@ impl Envelope {
             Err(e) => return Err(EnvelopeError::Frontmatter(e)),
         };
 
+        let on_disk = root.join(&self.location);
+        let file = on_disk.is_file().then_some(on_disk);
+
         Ok(Document {
             id,
             raw_id: self.id,
             location: self.location,
+            file,
             depends_on: self.depends_on,
             frontmatter_lines,
             metadata,
@@ -145,7 +156,9 @@ mod tests {
             .into(),
             ast: None,
         };
-        let doc = env.into_document().unwrap();
+        let doc = env
+            .into_document(Path::new("/nonexistent-ctxgrd-test-root"))
+            .unwrap();
         assert_eq!(doc.id, DocumentId::new("ADR", 1));
         // frontmatter key → comes from body
         assert_eq!(doc.metadata.get("title"), Some(&json!("Doc")));
@@ -165,7 +178,9 @@ mod tests {
             extra: [("status".to_string(), json!("from-extra"))].into(),
             ast: None,
         };
-        let doc = env.into_document().unwrap();
+        let doc = env
+            .into_document(Path::new("/nonexistent-ctxgrd-test-root"))
+            .unwrap();
         assert_eq!(doc.metadata.get("status"), Some(&json!("from-frontmatter")));
     }
 
@@ -180,7 +195,9 @@ mod tests {
             extra: [("status".to_string(), json!("Open"))].into(),
             ast: None,
         };
-        let doc = env.into_document().unwrap();
+        let doc = env
+            .into_document(Path::new("/nonexistent-ctxgrd-test-root"))
+            .unwrap();
         assert_eq!(doc.id.namespace, "JIRA");
         assert_eq!(doc.id.number, 100);
         assert_eq!(doc.metadata.get("status"), Some(&json!("Open")));
@@ -197,7 +214,7 @@ mod tests {
             extra: BTreeMap::new(),
             ast: None,
         };
-        match env.into_document() {
+        match env.into_document(Path::new("/nonexistent-ctxgrd-test-root")) {
             Err(EnvelopeError::IdMalformed { raw_id }) => assert_eq!(raw_id, "not-an-id"),
             other => panic!("expected IdMalformed, got {other:?}"),
         }
@@ -215,8 +232,50 @@ mod tests {
             ast: None,
         };
         assert!(matches!(
-            env.into_document(),
+            env.into_document(Path::new("/nonexistent-ctxgrd-test-root")),
             Err(EnvelopeError::Frontmatter(_))
         ));
+    }
+
+    fn env_at(location: &str) -> Envelope {
+        Envelope {
+            id: "STATUTE-1".into(),
+            body: "body".into(),
+            location: location.into(),
+            depends_on: vec![],
+            extra: BTreeMap::new(),
+            ast: None,
+        }
+    }
+
+    #[test]
+    fn into_document_resolves_no_file_for_a_non_path_location() {
+        // ADR-123 § LOC-003. ADR-005 lets a source emit any identifier;
+        // a statute citation names no file, so `file` stays `None`.
+        let root = tempfile::tempdir().unwrap();
+        let doc = env_at("Työttömyysturvalaki 1290/2002 §6(1)")
+            .into_document(root.path())
+            .unwrap();
+        assert_eq!(doc.file, None);
+    }
+
+    #[test]
+    fn into_document_resolves_a_file_for_a_location_that_names_one() {
+        // A source may legitimately emit a file-backed document — which
+        // is why ADR-123 rejected provenance as the predicate.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/001-x.md"), "body").unwrap();
+        let doc = env_at("docs/001-x.md").into_document(root.path()).unwrap();
+        assert_eq!(doc.file, Some(root.path().join("docs/001-x.md")));
+    }
+
+    #[test]
+    fn into_document_resolves_no_file_for_a_directory_location() {
+        // `is_file()`, not `exists()` — a directory is not a document body.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        let doc = env_at("docs").into_document(root.path()).unwrap();
+        assert_eq!(doc.file, None);
     }
 }

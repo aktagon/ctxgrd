@@ -7,6 +7,7 @@
 //! an `Option`, because external sources are free to omit it.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -24,6 +25,19 @@ pub struct Document {
     pub id: DocumentId,
     pub raw_id: String,
     pub location: String,
+    /// The file this document was read from, resolved once at ingest
+    /// (ADR-123 § LOC-001). `Some(path)` when the document is backed by
+    /// a readable file under the lint root — the walker sets it from the
+    /// path it already opened (LOC-002), envelope conversion probes
+    /// `root.join(&location)` exactly once (LOC-003). `None` when
+    /// `location` is a label rather than a path, which ADR-005 §
+    /// the envelope schema explicitly permits ("URL, path, or other
+    /// identifier").
+    ///
+    /// Consumers that need a real path MUST read this field rather than
+    /// re-deriving one from `location`; doing the latter is what produced
+    /// BUG-059 and BUG-060.
+    pub file: Option<PathBuf>,
     pub depends_on: Vec<String>,
     /// 1-indexed line of every top-level YAML key in the frontmatter
     /// block, keyed by key name. Rules (`core.dep-resolved`,
@@ -90,6 +104,7 @@ mod tests {
             id,
             raw_id: raw_id.to_owned(),
             location: location.to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),

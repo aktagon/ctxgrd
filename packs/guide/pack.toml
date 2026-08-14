@@ -13,7 +13,7 @@
 
 [GUIDE]
 paths = ["docs/guides/**"]
-rules = ["guide.frontmatter", "core.min-docs"]
+rules = ["guide.frontmatter", "core.min-docs", "core.link-resolved"]
 
 # The Diátaxis taxonomy constraining `diataxis.type`. Config-driven, not baked into
 # the binary: retype the allowlist (or drop it for presence-only) if your doc model

@@ -93,6 +93,7 @@ const SOUL_REFERENCED: &str = "soul.referenced";
 const COMMIT_FRESHNESS: &str = "core.commit-freshness";
 const CALENDAR_FRESHNESS: &str = "core.calendar-freshness";
 const REQUIRES_LINK: &str = "core.requires-link";
+const LINK_RESOLVED: &str = "core.link-resolved";
 const VULN_SLA: &str = "security.vuln-sla";
 const RISK_EXPIRY: &str = "security.risk-expiry";
 const REMEDIATION_LINK: &str = "security.remediation-link";
@@ -173,7 +174,10 @@ pub(crate) fn scan_file_level(
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let doc = synthetic_document(&ns, location, body);
+        let mut doc = synthetic_document(&ns, location, body);
+        // ADR-123 § LOC-002: the singleton was just read from `path`, so
+        // record it here rather than re-deriving it downstream.
+        doc.file = Some(path);
         let ns_cfg = config.namespace_config(&ns);
         for code in &ns_cfg.rules {
             if let Some(check_fn) = file_level_check(code) {
@@ -255,6 +259,8 @@ fn synthetic_document(namespace: &str, location: String, body: String) -> Docume
         id: DocumentId::new(namespace.to_string(), 0),
         raw_id: String::new(),
         location,
+        // Set by `scan_file_level` from the path it read (ADR-123 § LOC-002).
+        file: None,
         depends_on: Vec::new(),
         frontmatter_lines,
         metadata,
@@ -543,6 +549,366 @@ fn import_paths(doc: &Document) -> Vec<&str> {
             (!path.is_empty()).then_some(path)
         })
         .collect()
+}
+
+/// `core.link-resolved` (ADR-125 § LNK-001): every relative markdown link
+/// in the document points at something that exists, at the casing it was
+/// written in.
+///
+/// The mirror of [`check_requires_link`]. That rule asks "does *some* link
+/// resolve to this required target?"; this one asks "does *every* link
+/// resolve to anything at all?" — completeness in the other direction. Both
+/// resolve a path relative to the **document's own directory**, never the
+/// root, which is the trap BUG-035 recorded.
+///
+/// Four diagnostic classes, all at the same configurable severity
+/// (`severity`, default `warning` — a stale link misleads a reader but
+/// breaks no build, and this rule ships in the zero-config set where an
+/// error default would fail repos that never opted in):
+///
+/// 1. the target does not exist — the ordinary rot case;
+/// 2. the target lies outside the linted root — it may resolve on the
+///    author's disk yet be unfollowable from a fresh clone, which is a
+///    different problem with a different fix (LNK-003);
+/// 3. the target exists but only under a different casing — invisible on
+///    the case-insensitive filesystems most authoring happens on, a 404 on
+///    the Linux hosts most publishing happens on (LNK-006);
+/// 4. a reference-style link whose definition is missing (LNK-005), read
+///    from `ast.broken_refs` because such a link produces no `Link` at all.
+///
+/// Skipped without comment: scheme-qualified and protocol-relative URLs
+/// (`https:`, `mailto:`, `//cdn…`), pure `#fragment` links, and
+/// site-absolute `/path` links — the last because a repo linter cannot know
+/// which directory a static-site generator will serve as `/`, and guessing
+/// would fire on every Hugo and Jekyll tree ctxgrd is otherwise quiet on.
+/// Fragments and query strings are stripped before resolving: the path half
+/// is checked, the anchor is not (LNK-002).
+pub(crate) fn check_link_resolved(
+    doc: &Document,
+    params: Option<&Value>,
+    root: &Path,
+) -> Vec<Diagnostic> {
+    let Some(ast) = doc.ast.as_ref() else {
+        return Vec::new();
+    };
+
+    let as_error = params
+        .and_then(|p| p.get("severity"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("error"));
+    let lint_images = params
+        .and_then(|p| p.get("images"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let allow = allow_globs(params);
+
+    // A relative link is only meaningful for a document that is a file:
+    // it resolves against the directory holding it. `location` may be any
+    // identifier a source chose — a ticket URL, a database key (ADR-005) —
+    // and joining that onto the root invents a directory to resolve
+    // against. `doc.file` is the path resolved once at ingest, or nothing
+    // (ADR-123 § LOC-002); bail on nothing, exactly as `core.file-name`
+    // does after BUG-059. This rule ships zero-config, so a source-fed
+    // namespace nobody declared would otherwise inherit the invention.
+    let Some(doc_file) = doc.file.as_deref() else {
+        return Vec::new();
+    };
+
+    // Both sides are made absolute the same way — lexically, against the
+    // process directory — and neither is canonicalized. Canonicalizing
+    // only the root puts the two in different symlink-spaces: on macOS
+    // the root becomes `/private/var/…` while the walker's paths stay
+    // `/var/…`, and every document then reads as lying outside its own
+    // root. `join` with an already-absolute `doc_file` replaces rather
+    // than appends, so this is correct whichever form the walker recorded.
+    let root_real = absolutize(root);
+    let doc_path = absolutize(&root_real.join(doc_file));
+    let dir = doc_path.parent().unwrap_or(&root_real).to_path_buf();
+
+    let mut out = Vec::new();
+
+    let images = if lint_images {
+        ast.images.as_slice()
+    } else {
+        &[]
+    };
+    for (link, kind) in ast
+        .links
+        .iter()
+        .map(|l| (l, "link"))
+        .chain(images.iter().map(|i| (i, "image")))
+    {
+        let path = link
+            .href
+            .split(['#', '?'])
+            .next()
+            .unwrap_or(&link.href)
+            .trim();
+        if path.is_empty()
+            || has_scheme(&link.href)
+            || path.starts_with('/')
+            || allow.is_match(path)
+            || struck_through(ast, link.line, link.col)
+        {
+            continue;
+        }
+
+        let decoded = percent_decode(path);
+        let resolved = lexical_normalize(&dir.join(&decoded));
+
+        let (message, help) = if !resolved.starts_with(&root_real) {
+            (
+                format!("{kind} target lies outside the linted root: {path}"),
+                format!(
+                    "nothing under this root can guarantee the target travels with it. \
+                     If the target is a sibling inside the same repository — the usual case \
+                     under `--recursive`, where each nested config is its own root — exempt \
+                     it with `allow = [\"{path}\"]`; otherwise move it inside the root"
+                ),
+            )
+        } else if !resolved.exists() {
+            (
+                format!("{kind} target does not exist: {path}"),
+                "check the path for a rename or a typo — it resolves relative to this file, \
+                 not to the repository root"
+                    .to_owned(),
+            )
+        } else if let Some(actual) = case_mismatch(&resolved, &root_real) {
+            (
+                format!(
+                    "{kind} target resolves only on a case-insensitive filesystem: \
+                     {path} is {actual} on disk"
+                ),
+                "case-insensitive filesystems (macOS, Windows) accept this; Linux hosts and \
+                 GitHub's renderer do not — match the casing on disk"
+                    .to_owned(),
+            )
+        } else {
+            continue;
+        };
+
+        out.push(
+            diagnostic_at(
+                as_error,
+                LINK_RESOLVED,
+                doc.location.clone(),
+                link.line,
+                link.col,
+                message,
+            )
+            .with_help(help),
+        );
+    }
+
+    for broken in &ast.broken_refs {
+        // `![alt][ref]` is a reference *image*: pulldown reports it with
+        // the same `LinkType::Reference` an `[alt][ref]` link gets, so
+        // without this the `images = false` switch silences inline images
+        // and leaks reference ones (review finding 2).
+        if broken.is_image && !lint_images {
+            continue;
+        }
+        if struck_through(ast, broken.line, broken.col) {
+            continue;
+        }
+        out.push(
+            diagnostic_at(
+                as_error,
+                LINK_RESOLVED,
+                doc.location.clone(),
+                broken.line,
+                broken.col,
+                format!(
+                    "reference-style link `[{}]` has no matching definition — it renders as \
+                     literal text, not a link",
+                    broken.reference
+                ),
+                )
+            .with_help(format!(
+                "add a `[{}]: <path>` definition, or write the link inline",
+                broken.reference
+            )),
+        );
+    }
+
+    out
+}
+
+/// True when the position sits inside a strikethrough span.
+///
+/// `core.cross-ref` already treats strikethrough as *retirement* — an
+/// unresolved `ADR-404` inside `~~…~~` is deliberately not reported. A
+/// link rule that read the same markup as rot would have the two rules
+/// disagreeing about what an author meant by striking something out
+/// (review finding 3). Spans are single-line, as the AST records them.
+fn struck_through(ast: &crate::ast::Ast, line: u32, col: u32) -> bool {
+    ast.strikethrough_spans
+        .iter()
+        .any(|span| span.line == line && col >= span.col_start && col <= span.col_end)
+}
+
+/// One diagnostic at the severity a `severity` param selected. The three
+/// `core.link-resolved` classes differ in message, never in level.
+fn diagnostic_at(
+    as_error: bool,
+    code: &str,
+    location: String,
+    line: u32,
+    col: u32,
+    message: String,
+) -> Diagnostic {
+    if as_error {
+        Diagnostic::error(code, location, line, col, message)
+    } else {
+        Diagnostic::warning(code, location, line, col, message)
+    }
+}
+
+/// The `allow` param compiled to a glob set. An unparseable glob is
+/// dropped rather than failing the run: `allow` is an escape hatch, and a
+/// typo in it must not take down the lint it was meant to quiet.
+fn allow_globs(params: Option<&Value>) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    if let Some(list) = params.and_then(|p| p.get("allow")).and_then(Value::as_array) {
+        for pattern in list.iter().filter_map(Value::as_str) {
+            if let Ok(glob) = globset::Glob::new(pattern) {
+                builder.add(glob);
+            }
+        }
+    }
+    builder.build().unwrap_or_else(|_| globset::GlobSet::empty())
+}
+
+/// True when `href` carries a URL scheme (`https:`, `mailto:`, `tel:`) or
+/// is protocol-relative (`//cdn.example`).
+///
+/// The scheme must be alphanumeric-plus-`+.-` and start with a letter, so
+/// a path that merely contains a colon (`docs/a:b.md`) is still treated as
+/// a path.
+fn has_scheme(href: &str) -> bool {
+    if href.starts_with("//") {
+        return true;
+    }
+    let Some(idx) = href.find(':') else {
+        return false;
+    };
+    let scheme = &href[..idx];
+    !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'))
+}
+
+/// Percent-decode `%20`-style escapes. Markdown links to paths with
+/// spaces are written encoded but must be resolved decoded. An invalid
+/// escape or non-UTF-8 result leaves the input untouched.
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+}
+
+/// A path made absolute and `.`/`..`-free without resolving symlinks.
+///
+/// Deliberately not `canonicalize`: containment is only meaningful when
+/// both sides are expressed the same way, and canonicalize rewrites one
+/// of them into a different symlink-space.
+fn absolutize(path: &Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        lexical_normalize(path)
+    } else {
+        let base = std::env::current_dir().unwrap_or_default();
+        lexical_normalize(&base.join(path))
+    }
+}
+
+/// Resolve `.` and `..` textually, without touching the filesystem.
+///
+/// `canonicalize` cannot be used for containment here: it fails outright
+/// on a path that does not exist, which is exactly the case this rule
+/// reports on.
+fn lexical_normalize(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The on-disk spelling of `path` when it differs from how `path` was
+/// written, or `None` when every component matches exactly.
+///
+/// `canonicalize` looks like the cheap way to do this — on macOS it does
+/// return the corrected case — but it answers a different question. It
+/// also resolves symlinks, so comparing its output against the input
+/// reports every path that traverses a symlink as a casing error. A repo
+/// that keeps `docs/current -> docs/v2` would light up on links that are
+/// spelled perfectly. Comparing each component against the directory
+/// listing that contains it separates the two, and names the component
+/// that actually differs rather than an absolute path the reader must
+/// diff by eye.
+///
+/// (It is also the only form that works on a case-*sensitive* volume,
+/// where the wrong-case path simply does not exist — but that case is
+/// already caught by the existence arm above.)
+fn case_mismatch(path: &Path, root: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut corrected = root.to_path_buf();
+    let mut differs = false;
+    // Walk every component, not just up to the first mismatch: returning
+    // early names a prefix, and a message comparing a full path against a
+    // truncated one gives the reader two things that are not the same
+    // shape (review finding 5). Correcting as we descend also keeps the
+    // remaining lookups valid on a case-sensitive volume.
+    for component in relative.components() {
+        let name = component.as_os_str();
+        let entries: Vec<_> = std::fs::read_dir(&corrected)
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        if entries.iter().any(|e| e == name) {
+            corrected.push(name);
+        } else {
+            let actual = entries.into_iter().find(|e| {
+                e.to_string_lossy()
+                    .eq_ignore_ascii_case(&name.to_string_lossy())
+            })?;
+            corrected.push(actual);
+            differs = true;
+        }
+    }
+    if !differs {
+        return None;
+    }
+    Some(corrected.strip_prefix(root).ok()?.display().to_string())
 }
 
 /// `agents.context-budget` (ACX-006): dangling `@path` imports and an
@@ -4105,17 +4471,29 @@ pub(crate) fn check_calendar_freshness(
 /// zero-padded string, so both `88-slug.md` and `088-slug.md` satisfy
 /// `id: NS-88` (FNM-003) — padding width is a cosmetic convention this
 /// rule deliberately does not police.
+///
+/// The rule's real precondition is "this document has a filename", not
+/// "this document has an id" (ADR-123 § LOC-004). A document whose
+/// `file` is `None` — a source-provided one whose `location` is a
+/// citation, URL, or other identifier, which ADR-005 § the envelope
+/// schema expressly permits — has nothing to rename, so there is nothing
+/// to assert and no diagnostic is emitted (BUG-059). This is a total
+/// function of the struct: it reads no `root` and touches no filesystem.
 pub(crate) fn check_file_name(
     doc: &Document,
     _params: Option<&Value>,
     _root: &Path,
 ) -> Vec<Diagnostic> {
-    // `doc.location` is the root-relative path (e.g. `docs/adrs/091-x.md`);
-    // the convention constrains the final path component only.
-    let file_name = Path::new(&doc.location)
+    // The convention constrains the final path component only. Read the
+    // filename off `doc.file`, resolved once at ingest — never parsed
+    // back out of `doc.location`, which may be a label rather than a path.
+    let Some(path) = doc.file.as_deref() else {
+        return Vec::new();
+    };
+    let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or(doc.location.as_str());
+        .unwrap_or_default();
     let digits: String = file_name
         .chars()
         .take_while(|c| c.is_ascii_digit())
@@ -6295,6 +6673,7 @@ mod tests {
     use super::*;
     use crate::ast::{Ast, Heading, Link};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     /// Prose-drift guard for the third copy of the `research.type` vocabulary
     /// (ADR-095). The enforcement const `RESEARCH_TYPES` and the `research.type`
@@ -6326,6 +6705,7 @@ mod tests {
                 .unwrap_or_else(|_| "ADR-1".parse().unwrap()),
             raw_id: String::new(),
             location: location.to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -6812,6 +7192,7 @@ mod tests {
             id: "ADR-1".parse().unwrap(),
             raw_id: String::new(),
             location: "TODO.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -7021,6 +7402,7 @@ extra section
             id: "ADR-1".parse().unwrap(),
             raw_id: String::new(),
             location: "docs/tasks/TASK-1.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -7121,6 +7503,7 @@ tests pass
             id: "TASK-900".parse().unwrap(),
             raw_id: "TASK-900".to_owned(),
             location: "docs/tasks/TASK-900-probe.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines,
             metadata,
@@ -7160,6 +7543,7 @@ tests pass
             id: "TASK-901".parse().unwrap(),
             raw_id: "TASK-901".to_owned(),
             location: "docs/tasks/TASK-901.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -7528,6 +7912,7 @@ shall is discussed in the EARS paper.
             id: "ADR-1".parse().unwrap(),
             raw_id: String::new(),
             location: location.to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -7761,6 +8146,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/adrs/{raw_id}.md"),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines,
             metadata,
@@ -7841,6 +8227,7 @@ shall is discussed in the EARS paper.
             id: "ADR-1".parse().unwrap(),
             raw_id: String::new(),
             location: "DESIGN.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -7959,6 +8346,7 @@ shall is discussed in the EARS paper.
             id: "PRODUCT-0".parse().unwrap(),
             raw_id: String::new(),
             location: "PRODUCT.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -8111,6 +8499,7 @@ shall is discussed in the EARS paper.
             id: "ADR-1".parse().unwrap(),
             raw_id: String::new(),
             location: "DESIGN.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata,
@@ -8250,6 +8639,7 @@ shall is discussed in the EARS paper.
             id: "STYLE-0".parse().unwrap(),
             raw_id: String::new(),
             location: "STYLE.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -8325,6 +8715,7 @@ shall is discussed in the EARS paper.
             id: "STYLE-0".parse().unwrap(),
             raw_id: String::new(),
             location: location.to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -8398,6 +8789,7 @@ shall is discussed in the EARS paper.
             id: "SOUL-0".parse().unwrap(),
             raw_id: String::new(),
             location: "SOUL.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -8667,6 +9059,7 @@ shall is discussed in the EARS paper.
             id: "SOUL-0".parse().unwrap(),
             raw_id: String::new(),
             location: location.to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata: BTreeMap::new(),
@@ -8764,6 +9157,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().expect("valid id"),
             raw_id: raw_id.to_string(),
             location: format!("docs/specs/{}.md", raw_id.to_lowercase()),
+            file: None,
             depends_on: depends_on.into_iter().map(String::from).collect(),
             frontmatter_lines,
             metadata: BTreeMap::new(),
@@ -8927,6 +9321,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/secrevs/{raw_id}.md"),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines,
             metadata: BTreeMap::new(),
@@ -8958,13 +9353,25 @@ shall is discussed in the EARS paper.
 
     // -- core.file-name (ADR-091 § FNM-001) ------------------------------
 
+    /// A file-backed document: `location` is a root-relative path and
+    /// ingest resolved a `file` for it, as the markdown walker does.
     fn fname_doc(raw_id: &str, location: &str) -> Document {
+        let mut d = fname_doc_fileless(raw_id, location);
+        d.file = Some(PathBuf::from(location));
+        d
+    }
+
+    /// A file-less document: `location` is a bare label, exactly what
+    /// ADR-005 § the envelope schema permits a source to emit, so ingest
+    /// resolved no `file` (ADR-123 § LOC-003).
+    fn fname_doc_fileless(raw_id: &str, location: &str) -> Document {
         let mut frontmatter_lines = BTreeMap::new();
         frontmatter_lines.insert("id".to_owned(), 2u32);
         Document {
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: location.to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines,
             metadata: BTreeMap::new(),
@@ -9027,6 +9434,63 @@ shall is discussed in the EARS paper.
         );
     }
 
+    #[test]
+    fn file_name_bug_059_silent_when_document_has_no_file() {
+        // BUG-059 / ADR-123 § LOC-004: a source emitted a Finnish statute
+        // citation as its `location`. `Path::file_name` used to read the
+        // `/` in `1290/2002` as a directory separator and report a bogus
+        // `2002` prefix mismatch. With no file resolved at ingest there is
+        // nothing to rename, so the rule has nothing to assert.
+        let d = fname_doc_fileless("STATUTE-1", "Työttömyysturvalaki 1290/2002 §6(1)");
+        assert!(check_file_name(&d, None, Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn file_name_bug_059_silent_when_no_file_even_for_path_shaped_location() {
+        // The predicate is file-backedness, not the shape of the string:
+        // a label that happens to look like a mismatching path is still
+        // silent when ingest resolved no file for it.
+        let d = fname_doc_fileless("ADR-88", "docs/adrs/087-roadmap.md");
+        assert!(check_file_name(&d, None, Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn file_name_clean_when_resolved_file_prefix_matches_id() {
+        // A source-provided document that *does* name a real file keeps
+        // the full check (ADR-123 rejects provenance as the predicate).
+        let d = fname_doc("ADR-91", "docs/adrs/091-file-name-rule.md");
+        assert_eq!(
+            d.file,
+            Some(PathBuf::from("docs/adrs/091-file-name-rule.md"))
+        );
+        assert!(check_file_name(&d, None, Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn file_name_errors_when_resolved_file_prefix_mismatches_id() {
+        let d = fname_doc("ADR-88", "docs/adrs/087-roadmap.md");
+        let diags = check_file_name(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.file-name");
+        assert_eq!(
+            diags[0].message,
+            "ADR-88: filename prefix `087` does not match the id number 88"
+        );
+    }
+
+    #[test]
+    fn file_name_errors_when_resolved_file_has_no_numeric_prefix() {
+        let d = fname_doc("ADR-88", "docs/adrs/roadmap-namespace.md");
+        let diags = check_file_name(&d, None, Path::new("."));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "core.file-name");
+        assert_eq!(
+            diags[0].message,
+            "ADR-88: filename `roadmap-namespace.md` has no numeric prefix — \
+             expected it to start with `88` to match the id"
+        );
+    }
+
     // -- core.calendar-freshness (ADR-040 § PIN-008) ---------------------
 
     #[test]
@@ -9044,6 +9508,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/policies/{raw_id}.md"),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines,
             metadata,
@@ -9098,6 +9563,435 @@ shall is discussed in the EARS paper.
         assert!(check_calendar_freshness(&d, Some(&params), Path::new(".")).is_empty());
     }
 
+    // -- core.link-resolved (ADR-125 § LNK-001..008) ---------------------
+
+    /// A document written to disk under `root` and parsed by the real
+    /// markdown pipeline, so these tests exercise `parse_ast` rather than
+    /// a hand-built AST that could disagree with it.
+    fn linking_doc(root: &Path, location: &str, body: &str) -> Document {
+        let full = root.join(location);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&full, body).expect("write document");
+        Document {
+            id: "ADR-1".parse().unwrap(),
+            raw_id: String::new(),
+            location: location.to_owned(),
+            // What the walker records (ADR-123 § LOC-002) — the path it
+            // actually opened, not a re-derivation from `location`.
+            file: Some(full.clone()),
+            depends_on: Vec::new(),
+            frontmatter_lines: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            pin: None,
+            ast: Some(crate::source::markdown::parse_ast(body)),
+            body: body.to_owned(),
+        }
+    }
+
+    fn touch(root: &Path, relative: &str) {
+        let full = root.join(relative);
+        std::fs::create_dir_all(full.parent().expect("has parent")).expect("create dirs");
+        std::fs::write(&full, "# placeholder\n").expect("write file");
+    }
+
+    #[test]
+    fn link_to_a_renamed_document_is_reported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        touch(root, "docs/adrs/031-ears-clause-syntax-and-requirement-ids.md");
+        let d = linking_doc(
+            root,
+            "docs/specs/003-status-done-gate.md",
+            "# Spec\n\nSee [the EARS ADR](../adrs/031-ears-clause-syntax.md).\n",
+        );
+        let diags = check_link_resolved(&d, None, root);
+        assert_eq!(diags.len(), 1, "expected one broken link: {diags:?}");
+        assert_eq!(diags[0].code, "core.link-resolved");
+        assert!(
+            diags[0].message.contains("does not exist"),
+            "{}",
+            diags[0].message
+        );
+        assert_eq!(
+            diags[0].severity,
+            crate::diagnostic::Severity::Warning,
+            "default severity is warning — it ships in the zero-config set"
+        );
+        assert_eq!(diags[0].line, Some(3), "anchored at the link, not the file");
+    }
+
+    #[test]
+    fn link_that_resolves_relative_to_the_document_passes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        touch(root, "docs/adrs/046-requires-link.md");
+        let d = linking_doc(
+            root,
+            "docs/specs/003-status-done-gate.md",
+            "# Spec\n\nSee [ADR-046](../adrs/046-requires-link.md).\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "a resolvable relative link must pass"
+        );
+    }
+
+    #[test]
+    fn fragment_and_query_are_stripped_before_resolving() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        touch(root, "docs/adrs/046-requires-link.md");
+        let d = linking_doc(
+            root,
+            "docs/specs/003-status-done-gate.md",
+            "# Spec\n\nSee [RRF-001](../adrs/046-requires-link.md#requirements).\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "the anchor is not resolved — only the path half is"
+        );
+    }
+
+    #[test]
+    fn pure_fragment_link_is_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "docs/adrs/125-link-resolved.md",
+            "# ADR\n\nSee [Open Questions](#open-questions) below.\n",
+        );
+        assert!(check_link_resolved(&d, None, root).is_empty());
+    }
+
+    #[test]
+    fn scheme_qualified_and_protocol_relative_urls_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\n[site](https://ctxgrd.aktagon.com) \
+             [mail](mailto:christian@aktagon.com) \
+             [cdn](//cdn.aktagon.com/logo.svg)\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "external URLs are out of scope for an internal-link rule"
+        );
+    }
+
+    #[test]
+    fn site_absolute_link_is_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "docs/guides/getting-started.md",
+            "# Guide\n\nSee [the rules](/docs/rules.md).\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "a repo linter cannot know which directory an SSG serves as `/`"
+        );
+    }
+
+    #[test]
+    fn link_matching_on_disk_only_by_case_is_reported() {
+        // The load-bearing test. `canonicalize` on macOS returns the path
+        // as *given*, so an implementation built on it passes this link
+        // silently on the machine that authored it and 404s on the Linux
+        // host that serves it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        touch(root, "docs/adrs/046-requires-link.md");
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\nSee [ADR-046](docs/ADRS/046-requires-link.md).\n",
+        );
+        let diags = check_link_resolved(&d, None, root);
+        assert_eq!(diags.len(), 1, "expected one case diagnostic: {diags:?}");
+        assert!(
+            diags[0].message.contains("case-insensitive"),
+            "{}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains("docs/adrs"),
+            "the message must name the on-disk spelling: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn link_through_a_symlinked_directory_is_not_a_casing_error() {
+        // The test that picks the implementation. `canonicalize` resolves
+        // symlinks as well as case, so an implementation that compares its
+        // output against the written path reports this perfectly-spelled
+        // link as a casing error. Comparing directory entries does not.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        touch(root, "docs/v2/rules.md");
+        std::os::unix::fs::symlink(root.join("docs/v2"), root.join("docs/current"))
+            .expect("create symlink");
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\nSee [the rules](docs/current/rules.md).\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "a link through a symlink is spelled correctly and must stay silent"
+        );
+    }
+
+    #[test]
+    fn link_target_outside_the_root_gets_its_own_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).expect("create root");
+        // The target exists on disk, just not inside the linted tree —
+        // the case a plain existence check would wave through.
+        touch(tmp.path(), "briefs/001-kernel.md");
+        let d = linking_doc(
+            &root,
+            "README.md",
+            "# ctxgrd\n\nThe contract is in [the brief](../briefs/001-kernel.md).\n",
+        );
+        let diags = check_link_resolved(&d, None, &root);
+        assert_eq!(diags.len(), 1, "expected one diagnostic: {diags:?}");
+        assert!(
+            diags[0].message.contains("outside the linted root"),
+            "an escaping link needs its own message, not 'does not exist': {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn allow_glob_exempts_an_intentionally_external_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).expect("create root");
+        let d = linking_doc(
+            &root,
+            "README.md",
+            "# ctxgrd\n\nThe contract is in [the brief](../docs/briefs/001-kernel.md).\n",
+        );
+        let params = serde_json::json!({ "allow": ["../docs/briefs/*"] });
+        assert!(
+            check_link_resolved(&d, Some(&params), &root).is_empty(),
+            "an allow glob must silence the target it names"
+        );
+    }
+
+    #[test]
+    fn image_destination_is_checked_and_can_be_switched_off() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\n![the demo](assets/demo.svg)\n",
+        );
+        let diags = check_link_resolved(&d, None, root);
+        assert_eq!(diags.len(), 1, "images are checked by default: {diags:?}");
+        assert!(
+            diags[0].message.starts_with("image target"),
+            "the message must say which kind it is: {}",
+            diags[0].message
+        );
+
+        let params = serde_json::json!({ "images": false });
+        assert!(
+            check_link_resolved(&d, Some(&params), root).is_empty(),
+            "`images = false` must silence asset paths"
+        );
+    }
+
+    #[test]
+    fn undefined_reference_link_is_reported_but_bracketed_prose_is_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "docs/adrs/125-link-resolved.md",
+            "# ADR\n\nSee [the brief][brief-001]. The protocol is in [ADR-046].\n",
+        );
+        let diags = check_link_resolved(&d, None, root);
+        assert_eq!(
+            diags.len(),
+            1,
+            "the reference fires, the prose token does not: {diags:?}"
+        );
+        assert!(
+            diags[0].message.contains("brief-001"),
+            "{}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains("ADR-046"),
+            "bracketed prose must never be reported: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn link_inside_a_code_fence_is_not_checked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "docs/guides/getting-started.md",
+            "# Guide\n\n```markdown\n[example](../adrs/999-does-not-exist.md)\n```\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "a link shown as sample code is not a link"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_space_resolves_to_the_real_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        touch(root, "docs/release notes.md");
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\nSee [the notes](docs/release%20notes.md).\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "an encoded space must be decoded before resolving"
+        );
+    }
+
+    #[test]
+    fn severity_param_promotes_the_diagnostic_to_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\nSee [the guide](docs/guides/getting-started.md).\n",
+        );
+        let params = serde_json::json!({ "severity": "error" });
+        let diags = check_link_resolved(&d, Some(&params), root);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, crate::diagnostic::Severity::Error);
+    }
+
+    #[test]
+    fn source_supplied_document_with_no_file_is_silent() {
+        // ADR-005 lets a source use any identifier as `location`. Joining
+        // one onto the root invents a directory, and every relative link
+        // is then measured against a place that does not exist. This is
+        // the BUG-059 shape, and it bites harder here because the rule
+        // ships zero-config: an undeclared source-fed namespace inherits
+        // it without opting in.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let body = "# Ticket\n\nSee [the plan](../design/plan.md).\n";
+        let d = Document {
+            id: "TICKET-1".parse().unwrap(),
+            raw_id: String::new(),
+            location: "https://jira.example.com/browse/TICKET-1".to_owned(),
+            file: None,
+            depends_on: Vec::new(),
+            frontmatter_lines: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            pin: None,
+            ast: Some(crate::source::markdown::parse_ast(body)),
+            body: body.to_owned(),
+        };
+        assert!(
+            check_link_resolved(&d, None, tmp.path()).is_empty(),
+            "a document that is not a file has no directory to resolve links against"
+        );
+    }
+
+    #[test]
+    fn struck_through_link_is_treated_as_retired_not_broken() {
+        // `core.cross-ref` already reads strikethrough as retirement.
+        // Two rules disagreeing about what striking a reference out means
+        // is worse than either answer.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "docs/adrs/125-link-resolved.md",
+            "# ADR\n\nSuperseded: ~~[the old spec](../specs/000-removed.md)~~ - see below.\n",
+        );
+        assert!(
+            check_link_resolved(&d, None, root).is_empty(),
+            "a struck-through link is a retired reference, not rot"
+        );
+    }
+
+    #[test]
+    fn images_false_also_silences_reference_style_images() {
+        // pulldown reports `![alt][ref]` with the same LinkType as
+        // `[text][ref]`, so an images switch that only guards `ast.images`
+        // leaks half the image surface.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\n![the demo][demo-svg] and [the guide][guide-ref].\n",
+        );
+        let params = serde_json::json!({ "images": false });
+        let diags = check_link_resolved(&d, Some(&params), root);
+        assert_eq!(
+            diags.len(),
+            1,
+            "the prose reference still fires, the image one must not: {diags:?}"
+        );
+        assert!(
+            diags[0].message.contains("guide-ref"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn casing_diagnostic_names_the_whole_corrected_path() {
+        // Reporting only up to the first mismatching component leaves the
+        // reader comparing a full path against a prefix.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        touch(root, "docs/adrs/046-requires-link.md");
+        let d = linking_doc(
+            root,
+            "README.md",
+            "# ctxgrd\n\nSee [ADR-046](docs/ADRS/046-requires-link.md).\n",
+        );
+        let diags = check_link_resolved(&d, None, root);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0]
+                .message
+                .contains("docs/adrs/046-requires-link.md"),
+            "the on-disk path must be complete, not truncated at the first \
+             mismatch: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn document_without_an_ast_is_silent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut d = linking_doc(
+            tmp.path(),
+            "README.md",
+            "# ctxgrd\n\n[missing](docs/nope.md)\n",
+        );
+        d.ast = None;
+        assert!(check_link_resolved(&d, None, tmp.path()).is_empty());
+    }
+
     // -- security.vuln-sla (ADR-041 § SEC-004) ---------------------------
 
     /// A VULN finding with the given metadata fields. `frontmatter_lines`
@@ -9113,6 +10007,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/security/findings/{raw_id}.md"),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines,
             metadata,
@@ -9271,6 +10166,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/security/risk-acceptances/{raw_id}.md"),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -9421,6 +10317,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/security/findings/{raw_id}.md"),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -9659,6 +10556,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/compliance/gdpr/ropa/{raw_id}.md"),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -9750,6 +10648,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/compliance/hipaa/safeguards/{raw_id}.md"),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -9903,6 +10802,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/compliance/soc2/controls/{raw_id}.md"),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -10006,6 +10906,7 @@ shall is discussed in the EARS paper.
             id: "SOC2-005".parse().unwrap(),
             raw_id: "SOC2-005".to_owned(),
             location: "docs/compliance/soc2/controls/SOC2-005.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata,
@@ -10052,6 +10953,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: location.to_owned(),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -10150,6 +11052,7 @@ shall is discussed in the EARS paper.
             id: "ISO27001-005".parse().unwrap(),
             raw_id: "ISO27001-005".to_owned(),
             location: "docs/compliance/iso-27001/controls/ISO27001-005.md".to_owned(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata,
@@ -10248,6 +11151,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/compliance/nis2/measures/{raw_id}.md"),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -10432,6 +11336,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/ddd/context-maps/{raw_id}.md"),
+            file: None,
             depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             frontmatter_lines,
             metadata,
@@ -10567,6 +11472,7 @@ shall is discussed in the EARS paper.
             id: raw_id.parse().unwrap(),
             raw_id: raw_id.to_owned(),
             location: format!("docs/tasks/{raw_id}.md"),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: BTreeMap::new(),
             metadata,
@@ -10795,6 +11701,7 @@ shall is discussed in the EARS paper.
             id: "TEST-1".parse().unwrap(),
             raw_id: "TEST-1".to_string(),
             location: "docs/tests/TEST-001-release-1-0.md".to_string(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines,
             metadata,
@@ -10924,6 +11831,7 @@ shall is discussed in the EARS paper.
             id: "CLAUDE-0".parse().unwrap(),
             raw_id: String::new(),
             location: "CLAUDE.md".to_string(),
+            file: None,
             depends_on: Vec::new(),
             frontmatter_lines: std::collections::BTreeMap::new(),
             metadata: std::collections::BTreeMap::new(),

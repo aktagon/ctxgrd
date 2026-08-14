@@ -113,8 +113,11 @@ pub(crate) const RESOLUTION_AWARE_RULES: &[&str] = &[
 /// (`tests/rule_inert.rs`) checks step 6 still runs each of them. Drift the
 /// other way — a new arm added to step 6 and not listed here — produces a
 /// false `cfg.rule-inert`, which is loud rather than silent.
-pub(crate) const ID_KEYED_FILE_LEVEL_RULES: &[&str] =
-    &["core.required-headings", "core.file-budget"];
+pub(crate) const ID_KEYED_FILE_LEVEL_RULES: &[&str] = &[
+    "core.required-headings",
+    "core.file-budget",
+    "core.link-resolved",
+];
 
 /// The authoritative registry of all builtin-compiled rules (REG-001).
 /// `config`, `agent_guide`, and `introspect` derive their views from
@@ -913,6 +916,58 @@ pub(crate) const BUILTIN_RULES: &[BuiltinRule] = &[
         ],
     },
     BuiltinRule {
+        // File-level + dual-dispatched to id-keyed documents (ADR-125
+        // § LNK-007), the `core.file-budget` shape: the link-densest
+        // files in a repo are the id-less singletons (README, CLAUDE,
+        // guides) that the per-document loop never sees, while the
+        // fastest-rotting links live in the id-keyed ADRs and PRDs. One
+        // implementation, both dispatch paths.
+        //
+        // Compiled rather than pure `core.*` because it stats the
+        // filesystem and reads directory listings — the
+        // core.requires-link / core.commit-freshness precedent.
+        code: "core.link-resolved",
+        level: Level::File,
+        check: crate::agent_guide::check_link_resolved,
+        summary: "Every relative link and image in this file points at something that exists.",
+        description: "Reports a relative markdown link or image whose target is missing, lies \
+            outside the linted root, or matches on disk only under a different casing (a link \
+            that works on macOS and 404s on Linux and GitHub); also reports a reference-style \
+            link with no matching definition, which renders as literal text rather than a link. \
+            Skips scheme-qualified and protocol-relative URLs (`https:`, `mailto:`, `//cdn`), \
+            pure `#fragment` links, and site-absolute `/path` links — a repo linter cannot know \
+            which directory a static-site generator serves as `/`. A `#fragment` or `?query` \
+            suffix is stripped before resolving: the path half is checked, the anchor is not. \
+            Bare bracketed prose (`[ADR-046]`) is never treated as a broken reference. Paths \
+            resolve relative to the linting file, not the repository root. Ships in the \
+            zero-config set at `warning`, so it reports on a repo that never opted in without \
+            failing its build.",
+        params: &[
+            Param {
+                name: "severity",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &["error", "warning"],
+                doc: "Diagnostic level per unresolvable link (default warning).",
+            },
+            Param {
+                name: "images",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Whether `![alt](path)` destinations are checked too (default true).",
+            },
+            Param {
+                name: "allow",
+                kind: ParamKind::ConfigParam,
+                optional: true,
+                values: &[],
+                doc: "Globs of link targets to exempt — the escape for intentionally \
+                      external paths.",
+            },
+        ],
+    },
+    BuiltinRule {
         // Document-level (ADR-041 § SEC-004). The generic
         // core.calendar-freshness ages one date unconditionally; this
         // rule keys on `status`/`severity` and varies the window per
@@ -1622,6 +1677,7 @@ mod tests {
             "core.calendar-freshness",
             "core.file-name",
             "core.requires-link",
+            "core.link-resolved",
             "security.vuln-sla",
             "security.risk-expiry",
             "security.remediation-link",
@@ -1654,7 +1710,7 @@ mod tests {
                 "BUILTIN_RULES missing '{expected}'"
             );
         }
-        assert_eq!(codes.len(), 49, "expected exactly 49 builtin rules");
+        assert_eq!(codes.len(), 50, "expected exactly 50 builtin rules");
     }
 
     /// Every conditional-link rule names a real `Level::Document` code, so

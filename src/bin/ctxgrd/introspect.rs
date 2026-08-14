@@ -162,6 +162,10 @@ pub(super) struct StatusCmd {
     pub(super) granularity: Granularity,
     pub(super) lineage: Option<String>,
     pub(super) exit_code: bool,
+    /// Whether rows name their document (`BUG-046`). The CLI's `--no-titles`
+    /// inverted at the parse boundary, so nothing downstream reasons about a
+    /// negative flag.
+    pub(super) titles: bool,
 }
 
 /// ADR-118 § STG-005: document granularity is the only granularity, so
@@ -216,9 +220,11 @@ impl Command for StatusCmd {
         match ctxgrd::status::report_scoped(root, self.lineage.as_deref()) {
             Ok(report) => {
                 match self.format {
-                    StatusFormat::Text => print!("{}", ctxgrd::status::render_report(&report)),
+                    StatusFormat::Text => {
+                        print!("{}", ctxgrd::status::render_report(&report, self.titles))
+                    }
                     StatusFormat::Json => {
-                        println!("{}", ctxgrd::status::render_json(&report))
+                        println!("{}", ctxgrd::status::render_json(&report, self.titles))
                     }
                     StatusFormat::Mermaid => {
                         print!("{}", ctxgrd::status::render_mermaid(&report))

@@ -81,7 +81,11 @@ pub fn entries(documents: &[Document], filter: Option<&str>) -> Vec<DocEntry> {
 /// `llm-agents` pack and some ADR conventions use `name:`. Trying both
 /// keeps the column populated without per-project config — the
 /// first-touch-works property `list` inherits from the rest of ctxgrd.
-fn title_of(doc: &Document) -> String {
+///
+/// Shared with [`crate::status`] (`BUG-046`) rather than reimplemented
+/// there: the two commands render the same corpus, and a second definition
+/// of "the title" is a second place for the `name:` fallback to be missing.
+pub(crate) fn title_of(doc: &Document) -> String {
     ["title", "name"]
         .iter()
         .map(|k| metadata_str(doc, k))
@@ -222,6 +226,7 @@ mod tests {
             id,
             raw_id: raw_id.to_owned(),
             location: format!("adrs/{raw_id}.md"),
+            file: None,
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             frontmatter_lines: BTreeMap::new(),
             metadata,

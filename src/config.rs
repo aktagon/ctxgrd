@@ -38,15 +38,21 @@ pub(crate) const CORE_RULES: [&str; 13] = [
 ];
 
 /// Core rules whose zero-config default includes them — every
-/// namespace without explicit config gets exactly this set. The brief
-/// calls these "the six non-parameterized core rules."
-pub const ZERO_CONFIG_RULES: [&str; 6] = [
+/// namespace without explicit config gets exactly this set. The kernel
+/// brief calls these "the six non-parameterized core rules"; ADR-125
+/// § LNK-008 added a seventh, so the count is no longer written down
+/// anywhere but here. Derive it from `.len()`, never restate it.
+pub const ZERO_CONFIG_RULES: [&str; 7] = [
     "core.frontmatter",
     "core.id",
     "core.id-unique",
     "core.dep-resolved",
     "core.dep-cycle",
     "core.cross-ref",
+    // Warn-only by default (ADR-125 § LNK-008): it reports on a repo
+    // that never opted in without changing that repo's exit code, which
+    // is what makes a zero-config addition safe rather than a tightening.
+    "core.link-resolved",
 ];
 
 /// The envelope floor an activated source is held to when it does not
@@ -169,7 +175,7 @@ pub struct Config {
     /// references opt out here. Suppressing the warning does NOT zero the
     /// coverage count: an ignored namespace still shows in
     /// `namespaces_undeclared`, because it really is linting under the
-    /// six zero-config rules.
+    /// zero-config rules.
     pub ignore_namespaces: Vec<String>,
     /// The `[roles].allowed` vocabulary (ADR-076 § OWN-003). `None` means
     /// the project declared no vocabulary, and `[<NS>].owner` is then
@@ -260,7 +266,7 @@ pub struct ChangelogNamespace {
 }
 
 impl NamespaceConfig {
-    /// Zero-config default — the six non-parameterized core rules,
+    /// Zero-config default — the non-parameterized core rules,
     /// no params, no path declarations.
     pub fn zero_config() -> Self {
         Self {

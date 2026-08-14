@@ -82,6 +82,15 @@ pub struct DocReadiness {
     pub id: String,
     /// The namespace that claims it. JSON `namespace`.
     pub namespace: String,
+    /// The document's `title:` (or `name:`) frontmatter value, empty when it
+    /// declares neither. JSON `title`, whole; the text report fits it to
+    /// [`TITLE_WIDTH`].
+    ///
+    /// `BUG-046`: an id identifies a document without saying anything about
+    /// it, so a queue keyed only by id is unreadable to anyone not already
+    /// holding the corpus in their head — and, with no `title` on the wire,
+    /// unrecoverable by an agent without a second pass over `ctxgrd list`.
+    pub title: String,
     /// The `status` frontmatter value verbatim, or `None` when absent —
     /// which serializes as JSON `null` and counts as non-terminal.
     pub status: Option<String>,
@@ -360,6 +369,11 @@ fn compute_documents(
                 ready: !is_settled_status(status) && blocked_by.is_empty(),
                 id: d.raw_id.clone(),
                 namespace: d.id.namespace.clone(),
+                // Already parsed into `Document.metadata` by the single
+                // ingest pass — the row was simply never given it
+                // (`BUG-046`). Read through `list`'s accessor so the two
+                // commands cannot name the same document differently.
+                title: crate::list::title_of(d),
                 status: status.map(str::to_string),
                 blocked_by,
                 deps,
@@ -370,14 +384,87 @@ fn compute_documents(
     rows
 }
 
+/// The text report's title column, in characters (`BUG-046`).
+///
+/// Measured on this repo: 35 ready rows cost +627 tokens with titles whole
+/// and +272 fitted to 60. The bound is there for legibility, not for the
+/// tokens — this project writes titles as full sentences and the longest is
+/// 202 characters, so untruncated a handful of rows would dominate an
+/// injected report. The JSON field is never cut.
+const TITLE_WIDTH: usize = 60;
+
+/// `title` fitted to [`TITLE_WIDTH`], with an ellipsis standing in for what
+/// was cut so a shortened title never reads as the whole one.
+///
+/// Counts `char`s rather than bytes: a multi-byte title must be cut on a
+/// character boundary, not panic on one.
+fn fit_title(title: &str) -> String {
+    if title.chars().count() <= TITLE_WIDTH {
+        return title.to_string();
+    }
+    let kept: String = title.chars().take(TITLE_WIDTH - 1).collect();
+    format!("{kept}…")
+}
+
+/// One queue line up to the title: `  <id>  <status>`, then the fitted
+/// title. Both buckets share it so they cannot drift into different column
+/// orders.
+///
+/// A `tw` of 0 means *there is no title column* — under `--no-titles`, and
+/// equally in a bucket where no document declares one. The column is then
+/// absent rather than empty, which is what lets the opt-out reproduce the
+/// pre-`BUG-046` output byte for byte rather than approximately.
+fn queue_line(d: &DocReadiness, w: usize, sw: usize, tw: usize) -> String {
+    let mut line = format!("  {:<w$}  {:<sw$}", d.id, doc_label_status(d));
+    if tw > 0 {
+        line.push_str(&format!("  {:<tw$}", fit_title(&d.title)));
+    }
+    line
+}
+
+/// The widest id, status and fitted title in a bucket, so its columns line
+/// up within it.
+///
+/// Status is padded only when a title column follows it — otherwise the
+/// padding is invisible trailing space in the `ready` bucket and a shifted
+/// `←` in the `blocked` one, for no content. So a corpus whose documents
+/// declare no titles renders identically with the flag and without it.
+fn column_widths(rows: &[&DocReadiness], titles: bool) -> (usize, usize, usize) {
+    let w = rows.iter().map(|d| d.id.len()).max().unwrap_or(0);
+    let tw = if titles {
+        rows.iter()
+            .map(|d| fit_title(&d.title).chars().count())
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if tw == 0 {
+        return (w, 0, 0);
+    }
+    let sw = rows
+        .iter()
+        .map(|d| doc_label_status(d).len())
+        .max()
+        .unwrap_or(0);
+    (w, sw, tw)
+}
+
 /// Full `ctxgrd status` text output: a one-line census, then the workable
 /// documents, then the blocked ones with what holds each.
 ///
 /// The census leads because the queue is now the whole corpus — 212 rows
-/// is a wall of text, and the two lists a person acts on are short. Nothing
-/// is truncated: every ready and every blocked document is printed, so the
-/// output never implies coverage it does not have.
-pub fn render_report(report: &Report) -> String {
+/// is a wall of text, and the two lists a person acts on are short. No
+/// *row* is truncated: every ready and every blocked document is printed,
+/// so the output never implies coverage it does not have. The title *cell*
+/// is fitted to [`TITLE_WIDTH`] (`BUG-046`), which is a bound on one column
+/// and not on the census — a shortened title marks itself with an ellipsis,
+/// where a dropped row could not mark itself at all.
+///
+/// WHERE `titles` is false (`--no-titles`), the title column is absent and
+/// the output is byte-identical to the pre-`BUG-046` report — the opt-out
+/// `ADR-074`'s per-session-start inject would need.
+pub fn render_report(report: &Report, titles: bool) -> String {
     let mut out = String::new();
 
     if let Some(root) = &report.lineage {
@@ -404,28 +491,27 @@ pub fn render_report(report: &Report) -> String {
     ));
 
     if !ready.is_empty() {
-        let w = ready.iter().map(|d| d.id.len()).max().unwrap_or(0);
+        let (w, sw, tw) = column_widths(&ready, titles);
         out.push_str("\nready:\n");
         for d in &ready {
-            out.push_str(&format!(
-                "  {:<w$}  {}\n",
-                d.id,
-                d.status.as_deref().unwrap_or("none"),
-                w = w
-            ));
+            // The title ends the line here, so its padding is trimmed off:
+            // a row whose document declares no title must not be wider
+            // than one that does.
+            out.push_str(queue_line(d, w, sw, tw).trim_end());
+            out.push('\n');
         }
     }
 
     if !blocked.is_empty() {
-        let w = blocked.iter().map(|d| d.id.len()).max().unwrap_or(0);
+        let (w, sw, tw) = column_widths(&blocked, titles);
         out.push_str("\nblocked:\n");
         for d in &blocked {
+            // Here the padding stays: `←` and its blockers follow, and a
+            // ragged arrow costs the reader more than the spaces do.
             out.push_str(&format!(
-                "  {:<w$}  {}  ← {}\n",
-                d.id,
-                d.status.as_deref().unwrap_or("none"),
+                "{}  ← {}\n",
+                queue_line(d, w, sw, tw),
                 d.blocked_by.join(", "),
-                w = w
             ));
         }
     }
@@ -467,12 +553,25 @@ pub fn render_report(report: &Report) -> String {
 /// independently of the in-memory [`Report`] (ADR-037 § WIRE-005): `deps`
 /// stays internal, and `status` serializes as `null` when absent rather
 /// than being omitted.
-pub fn render_json(report: &Report) -> String {
+///
+/// WHERE `titles` is false (`--no-titles`), `title` is omitted entirely and
+/// the payload is byte-identical to the pre-`BUG-046` one. `title` is never
+/// fitted to [`TITLE_WIDTH`] here: truncating data in a machine format
+/// destroys what a consumer already paid structure to receive, and the
+/// reason the text report cuts it — line width — does not exist on the wire.
+pub fn render_json(report: &Report, titles: bool) -> String {
     /// One work-queue row (ADR-107 § RDY-001).
     #[derive(serde::Serialize)]
     struct WireDocument<'a> {
         id: &'a str,
         namespace: &'a str,
+        /// `None` means *suppressed by `--no-titles`* and is omitted;
+        /// `Some("")` means the document declares no title, and is emitted
+        /// as an empty string — the distinction a consumer needs to tell
+        /// "you asked me not to" from "there is none", and the same empty
+        /// string `ctxgrd list --format json` publishes for that document.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<&'a str>,
         status: Option<&'a str>,
         ready: bool,
         blocked_by: &'a [String],
@@ -498,6 +597,7 @@ pub fn render_json(report: &Report) -> String {
             .map(|d| WireDocument {
                 id: &d.id,
                 namespace: &d.namespace,
+                title: titles.then_some(d.title.as_str()),
                 status: d.status.as_deref(),
                 ready: d.ready,
                 blocked_by: &d.blocked_by,
@@ -638,6 +738,7 @@ mod tests {
             id: raw_id.parse().expect("valid id"),
             raw_id: raw_id.to_owned(),
             location: format!("{}.md", raw_id.to_lowercase()),
+            file: None,
             depends_on: depends_on.into_iter().map(String::from).collect(),
             frontmatter_lines: Default::default(),
             metadata: Default::default(),
@@ -666,10 +767,21 @@ mod tests {
         DocReadiness {
             id: id.to_string(),
             namespace: id.split('-').next().unwrap_or(id).to_string(),
+            title: String::new(),
             status: status.map(str::to_string),
             ready,
             blocked_by: blocked_by.iter().map(|s| s.to_string()).collect(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// [`row`] with a title — the `BUG-046` column. Kept separate so the
+    /// rows every other test builds stay title-less, which is also the
+    /// case that proves an untitled document does not widen its line.
+    fn titled_row(id: &str, title: &str, status: Option<&str>, blocked_by: &[&str]) -> DocReadiness {
+        DocReadiness {
+            title: title.to_string(),
+            ..row(id, status, blocked_by.is_empty(), blocked_by, blocked_by)
         }
     }
 
@@ -886,14 +998,17 @@ mod tests {
 
     #[test]
     fn stg003_json_is_the_work_queue_and_nothing_else() {
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&queue_report())).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&queue_report(), true)).unwrap();
         assert_eq!(
             parsed,
+            // `title: ""` — these rows are built title-less, and an absent
+            // title is an empty string on the wire, never `null`
+            // (`BUG-046`; `null` is reserved for `status`).
             json!({
                 "documents": [
-                    {"id": "ADR-001", "namespace": "ADR", "status": "accepted",
+                    {"id": "ADR-001", "namespace": "ADR", "title": "", "status": "accepted",
                      "ready": false, "blocked_by": []},
-                    {"id": "SPEC-001", "namespace": "SPEC", "status": null,
+                    {"id": "SPEC-001", "namespace": "SPEC", "title": "", "status": null,
                      "ready": false, "blocked_by": ["ADR-002"]}
                 ]
             })
@@ -906,7 +1021,7 @@ mod tests {
         // remains", so a future field that reintroduces one of them by name
         // fails here and not merely in a whole-object comparison somebody
         // might update by hand.
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&queue_report())).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&queue_report(), true)).unwrap();
         for gone in [
             "stages",
             "edges",
@@ -924,14 +1039,14 @@ mod tests {
     #[test]
     fn lineage_and_shared_appear_only_when_scoped() {
         let global: serde_json::Value =
-            serde_json::from_str(&render_json(&queue_report())).unwrap();
+            serde_json::from_str(&render_json(&queue_report(), true)).unwrap();
         assert!(global.get("lineage").is_none());
         assert!(global.get("shared").is_none());
 
         let mut scoped = queue_report();
         scoped.lineage = Some("ADR-001".to_string());
         scoped.shared = vec!["ADR-042".to_string()];
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&scoped)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&scoped, true)).unwrap();
         assert_eq!(parsed["lineage"], json!("ADR-001"));
         assert_eq!(parsed["shared"], json!(["ADR-042"]));
     }
@@ -1051,7 +1166,7 @@ mod tests {
                 row("SPEC-006", Some("draft"), false, &["ADR-008"], &["ADR-008"]),
             ],
         };
-        insta::assert_snapshot!(render_report(&report), @r"
+        insta::assert_snapshot!(render_report(&report, true), @r"
         3 documents · 1 ready · 1 blocked · 1 settled
 
         ready:
@@ -1071,7 +1186,7 @@ mod tests {
             shared: Vec::new(),
             documents: vec![row("ADR-001", Some("accepted"), false, &[], &[])],
         };
-        let out = render_report(&report);
+        let out = render_report(&report, true);
         assert!(out.contains("1 documents · 0 ready · 0 blocked · 1 settled"), "out:\n{out}");
         assert!(out.contains("nothing open."), "out:\n{out}");
     }
@@ -1083,8 +1198,188 @@ mod tests {
             shared: vec!["ADR-115".to_string()],
             documents: vec![row("ADR-117", Some("accepted"), false, &[], &[])],
         };
-        let out = render_report(&report);
+        let out = render_report(&report, true);
         assert!(out.contains("lineage: ADR-117"), "out:\n{out}");
         assert!(out.contains("shared with: ADR-115"), "out:\n{out}");
+    }
+
+    // --- BUG-046: the row names its document -----------------------------
+
+    /// Two workable rows and one held one, all titled. `RUN-001` is the
+    /// document the bug was filed over: twelve `status` invocations across
+    /// one session read it as queue noise while its title was the answer
+    /// being searched for.
+    fn titled_report() -> Report {
+        Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![
+                titled_row("BUG-003", "Frontmatter parse drops a key", Some("open"), &[]),
+                titled_row(
+                    "RUN-001",
+                    "Publish a release to the public mirror",
+                    Some("active"),
+                    &[],
+                ),
+                titled_row("SPEC-006", "Ledger reconciliation", Some("draft"), &["ADR-008"]),
+            ],
+        }
+    }
+
+    #[test]
+    fn bug046_the_text_report_names_each_row_and_still_reports_readiness() {
+        // Asserted as a pair (`ADR-112` § CLR-007). A change that printed
+        // the title *instead of* the status would satisfy "titles appear",
+        // so the columns it must not displace are pinned in the same
+        // snapshot: status on both rows, `←` and its blockers on the
+        // blocked one.
+        insta::assert_snapshot!(render_report(&titled_report(), true), @r"
+        3 documents · 2 ready · 1 blocked · 0 settled
+
+        ready:
+          BUG-003  open    Frontmatter parse drops a key
+          RUN-001  active  Publish a release to the public mirror
+
+        blocked:
+          SPEC-006  draft  Ledger reconciliation  ← ADR-008
+
+        tip: --format json for agents, mermaid/dot for diagrams
+        ");
+    }
+
+    #[test]
+    fn bug046_no_titles_reproduces_the_previous_report_byte_for_byte() {
+        // The other half of the pair, and `ADR-074`'s lever: the opt-out
+        // must be the old output exactly, not a near-miss with stray
+        // padding where the column used to be.
+        let expected = "3 documents · 2 ready · 1 blocked · 0 settled\n\
+                        \nready:\n\
+                        \x20 BUG-003  open\n\
+                        \x20 RUN-001  active\n\
+                        \nblocked:\n\
+                        \x20 SPEC-006  draft  ← ADR-008\n\
+                        \ntip: --format json for agents, mermaid/dot for diagrams\n";
+        assert_eq!(render_report(&titled_report(), false), expected);
+    }
+
+    #[test]
+    fn bug046_an_untitled_row_does_not_carry_the_column_as_whitespace() {
+        // The ready bucket's title is the last column, so a document that
+        // declares no title must end at its status — trailing spaces would
+        // be an invisible cost on every injected report.
+        let report = Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![
+                titled_row("BUG-003", "Frontmatter parse drops a key", Some("open"), &[]),
+                titled_row("BUG-004", "", Some("open"), &[]),
+            ],
+        };
+        let out = render_report(&report, true);
+        assert!(out.contains("  BUG-004  open\n"), "out:\n{out}");
+    }
+
+    #[test]
+    fn bug046_a_long_title_is_fitted_and_says_it_was_cut() {
+        // This repo writes titles as full sentences; the longest is 202
+        // characters. Untruncated, one row would dominate the report.
+        let long = "a".repeat(80);
+        let report = Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![titled_row("BUG-003", &long, Some("open"), &[])],
+        };
+        let out = render_report(&report, true);
+        let fitted = format!("{}…", "a".repeat(TITLE_WIDTH - 1));
+        assert!(out.contains(&fitted), "out:\n{out}");
+        assert!(!out.contains(&long), "the whole title survived:\n{out}");
+    }
+
+    #[test]
+    fn bug046_fit_title_cuts_on_a_character_boundary() {
+        // `chars`, not bytes: a multi-byte title must be shortened, not
+        // panic. Slicing `&title[..59]` here would be a crash on a corpus
+        // that is not ASCII.
+        let title = "é".repeat(80);
+        let fitted = fit_title(&title);
+        assert_eq!(fitted.chars().count(), TITLE_WIDTH);
+        assert!(fitted.ends_with('…'), "fitted: {fitted}");
+    }
+
+    #[test]
+    fn bug046_a_title_at_the_limit_is_left_whole() {
+        let exact = "b".repeat(TITLE_WIDTH);
+        assert_eq!(fit_title(&exact), exact);
+    }
+
+    #[test]
+    fn bug046_json_carries_the_title_untruncated() {
+        // A machine format has no line to overflow, and a consumer that
+        // asked for structure has already paid for it — so the text
+        // report's bound must not follow the title onto the wire.
+        let long = "a".repeat(80);
+        let report = Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![titled_row("BUG-003", &long, Some("open"), &[])],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(&report, true)).unwrap();
+        assert_eq!(parsed["documents"][0]["title"], json!(long));
+        // The paired half: adding the field displaced nothing.
+        assert_eq!(parsed["documents"][0]["status"], json!("open"));
+        assert_eq!(parsed["documents"][0]["ready"], json!(true));
+    }
+
+    #[test]
+    fn bug046_json_omits_the_title_field_under_no_titles() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(&titled_report(), false)).unwrap();
+        assert!(
+            parsed["documents"][0].get("title").is_none(),
+            "parsed:\n{parsed:#}"
+        );
+        assert_eq!(parsed["documents"][0]["id"], json!("BUG-003"));
+    }
+
+    #[test]
+    fn bug046_a_titleless_document_serializes_an_empty_string_not_null() {
+        // `null` would collide with "suppressed"; the empty string is what
+        // `ctxgrd list --format json` publishes for the same document.
+        let report = Report {
+            lineage: None,
+            shared: Vec::new(),
+            documents: vec![titled_row("BUG-004", "", Some("open"), &[])],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(&report, true)).unwrap();
+        assert_eq!(parsed["documents"][0]["title"], json!(""));
+    }
+
+    #[test]
+    fn bug046_the_projection_reads_the_title_from_frontmatter() {
+        // End to end through `compute_documents`, so the row is fed by the
+        // same ingest the report runs on rather than by a test constructor.
+        let mut d = doc_with_status("RUN-001", "active", vec![]);
+        d.metadata.insert(
+            "title".to_string(),
+            serde_json::Value::String("Publish a release to the public mirror".to_string()),
+        );
+        let rows = readiness(&[d]);
+        assert_eq!(rows[0].title, "Publish a release to the public mirror");
+    }
+
+    #[test]
+    fn bug046_the_title_falls_back_to_name_as_list_does() {
+        // Shared with `list::title_of`, so the `name:` convention some
+        // packs use is not a blank column in one command and a title in
+        // the other.
+        let mut d = doc_with_status("GUIDE-001", "active", vec![]);
+        d.metadata.insert(
+            "name".to_string(),
+            serde_json::Value::String("Getting started".to_string()),
+        );
+        let rows = readiness(&[d]);
+        assert_eq!(rows[0].title, "Getting started");
     }
 }

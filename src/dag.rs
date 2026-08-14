@@ -326,6 +326,7 @@ mod tests {
             id: raw_id.parse().expect("valid id"),
             raw_id: raw_id.to_owned(),
             location: location.to_owned(),
+            file: None,
             depends_on: depends_on.into_iter().map(String::from).collect(),
             frontmatter_lines: Default::default(),
             metadata: Default::default(),

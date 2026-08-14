@@ -47,10 +47,10 @@ pub struct RuleEntry {
     pub source: String,
     /// Why this rule applies here: `configured` when `ctxgrd.toml`
     /// declares the namespace, `zero-config` when nothing does and the
-    /// six-rule fallback supplied it (BUG-049).
+    /// zero-config fallback supplied it (BUG-049).
     ///
-    /// A caller needs the distinction to tell "six rules because that is
-    /// the floor" from "six rules because that is what this project
+    /// A caller needs the distinction to tell "these rules because that is
+    /// the floor" from "these rules because that is what this project
     /// chose" — the first is a prompt to run `ctxgrd init` or
     /// `pack add`, the second is a deliberate configuration.
     pub binding: String,
@@ -255,7 +255,7 @@ pub fn rule_descriptions() -> Vec<(&'static str, &'static str)> {
 /// [`crate::run::governed_namespaces`]. It is a superset of
 /// `config.namespaces`: a namespace claimed by a document but absent
 /// from the config resolves through [`Config::namespace_config`] to the
-/// zero-config six, exactly as the lint path resolves it, and is
+/// zero-config set, exactly as the lint path resolves it, and is
 /// reported with `binding: "zero-config"` (BUG-049).
 ///
 /// Passing only `config.namespaces.keys()` reproduces the pre-fix

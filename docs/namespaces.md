@@ -271,7 +271,7 @@ warning[cfg.namespace-undeclared]: 2 documents claim namespace 'REPORT', which c
 
 This is the check for a convention a team invented but never declared. Such
 documents are *not* skipped — they are ingested, listed by `ctxgrd list`, and
-linted, but only under the six zero-config core rules, with the run still
+linted, but only under the zero-config core rules, with the run still
 reporting `ok`. One diagnostic is emitted per namespace (not per document),
 anchored at the lowest-numbered claimant, and it names the `pack add` that
 would declare the namespace when a built-in pack ships it.
@@ -313,6 +313,7 @@ namespace is undeclared there by definition) or under a `--namespace` /
 | `core.dep-cycle`         | No            | The `depends_on` graph contains no cycles                     |
 | `core.dep-status`        | Optional      | A terminal-status document's `depends_on` targets are terminal too |
 | `core.cross-ref`         | No            | Every `NS-NNN` token in the body resolves to a known document |
+| `core.link-resolved`     | Optional      | Every relative link and image points at something that exists |
 | `core.required-headings` | Yes           | Required H2 headings are present                              |
 | `core.required-metadata` | Yes           | Required metadata keys are present                            |
 | `core.allowed-values`    | Yes           | Metadata values are in their configured allow-list            |
@@ -320,6 +321,17 @@ namespace is undeclared there by definition) or under a `--namespace` /
 The rules marked "No" need no parameters and can be added to any
 namespace without a sub-table. If you include a parameterized rule but
 omit its sub-table, ctxgrd exits with code 2 (kernel error) at startup.
+
+`core.link-resolved` is marked "Optional": it runs on documented defaults
+with no sub-table, and accepts `severity` (`error` or `warning`, default
+**warning**), `images` (whether `![alt](path)` destinations are checked
+too, default true), and `allow` (globs of link targets to exempt). It is
+one of the zero-config rules, so a namespace you never declared is
+already link-checked — at `warning`, which never changes your exit code.
+Paths resolve relative to the linting file, not the repository root.
+External URLs, pure `#fragment` links, and site-absolute `/path` links
+are skipped; a `#fragment` on a relative path is stripped before
+resolving, so the path is checked and the anchor is not.
 
 `core.dep-status` is marked "Optional": it runs on documented defaults
 with no sub-table, and accepts `terminal` (the statuses that count as

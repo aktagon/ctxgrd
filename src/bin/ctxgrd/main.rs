@@ -67,9 +67,9 @@ Examples:
   ctxgrd rules                 # list resolved rules
   ctxgrd rules core.cross-ref  # show details for one rule
   ctxgrd refs ADR-001          # list every pointer to a document
-  ctxgrd status                # show pipeline position: stages, blockers, next action
+  ctxgrd status                # the work queue: what is ready, what is blocked, and by what
   ctxgrd status --format json  # same, as a JSON object for agent routers
-  ctxgrd serve                 # browse the governed docs + pipeline at a localhost URL
+  ctxgrd serve                 # browse the governed docs + work queue at a localhost URL
   ctxgrd docs rules            # learn how to write your own rules
 
 Exit codes:  0 clean · 1 diagnostics · 2 kernel/config error
@@ -380,6 +380,19 @@ enum Cmd {
         /// (`BUG-036` R2).
         #[arg(long)]
         exit_code: bool,
+        /// Drop the document titles from the report (`BUG-046`), leaving
+        /// the bare `<ID>  <status>` rows the queue printed before 2.2.0.
+        ///
+        /// Titles are on by default: an ID identifies a document without
+        /// saying anything about it, so a queue keyed only by ID is
+        /// unreadable to anyone not already holding the corpus in their
+        /// head. This is the opt-out for a cost-sensitive injector that
+        /// pays for the report on every session start.
+        ///
+        /// Applies to `text` and `json`; the diagram formats label their
+        /// nodes by id and status and are unaffected.
+        #[arg(long)]
+        no_titles: bool,
     },
     /// Start the Language Server Protocol (LSP) server over stdio.
     Lsp,
@@ -670,12 +683,14 @@ fn dispatch() -> Result<ExitCode> {
             granularity,
             lineage,
             exit_code,
+            no_titles,
         } => emit(
             introspect::StatusCmd {
                 format,
                 granularity,
                 lineage,
                 exit_code,
+                titles: !no_titles,
             },
             &ctx,
         ),
