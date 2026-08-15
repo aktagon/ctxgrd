@@ -209,6 +209,61 @@ fn path_outside_governed_set_is_404() {
     assert_eq!(status, 404);
 }
 
+/// BUG-057: the server must consume the whole request head before it
+/// answers. It ignores the headers at the HTTP layer, but it may not leave
+/// them unread at the socket layer — on BSD/macOS `close()` with data still
+/// in the receive buffer sends RST rather than FIN, and the RST discards the
+/// response already written. The client sees `ECONNRESET` instead of the
+/// answer it earned.
+///
+/// A head larger than the server's read buffer makes the race deterministic.
+/// Under the parallel suite the same condition arises from ordinary TCP
+/// fragmentation, which is why it showed up as a ~1-in-10 flake rather than
+/// a reliable failure; oversizing the head reproduces it every run.
+#[test]
+fn response_survives_a_request_head_larger_than_one_read() {
+    let serve = start();
+    let addr = serve.url.strip_prefix("http://").expect("http url");
+    let mut stream = TcpStream::connect(addr).expect("connect to serve");
+    let mut req = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    // ~30 KiB: past the 8 KiB the server reads in one fill, so bytes are
+    // certainly still unread when it answers, and inside the drain budget.
+    for i in 0..400 {
+        req.push_str(&format!("X-Pad-{i}: {}\r\n", "a".repeat(64)));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).expect("write oversized head");
+    stream.flush().expect("flush oversized head");
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .expect("read response without a connection reset");
+    assert!(
+        raw.starts_with("HTTP/1.1 200"),
+        "expected a 200 status line, got {raw:?}"
+    );
+}
+
+/// The pair for the test above: a head that never terminates must not pin
+/// the connection thread forever. Draining is bounded, so an unterminated
+/// head still yields a response rather than hanging the test out to the
+/// suite timeout.
+#[test]
+fn an_unterminated_request_head_still_gets_an_answer() {
+    let serve = start();
+    let addr = serve.url.strip_prefix("http://").expect("http url");
+    let mut stream = TcpStream::connect(addr).expect("connect to serve");
+    // No terminating blank line, ever.
+    write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n").expect("write partial head");
+    stream.flush().expect("flush partial head");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("read response");
+    assert!(
+        raw.starts_with("HTTP/1.1 200"),
+        "expected a 200 status line, got {raw:?}"
+    );
+}
+
 #[test]
 fn static_assets_and_reload_endpoint_are_served() {
     let serve = start();

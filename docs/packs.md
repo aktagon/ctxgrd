@@ -60,10 +60,13 @@ It never overwrites a namespace block you already have: if the pack and
 your config both define `[ADR]`, the pack's `[ADR]` is skipped and the
 skip is reported. Each block it does write carries a versioned, fingerprinted
 provenance comment — `# pack: <name>@<version> sha:<hash>` (ADR-053) — so you
-can see where it came from and a later `pack migrate` can tell an untouched
-block (safe to rewrite) from one you hand-edited (left alone). The older
-bare `# pack: <name>` form is still valid input and an older binary treats
-the `@version sha:` suffix as an inert comment.
+can see where it came from. The `sha:` is the fingerprint of the *pack's* block
+at the moment it was copied, which is what lets a later `pack outdated` tell
+"the pack has moved since you copied it" from "you edited your copy"
+(ADR-126). The older bare `# pack: <name>` form is still valid input and an
+older binary treats the `@version sha:` suffix as an inert comment — but a
+block carrying no `sha:` has no baseline, so the pack-moved question cannot be
+asked of it at all.
 
 `init --pack` is sugar for the common first-run case — it is equivalent to
 `init` followed by `pack add` for each name:
@@ -89,15 +92,29 @@ ctxgrd pack migrate                       # rewrite clean blocks in place
 
 `pack migrate` compares each provenance-stamped block against its pack's current
 shape. A block that is byte-for-byte the generated shape (a "clean" block) is
-rewritten to the new shape and re-stamped. A block you hand-edited (a "dirty"
-block) is **left untouched** and surfaced as a diff (the on-disk block and the
-proposed shape) for you — or an agent — to reconcile by hand; migrate never
-merges or overwrites your edits. Running it twice is a no-op.
+rewritten to the new shape and re-stamped. A block you edited is **left
+untouched** — always, whatever its drift verdict — and migrate never merges or
+overwrites your edits. Running it twice is a no-op.
 
-Exit codes follow the contract: `pack outdated` exits `0` when current and `1`
-when drift exists; `pack migrate` exits `0` when it finishes with no unresolved
-dirty blocks and `1` when dirty blocks remain to reconcile; both exit `2` on a
-config error. So CI or an agent can branch on the outcome without parsing text.
+`pack outdated` asks one question of each block: **has the pack moved since this
+block was stamped?** It compares the stored `sha:` against the pack's block
+today, so adding a rule, overriding `paths`, customizing a rule's params or
+setting `owner` is not drift, however much of the block you have rewritten
+(ADR-126). Blocks fall into three groups:
+
+- **drift** — the pack moved; the diff (your block and the pack's current shape)
+  is printed for you or an agent to reconcile by hand. Sets exit `1`.
+- **no baseline** — the block carries a bare `# pack: <name>` stamp, or none, so
+  there is nothing to compare the pack against and the question has no answer.
+  Reported by name, never as drift. A block gains a baseline the next time
+  `pack add` or `pack migrate` writes it.
+- **current** — silent.
+
+Exit codes follow the contract: `pack outdated` exits `0` when no pack has moved
+and `1` when one has; `pack migrate` exits `0` when it finishes with no
+unresolved dirty blocks and `1` when dirty blocks remain to reconcile; both exit
+`2` on a config error. So CI or an agent can branch on the outcome without
+parsing text.
 
 ## Built-in packs
 

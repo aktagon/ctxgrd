@@ -30,6 +30,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
@@ -89,8 +90,24 @@ impl Server {
     }
 }
 
+/// How long a single connection may block waiting for request bytes.
+///
+/// Bounds [`drain_request_head`]: a client that opens a connection and never
+/// terminates its head would otherwise pin this connection's thread forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The most request head this server will read before answering anyway.
+///
+/// Generous against real clients (a browser sends 1–2 KiB) and bounded so a
+/// client streaming an endless header block cannot make the server read it
+/// all. A head past this budget may still be reset on close — that is the
+/// documented edge, not the common case BUG-057 was about.
+const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+
 /// Parse one request, route it, write one response, and close.
 fn handle_connection(root: &Path, mut stream: TcpStream) -> std::io::Result<()> {
+    // Armed before the first read so it also covers `drain_request_head`.
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     match read_request_target(&stream)? {
         Some(target) => {
             eprintln!("serve: GET {target}");
@@ -102,12 +119,13 @@ fn handle_connection(root: &Path, mut stream: TcpStream) -> std::io::Result<()> 
 }
 
 /// Read the request line and return the requested path for a `GET`, or
-/// `None` for any other method. Headers and body are ignored — the
-/// server is read-only and closes after one response.
+/// `None` for any other method. The remaining headers carry no routing
+/// information, but they are still *read* — see [`drain_request_head`].
 fn read_request_target(stream: &TcpStream) -> std::io::Result<Option<String>> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
+    drain_request_head(&mut reader);
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
@@ -117,6 +135,34 @@ fn read_request_target(stream: &TcpStream) -> std::io::Result<Option<String>> {
     // Drop any query string; v1 routes carry no query parameters.
     let path = target.split('?').next().unwrap_or("/");
     Ok(Some(path.to_string()))
+}
+
+/// Read and discard the rest of the request head, to the blank line that
+/// terminates it.
+///
+/// The routing layer ignores these headers; the *socket* layer may not. On
+/// BSD and macOS, closing a connection whose receive buffer still holds
+/// unread bytes sends RST rather than FIN, and the RST discards the response
+/// already written — the client sees `ECONNRESET` instead of its answer.
+/// That is BUG-057: it surfaced as a ~1-in-10 flake in `tests/serve.rs`
+/// because whether bytes remain unread depends on how TCP happened to
+/// fragment the request, which under a parallel test suite varies run to run.
+///
+/// Best-effort by construction. A read error or the [`READ_TIMEOUT`] ends the
+/// drain rather than the connection: the client is still owed its response,
+/// and failing to drain costs at worst the reset this exists to avoid.
+fn drain_request_head<R: BufRead>(reader: &mut R) {
+    let mut budget = MAX_REQUEST_HEAD_BYTES;
+    let mut line = String::new();
+    while budget > 0 {
+        line.clear();
+        match reader.read_line(&mut line) {
+            // EOF, a read error, or the blank line that ends the head.
+            Ok(0) | Err(_) => break,
+            Ok(_) if line == "\r\n" || line == "\n" => break,
+            Ok(n) => budget = budget.saturating_sub(n),
+        }
+    }
 }
 
 /// The closed route table (SRV-005). Every branch resolves against the

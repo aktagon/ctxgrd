@@ -529,18 +529,21 @@ enum PackAction {
         #[arg(long, value_enum, default_value_t = Format::Rich)]
         format: Format,
     },
-    /// Report pack-definition drift: blocks whose pack shape has evolved
-    /// since they were generated (ADR-053 § PKM-004). Read-only; exit 1
-    /// when drift is present, 0 when clean.
+    /// Report pack drift: blocks whose pack has changed since they were
+    /// stamped (ADR-053 § PKM-004, ADR-126 § DRF-001). Your own edits to a
+    /// block are never drift. Read-only; exit 1 when a pack has moved, 0
+    /// otherwise — including for blocks with no stored baseline, which are
+    /// listed but cannot be judged.
     Outdated {
         /// Output format. `json` emits the structured drift plan.
         #[arg(long, value_enum, default_value_t = Format::Rich)]
         format: Format,
     },
     /// Migrate provenance-stamped blocks to their pack's current shape
-    /// (ADR-053 § PKM-002): rewrite fingerprint-clean blocks in place and
-    /// emit a diff for hand-edited ones to resolve. Exit 1 when dirty
-    /// blocks remain, 0 otherwise.
+    /// (ADR-053 § PKM-002): rewrite blocks that still match their pack
+    /// byte-for-byte, and emit a diff for the rest to resolve by hand. A
+    /// block you have edited is never overwritten. Exit 1 when blocks
+    /// remain to reconcile, 0 otherwise.
     Migrate {
         /// Compute and print the plan without writing ctxgrd.toml.
         #[arg(long)]

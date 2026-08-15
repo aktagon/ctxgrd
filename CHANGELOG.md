@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-08-16
+
+### Changed
+
+- Pack drift detection asks the wrong question (ADR-126)
+
+### Fixed
+
+- `packs/port/` has no `include_str!` line, so `ctxgrd pack add port` fails for everyone who has only the binary while resolving fine from a checkout of this repo (BUG-043)
+- init hardcodes its rules array, so a rule bound in a pack never reaches a new project (BUG-052)
+- `ctxgrd serve` now reads a client's whole request before it answers. It previously read only the request line, so any remaining header bytes were still unread when the connection closed — which on macOS and BSD sends a reset that discards the response, and the client saw a connection error instead of the page it asked for (BUG-057)
+- `ctxgrd new` now writes the file itself for a namespace whose `paths` names one literal file — `[DESIGN]`'s `DESIGN.md`, `[PRODUCT]`'s `PRODUCT.md`. It previously treated that filename as a directory and created a numbered document inside it, which occupied the exact path the document had to occupy and left the namespace impossible to satisfy. Namespaces whose `paths` is a glob are unchanged: documents are still numbered inside the directory it names (BUG-062)
+- `ctxgrd new` no longer invents an `id` for a namespace that holds a single file at a literal path. Such a namespace has no sequence to number, so the scaffold now carries neither `id:` nor `depends_on:` (unless a `core.dep-*` rule asks for the latter), its heading is the title alone, and `new --format json` omits the `id` field rather than reporting an identifier that appears in no document. Namespaces that use ids are unchanged (BUG-063)
+- `cfg.namespace-unowned` and `pack outdated` are mutually unsatisfiable: the only fix for one breaks the other (BUG-067)
+- The `cfg.namespace-unowned` help tells pack users to make an edit that breaks their pack provenance, and does not say so (BUG-068)
+- A namespace block's pack fingerprint spans the comment introducing the next block, so removing one namespace dirties its predecessor (BUG-069)
+- A virgin `ctxgrd init` fails ctxgrd's own `pack outdated` gate: the config it writes is born hand-edited (BUG-071)
+
 ## [2.2.0] — 2026-08-14
 
 ### Changed

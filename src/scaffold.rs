@@ -25,7 +25,10 @@ use crate::id::DocumentId;
 /// A scaffolded document, in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scaffold {
-    pub id: DocumentId,
+    /// `None` for a single-file namespace, which has no sequence to draw an
+    /// id from — see [`single_file_target`]. Reporting one there would hand a
+    /// caller an identifier that appears in no document (BUG-063).
+    pub id: Option<DocumentId>,
     pub title: String,
     pub slug: String,
     pub contents: String,
@@ -45,12 +48,25 @@ pub fn scaffold(
 ) -> Scaffold {
     let number = id_override.unwrap_or_else(|| next_id(namespace, existing));
     let slug = slugify(title);
-    let contents = render_contents(namespace, number, title, ns_cfg, root);
-    let dir = target_dir(namespace, ns_cfg, existing, root, out_override);
-    let filename = format!("{number:03}-{slug}.md");
-    let target_path = dir.join(filename);
+    // A single-file namespace has exactly one legal path and no sequence to
+    // number, so neither the filename nor an `id` is ours to invent (BUG-062,
+    // BUG-063). `--out` still names a directory, so an explicit override keeps
+    // composing a filename — the shortcut applies only when config decides.
+    let single_file = out_override
+        .is_none()
+        .then(|| single_file_target(ns_cfg))
+        .flatten();
+    let id = single_file
+        .is_none()
+        .then(|| format!("{namespace}-{number:03}"));
+    let contents = render_contents(id.as_deref(), title, ns_cfg, root);
+    let target_path = match single_file {
+        Some(literal) => root.join(literal),
+        None => target_dir(namespace, ns_cfg, existing, root, out_override)
+            .join(format!("{number:03}-{slug}.md")),
+    };
     Scaffold {
-        id: DocumentId::new(namespace, number),
+        id: id.as_ref().map(|_| DocumentId::new(namespace, number)),
         title: title.to_owned(),
         slug,
         contents,
@@ -141,11 +157,35 @@ fn target_dir(
     root.join(format!("{}s", namespace.to_lowercase()))
 }
 
+/// The one legal path of a namespace whose first `paths` pattern carries no
+/// glob metacharacters at all — `[DESIGN]`'s `DESIGN.md`, `[PRODUCT]`'s
+/// `PRODUCT.md`.
+///
+/// This is the distinction [`glob_literal_prefix`] cannot express, and BUG-062
+/// is what its absence cost. Both of these yield a literal prefix:
+///
+/// - `docs/bugs/**` — the prefix `docs/bugs` is a **container**. Documents are
+///   numbered inside it, so the prefix is a directory.
+/// - `DESIGN.md` — there is nothing to expand, so the pattern matches exactly
+///   one path and **is** the document. Numbering and slugging are meaningless:
+///   the namespace holds one document and its filename is already decided.
+///
+/// Reading the second as the first turned `DESIGN.md` into a *directory*
+/// holding `001-<slug>.md`, occupying the exact path the document had to
+/// occupy — the scaffolder making its own output impossible to create.
+fn single_file_target(ns_cfg: &NamespaceConfig) -> Option<&str> {
+    let pattern = ns_cfg.path_patterns.first()?;
+    (!pattern.contains(['*', '?', '[', ']', '{', '}'])).then_some(pattern.as_str())
+}
+
 /// Literal directory prefix of a glob: the longest leading run of path
 /// segments containing no glob metacharacters. `docs/specs/**` →
 /// `docs/specs`; `**/specs/**` → `None` (empty prefix). Drives ADR-010
 /// NEW-004 / BUG-002 — landing a first scaffold in the namespace's
 /// declared `paths` home instead of the hardcoded `<ns>s/` fallback.
+///
+/// Only reached for patterns that actually contain a glob — see
+/// [`single_file_target`], which claims the wholly-literal case first.
 fn glob_literal_prefix(glob: &str) -> Option<PathBuf> {
     let mut prefix = PathBuf::new();
     let mut any = false;
@@ -162,19 +202,25 @@ fn glob_literal_prefix(glob: &str) -> Option<PathBuf> {
     any.then_some(prefix)
 }
 
+/// Render the scaffold body. `id` is `None` for a single-file namespace,
+/// which has no sequence to draw one from — emitting `id: DESIGN-001` there
+/// invents an identifier the namespace never asked for, and (BUG-063) that
+/// invented id is what made the stray file of BUG-062 get *claimed* and
+/// linted: an `id:` field is an intent-claim under ADR-007 § DOC-001, so the
+/// scaffold pulled itself into a namespace by a key it should not have had.
 fn render_contents(
-    namespace: &str,
-    number: u32,
+    id: Option<&str>,
     title: &str,
     ns_cfg: &NamespaceConfig,
     root: &Path,
 ) -> String {
     let mut out = String::new();
-    let id = format!("{namespace}-{number:03}");
 
     // --- Frontmatter ---
     out.push_str("---\n");
-    out.push_str(&format!("id: {id}\n"));
+    if let Some(id) = id {
+        out.push_str(&format!("id: {id}\n"));
+    }
     out.push_str(&format!("title: {}\n", yaml_scalar(title)));
     // Every required-metadata key that isn't `id` or `title` gets
     // a stubbed-empty entry. Order preserved from config.
@@ -192,7 +238,14 @@ fn render_contents(
             }
         }
     }
-    out.push_str("depends_on: []\n");
+    // A single-file namespace (`id == None`) does not participate in the
+    // dependency graph unless it says so — nothing can reference a document
+    // that has no id. Elsewhere the key stays unconditional: narrowing it by
+    // rule list would re-derive id-less-ness by inference, which is the
+    // fragility BUG-038 exists to remove.
+    if id.is_some() || ns_cfg.rules.iter().any(|r| r.starts_with("core.dep-")) {
+        out.push_str("depends_on: []\n");
+    }
     // ADR-041 § SEC-008: when this namespace requires a commit pin
     // (`[NS."core.commit-freshness"] require-pin = true`), seed a `pin`
     // block so the scaffold lints clean against `require-pin`. The
@@ -210,7 +263,10 @@ fn render_contents(
 
     // --- Body ---
     out.push('\n');
-    out.push_str(&format!("# {id}: {title}\n"));
+    match id {
+        Some(id) => out.push_str(&format!("# {id}: {title}\n")),
+        None => out.push_str(&format!("# {title}\n")),
+    }
     if let Some(headings) = ns_cfg
         .params
         .get("core.required-headings")
@@ -625,15 +681,49 @@ fn render_namespace_block(
     comment: bool,
     paths: Option<&[String]>,
 ) {
+    // The pack that owns this namespace, when one does. Everything the
+    // pack declares is read from it rather than restated here: a parallel
+    // copy is what BUG-052 and BUG-071 both are, and it decays silently
+    // because nothing compares the two.
+    let source = crate::pack::builtin_pack_block_source(namespace);
+
     let mut buf = String::new();
+    // Stamp what was written (BUG-071). Without this a config ctxgrd itself
+    // generated lands in `pack outdated`'s baseline-less category on day one
+    // — the state no command can resolve — so a project that gates CI on
+    // `pack outdated`, which `docs/ci.md` presents as supported, starts life
+    // unable to go green.
+    //
+    // Inside `buf`, so a commented example block carries it too: the
+    // renderer below prefixes every line with `# `, and uncommenting the
+    // block strips exactly that prefix, leaving a live stamp. Stamping only
+    // the active blocks would move the same defect one step later, onto
+    // whoever enables a namespace.
+    //
+    // Only for a namespace a pack actually owns. Stamping one no pack
+    // defines would have ctxgrd claim an authorship that does not exist,
+    // and `pack migrate` would then answer for it.
+    if let Some(s) = &source {
+        buf.push_str(&crate::pack::init_provenance_comment(
+            &s.pack,
+            &s.fingerprint,
+        ));
+        buf.push('\n');
+    }
     buf.push_str(&format!("[{namespace}]\n"));
     // ADR-076 § OWN-003: the role accountable for writing this document
     // type. Seeded rather than left out, so a generated config does not
     // trip `cfg.namespace-unowned` on its own first run — a linter that
     // warns about the file it just wrote teaches the wrong lesson.
+    //
+    // No pack ships an `owner`, so this key makes the block differ from
+    // canonical pack text. That is safe: the stamp below is a digest of the
+    // *pack's* block, so consumer additions are not drift (ADR-126 § DRF-002).
     buf.push_str(&format!("owner = \"{}\"\n", default_owner(namespace)));
     buf.push_str("rules = [\n");
-    for rule in [
+    // Fallback only for a namespace no pack covers — the conventional core
+    // set, which is what those namespaces got before packs existed.
+    const CONVENTIONAL_RULES: [&str; 9] = [
         "core.frontmatter",
         "core.id",
         "core.id-unique",
@@ -643,28 +733,52 @@ fn render_namespace_block(
         "core.required-headings",
         "core.required-metadata",
         "core.allowed-values",
-    ] {
-        buf.push_str(&format!("  \"{rule}\",\n"));
+    ];
+    match &source {
+        Some(s) => {
+            for rule in s.rules.iter().filter(|r| !is_deferred_rule(r)) {
+                buf.push_str(&format!("  \"{rule}\",\n"));
+            }
+            // A rule that asserts a document exists is false by construction
+            // in the repo `init` was just run on, so binding it would make a
+            // fresh config report errors about itself. Offered rather than
+            // dropped: dropping it is BUG-052's defect for one rule, and the
+            // reader needs to know the pack binds it.
+            for rule in s.rules.iter().filter(|r| is_deferred_rule(r)) {
+                buf.push_str(&format!(
+                    "  # Enable once this namespace has its first document:\n  # \"{rule}\",\n"
+                ));
+            }
+        }
+        None => {
+            for rule in CONVENTIONAL_RULES {
+                buf.push_str(&format!("  \"{rule}\",\n"));
+            }
+        }
     }
     buf.push_str("]\n");
 
     // ADR 007 § DOC-005: when init detected a conventional ADR/PRD
     // directory for this namespace, pre-fill `paths` so the user
-    // can run `ctxgrd` immediately and see their docs lint.
+    // can run `ctxgrd` immediately and see their docs lint. Detected paths
+    // win over the pack's: they describe the repo in front of us, where the
+    // pack's is a greenfield default. Falling back to the pack's is what
+    // closes BUG-071's third divergence — an init `[ADR]` was id-claimed
+    // only where the pack's is both.
     // Empty `paths` slice would still write `paths = []` — DOC-002
     // treats that as "match nothing", so callers should pass `None`
     // instead when they have nothing to inject.
-    if let Some(globs) = paths {
-        if !globs.is_empty() {
-            buf.push_str("paths = [");
-            for (i, g) in globs.iter().enumerate() {
-                if i > 0 {
-                    buf.push_str(", ");
-                }
-                buf.push_str(&format!("\"{g}\""));
+    let detected = paths.filter(|g| !g.is_empty());
+    let pack_paths = source.as_ref().map(|s| s.paths.as_slice());
+    if let Some(globs) = detected.or(pack_paths).filter(|g| !g.is_empty()) {
+        buf.push_str("paths = [");
+        for (i, g) in globs.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(", ");
             }
-            buf.push_str("]\n");
+            buf.push_str(&format!("\"{g}\""));
         }
+        buf.push_str("]\n");
     }
     buf.push('\n');
 
@@ -726,6 +840,23 @@ fn render_namespace_block(
     } else {
         out.push_str(&buf);
     }
+}
+
+/// Whether `init` should offer a pack rule commented out rather than bind it.
+///
+/// The single criterion: the rule asserts that a document *exists*. Every
+/// other rule checks a document that is there, so it has nothing to say about
+/// an empty repository and stays silent on its own; these fire precisely
+/// because the repository is empty, which it always is on first touch.
+///
+/// Binding one would have `ctxgrd init` produce a config that immediately
+/// reports errors about itself, contradicting ADR-007 § DOC-001 — the
+/// first-touch silence that distinguishes ctxgrd from a frontmatter-walking
+/// linter. Adopting the pack explicitly with `pack add` still binds it: that
+/// is a declaration the user made, and ADR-089 § MND-001 is right to hold
+/// them to it.
+fn is_deferred_rule(rule: &str) -> bool {
+    rule == "core.min-docs"
 }
 
 /// Seed `owner` role per namespace (ADR-076 § OWN-003).
@@ -1188,6 +1319,103 @@ mod tests {
         assert_eq!(dir, Path::new("/root/ops"));
     }
 
+    // -- BUG-062 / BUG-063: a namespace whose `paths` names one literal file --
+
+    #[test]
+    fn scaffold_writes_a_file_for_a_literal_single_file_path() {
+        // The target is the declared path itself — not a directory to drop a
+        // numbered file into. The old behaviour returned
+        // `/root/DESIGN.md/001-aktagon-visual-system.md`, which made the
+        // namespace permanently unsatisfiable.
+        let cfg = ns_cfg_with_paths(&["DESIGN.md"]);
+        let s = scaffold(
+            "DESIGN",
+            "Aktagon visual system",
+            None,
+            &cfg,
+            &[],
+            Path::new("/root"),
+            None,
+        );
+        assert_eq!(s.target_path, Path::new("/root/DESIGN.md"));
+    }
+
+    #[test]
+    fn scaffold_invents_no_id_for_a_single_file_namespace() {
+        // BUG-063: `id: DESIGN-001` is an identifier nothing asked for, and
+        // under DOC-001 it is also an intent-claim — it is what dragged the
+        // stray file into the namespace and got it linted.
+        let cfg = ns_cfg_with_paths(&["DESIGN.md"]);
+        let s = scaffold(
+            "DESIGN",
+            "Aktagon visual system",
+            None,
+            &cfg,
+            &[],
+            Path::new("/root"),
+            None,
+        );
+        assert!(
+            !s.contents.contains("id: DESIGN"),
+            "scaffold invented an id: {}",
+            s.contents
+        );
+        assert!(
+            s.contents.contains("# Aktagon visual system\n"),
+            "heading should carry the title alone: {}",
+            s.contents
+        );
+        assert_eq!(s.id, None, "no id to report for a single-file namespace");
+        assert!(
+            !s.contents.contains("depends_on"),
+            "nothing can depend on a document with no id: {}",
+            s.contents
+        );
+    }
+
+    #[test]
+    fn scaffold_keeps_depends_on_when_a_single_file_namespace_asks_for_it() {
+        // The pair: the key is dropped because the namespace never asked for
+        // it, not because single-file namespaces are special. One that binds a
+        // dep rule keeps it.
+        let mut cfg = ns_cfg_with_paths(&["DESIGN.md"]);
+        cfg.rules = vec!["core.dep-resolved".to_string()];
+        let s = scaffold("DESIGN", "Visual system", None, &cfg, &[], Path::new("/root"), None);
+        assert!(s.contents.contains("depends_on: []"), "{}", s.contents);
+    }
+
+    #[test]
+    fn scaffold_still_numbers_inside_a_globbed_container() {
+        // The pair for the two above: a glob with a literal *prefix* keeps
+        // its container semantics. Without this, a fix that treated every
+        // literal prefix as a file would pass the tests above and silently
+        // break every ordinary namespace.
+        let cfg = ns_cfg_with_paths(&["docs/runbooks/**"]);
+        let s = scaffold("RUN", "Deploy", None, &cfg, &[], Path::new("/root"), None);
+        assert_eq!(s.target_path, Path::new("/root/docs/runbooks/001-deploy.md"));
+        assert!(s.contents.contains("id: RUN-001"), "{}", s.contents);
+    }
+
+    #[test]
+    fn scaffold_out_override_still_composes_a_filename_for_a_single_file_path() {
+        // `--out` names a directory, so it keeps its meaning even here —
+        // the single-file shortcut applies only when config decides.
+        let cfg = ns_cfg_with_paths(&["DESIGN.md"]);
+        let s = scaffold(
+            "DESIGN",
+            "Aktagon visual system",
+            None,
+            &cfg,
+            &[],
+            Path::new("/root"),
+            Some(Path::new("/custom")),
+        );
+        assert_eq!(
+            s.target_path,
+            Path::new("/custom/001-aktagon-visual-system.md")
+        );
+    }
+
     #[test]
     fn target_dir_out_override_beats_paths() {
         // `--out` still wins over a declared paths home (acceptance row 4).
@@ -1279,7 +1507,7 @@ depends_on: []
     fn scaffold_honours_id_override() {
         let cfg = ns_cfg(vec!["id", "title"], vec!["Status"]);
         let s = scaffold("ADR", "Doc", Some(7), &cfg, &[], Path::new("."), None);
-        assert_eq!(s.id, DocumentId::new("ADR", 7));
+        assert_eq!(s.id, Some(DocumentId::new("ADR", 7)));
         assert!(s.contents.contains("id: ADR-007"));
     }
 
@@ -1382,8 +1610,30 @@ depends_on: []
         let value: toml::Value = toml::from_str(&toml_text).expect("valid TOML");
         let adr = value.get("ADR").expect("ADR section present");
         let rules = adr.get("rules").and_then(|v| v.as_array()).unwrap();
-        // All nine core rules listed.
-        assert_eq!(rules.len(), 9);
+        // Exactly what the owning pack binds. Was `assert_eq!(len, 9)` — a
+        // transcription of the hardcoded list beside it, so it agreed with
+        // the copy rather than with the pack and stayed green through the
+        // thirteen months BUG-052 describes. Derived now, so a rule added to
+        // `project-docs` either reaches `init` or fails here.
+        let bound: Vec<&str> = rules.iter().filter_map(|v| v.as_str()).collect();
+        let pack = crate::pack::builtin_pack_block_source("ADR").expect("project-docs owns ADR");
+        let expected: Vec<&str> = pack
+            .rules
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !is_deferred_rule(r))
+            .collect();
+        assert_eq!(bound, expected);
+        assert!(
+            bound.contains(&"core.acceptance-complete"),
+            "the rule BUG-052 measured as never reaching a new project"
+        );
+        // And the block is stamped with the pack it was rendered from
+        // (BUG-071), so `pack outdated` can answer for it.
+        assert!(
+            toml_text.contains(&format!("# pack: project-docs@{} sha:", env!("CARGO_PKG_VERSION"))),
+            "expected a provenance stamp; rendered:\n{toml_text}"
+        );
         // ADR gets the project-docs pack shape as the active headings.
         let headings = adr
             .get("core.required-headings")
@@ -1999,11 +2249,31 @@ depends_on: []
     }
 
     #[test]
-    fn render_init_toml_omits_paths_when_namespace_has_none() {
+    fn render_init_toml_falls_back_to_the_packs_paths_when_nothing_is_detected() {
+        // Was "omits paths when nothing detected". BUG-071 § 3: that left an
+        // init `[ADR]` id-claimed where `pack add project-docs` makes it both
+        // id- and path-claimed, so the two commands produced namespaces that
+        // enforced different things. The pack's glob is the fallback.
         let text = render_init_toml(&["ADR"], &[], &DetectedPaths::new());
         assert!(
+            text.contains(r#"paths = ["docs/adrs/**"]"#),
+            "expected the pack's path claim; rendered:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_init_toml_omits_paths_for_a_namespace_no_pack_covers() {
+        // The fallback is the *pack's* claim, so there is none to fall back
+        // to here — and inventing one would path-claim a directory on a
+        // guess, which DOC-001's first-touch silence exists to prevent.
+        let text = render_init_toml(&["WIDGET"], &[], &DetectedPaths::new());
+        assert!(
             !text.contains("paths ="),
-            "no paths key when nothing detected; rendered:\n{text}"
+            "nothing to fall back to; rendered:\n{text}"
+        );
+        assert!(
+            !text.contains("# pack:"),
+            "and no stamp: no pack authored this block; rendered:\n{text}"
         );
     }
 

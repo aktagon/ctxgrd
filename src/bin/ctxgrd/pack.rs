@@ -115,6 +115,7 @@ impl Command for PackShowCmd {
                         "paths": v.path_patterns,
                         "required_metadata": v.required_metadata,
                         "params": v.params,
+                        "fingerprint": v.fingerprint,
                     })
                 })
                 .collect();
@@ -277,8 +278,11 @@ pub(crate) fn report_pack_add(pack: &ctxgrd::pack::Pack, plan: &ctxgrd::pack::Ad
     }
 }
 
-/// `ctxgrd pack outdated` — read-only drift report (ADR-053 § PKM-004). Exit
-/// 0 = no drift, 1 = drift present, 2 = config error.
+/// `ctxgrd pack outdated` — read-only drift report (ADR-053 § PKM-004,
+/// ADR-126 § DRF-001). Reports blocks whose *pack* has moved since they were
+/// stamped; consumer edits are not drift. Exit 0 = no pack moved (blocks with
+/// no baseline are listed but do not count), 1 = a pack moved, 2 = config
+/// error.
 pub(super) struct PackOutdatedCmd {
     pub(super) format: Format,
 }
@@ -300,15 +304,23 @@ impl Command for PackOutdatedCmd {
         let config_toml =
             fs::read_to_string(&toml_path).map_err(|e| pack_config_read_error(root, &toml_path, &e))?;
         let plan = ctxgrd::pack::plan_migrate(&config_toml, root);
-        let drift = !plan.rewrites.is_empty() || !plan.diffs.is_empty();
+        // A stamp-only rewrite is a block that is already at its pack's
+        // current shape and merely lacks a baseline; it is housekeeping
+        // `pack migrate` performs, not drift, and must not fail the gate
+        // (ADR-126 § DRF-008).
+        let drift =
+            plan.rewrites.iter().any(|r| !r.stamp_only) || !plan.diffs.is_empty();
 
         match self.format {
             // JSON: the dispatcher writes the plan (via `render_json`).
             Format::Json => {}
             Format::Rich | Format::Simple => {
-                if !drift {
+                if !drift && plan.unknown.is_empty() {
                     println!("ctxgrd.toml is up to date with the installed packs.");
                 } else {
+                    // Baseline-less blocks are reported but are not drift:
+                    // the pack-moved question cannot be asked of them, so
+                    // they must not set the exit code (ADR-126).
                     print!("{}", ctxgrd::pack::render_migrate_report(&plan, true));
                 }
             }
@@ -322,10 +334,11 @@ impl Command for PackOutdatedCmd {
     }
 }
 
-/// `ctxgrd pack migrate` — rewrite fingerprint-clean blocks in place and emit a
-/// diff for hand-edited ones (ADR-053 § PKM-002). Exit 0 = nothing to do or
-/// only clean rewrites applied, 1 = dirty blocks need manual resolution, 2 =
-/// config error.
+/// `ctxgrd pack migrate` — rewrite blocks that still match their pack
+/// byte-for-byte, give v1 stamps a baseline, and emit a diff for the rest
+/// (ADR-053 § PKM-002, ADR-126 § DRF-007). A block the consumer edited is
+/// never overwritten. Exit 0 = nothing to do or only clean rewrites applied,
+/// 1 = blocks remain to reconcile, 2 = config error.
 pub(super) struct PackMigrateCmd {
     pub(super) dry_run: bool,
     pub(super) format: Format,

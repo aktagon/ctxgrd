@@ -55,6 +55,7 @@ const GOVERNANCE_TOML: &str = include_str!("../packs/governance/pack.toml");
 const RESEARCH_TOML: &str = include_str!("../packs/research/pack.toml");
 const QA_TOML: &str = include_str!("../packs/qa/pack.toml");
 const MARKETING_TOML: &str = include_str!("../packs/marketing/pack.toml");
+const PORT_TOML: &str = include_str!("../packs/port/pack.toml");
 const STRIPE_INTEGRATION_WEB_TOML: &str =
     include_str!("../packs/stripe-integration-web/pack.toml");
 
@@ -128,6 +129,17 @@ pub struct NamespaceView {
     /// also hoists. The duplication is deliberate: removing the hoisted field
     /// would break the `pack show --format json` shape ADR-096 § CMD-002 ships.
     pub params: BTreeMap<String, serde_json::Value>,
+    /// The digest a `# pack:` stamp must carry for this namespace to read as
+    /// current — [`fingerprint`] of the pack's canonical block, the exact
+    /// value the drift classifier compares a stored `sha:` against
+    /// (ADR-126 § DRF-008).
+    ///
+    /// This is the escape hatch for a block with no baseline. Nothing can
+    /// recover which pack revision such a block was copied from, so no verb
+    /// adopts today's pack on the consumer's behalf; publishing the digest
+    /// puts the assertion where it belongs, with the person who can actually
+    /// judge whether their block is current.
+    pub fingerprint: String,
 }
 
 /// A paid (non-built-in) pack the public binary *advertises* but does not
@@ -708,6 +720,19 @@ pub fn builtin_packs() -> Vec<Pack> {
             toml_text: MARKETING_TOML.to_string(),
             rules: Vec::new(),
         },
+        Pack {
+            // A per-subsystem porting-parity tracker: one document per subsystem
+            // of the software being ported, citing `original_source` and the
+            // `original_ref` it was ported against, carrying a parity status and
+            // proving equivalence under ## Verification. Reusable across any port,
+            // so the namespace is generic rather than named for one project.
+            name: "port".to_string(),
+            summary: summary_of(PORT_TOML),
+            source_label: "built-in".to_string(),
+            rank: 0,
+            toml_text: PORT_TOML.to_string(),
+            rules: Vec::new(),
+        },
     ]
 }
 
@@ -899,7 +924,7 @@ pub fn namespace_views(pack: &Pack) -> Vec<NamespaceView> {
     let table = pack.toml_text.parse::<Value>().ok();
     namespace_blocks(&pack.toml_text)
         .into_iter()
-        .map(|(name, _)| {
+        .map(|(name, block)| {
             let ns_tbl = table
                 .as_ref()
                 .and_then(|v| v.get(&name))
@@ -949,12 +974,18 @@ pub fn namespace_views(pack: &Pack) -> Vec<NamespaceView> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Hashed from the same `namespace_blocks` slice `canonical_block`
+            // returns, so this is the classifier's operand and not a parallel
+            // derivation of it — the divergence that would make the published
+            // remedy silently produce a wrong value.
+            let fingerprint = fingerprint(&block);
             NamespaceView {
                 name,
                 rules,
                 required_metadata,
                 path_patterns,
                 params,
+                fingerprint,
             }
         })
         .collect()
@@ -997,16 +1028,19 @@ fn toml_table_to_json(t: &toml::Table) -> serde_json::Value {
 pub fn plan_add(pack: &Pack, existing_toml: &str, root: &Path) -> AddPlan {
     let existing = existing_namespaces(existing_toml);
     let mut plan = AddPlan::default();
-    for (ns, block) in namespace_blocks(&pack.toml_text) {
-        if existing.contains(&ns) {
-            plan.skipped.push(ns);
+    for seg in namespace_segments(&pack.toml_text) {
+        if existing.contains(&seg.name) {
+            plan.skipped.push(seg.name);
             continue;
         }
+        // Stamp first, then the pack's introduction to the namespace, then
+        // the block — the stamp fingerprints the block alone (BUG-069).
         plan.blocks_text
-            .push_str(&format!("\n{}\n", provenance_comment(&pack.name, &block)));
-        plan.blocks_text.push_str(&block);
+            .push_str(&format!("\n{}\n", provenance_comment(&pack.name, &seg.block)));
+        plan.blocks_text.push_str(&seg.lead);
+        plan.blocks_text.push_str(&seg.block);
         plan.blocks_text.push('\n');
-        plan.added.push(ns);
+        plan.added.push(seg.name);
     }
     plan.rules_to_copy = pack
         .rules
@@ -1205,6 +1239,62 @@ fn builtin_pack_list(namespace: &str, table: &str, key: &str) -> Option<Vec<Stri
         })
 }
 
+/// What the owning pack binds for `namespace`, for `ctxgrd init` to render
+/// instead of a parallel hardcoded copy (BUG-052, BUG-071).
+pub(crate) struct InitBlockSource {
+    /// The owning pack's name, for the provenance stamp.
+    pub pack: String,
+    /// The rule list the pack binds. `init` hardcoded its own, so a rule
+    /// bound in a pack never reached a new project — `core.acceptance-complete`
+    /// was missing from every generated config for thirteen months.
+    pub rules: Vec<String>,
+    /// The pack's path claim, used when `init` detected no directory of its
+    /// own for this namespace (ADR-007 § DOC-005 gives the detected one
+    /// precedence: it describes the repo in front of us).
+    pub paths: Vec<String>,
+    /// The digest the generated block's stamp must carry. Pack-side, so it
+    /// stays correct however much `init` adds on top (ADR-126 § DRF-001).
+    pub fingerprint: String,
+}
+
+/// The pack that owns `namespace`, among the doc packs `init` renders from.
+///
+/// Same two-pack scan as [`builtin_pack_list`], for the same reason: the
+/// `agents`/`design` packs bind builtin-compiled rules that are not in init's
+/// catalogue. Returns `None` for a namespace no pack covers — `init` still
+/// generates those, from the conventional defaults, and leaves them unstamped
+/// because no pack authored them.
+pub(crate) fn builtin_pack_block_source(namespace: &str) -> Option<InitBlockSource> {
+    builtin_packs()
+        .iter()
+        .filter(|p| p.name == "project-docs" || p.name == "ops")
+        .find_map(|p| {
+            let view = namespace_views(p).into_iter().find(|v| v.name == namespace)?;
+            Some(InitBlockSource {
+                pack: p.name.clone(),
+                rules: view.rules,
+                paths: view.path_patterns,
+                fingerprint: view.fingerprint,
+            })
+        })
+}
+
+/// The v2 provenance line for a block `init` generated, stamped with the
+/// owning pack's current digest (ADR-126 § DRF-001).
+///
+/// Deliberately not `fingerprint` of the text `init` writes: `init` adds an
+/// `owner`, a commented heading alternative and possibly a detected `paths`,
+/// none of which any pack renders. Under the byte-equality model that made
+/// the block "hand-edited" the moment it was written (BUG-071); under the
+/// pack-moved model the stamp is a claim about the *pack*, so a generated
+/// block may differ from canonical text and still be honestly current.
+pub(crate) fn init_provenance_comment(pack: &str, fingerprint: &str) -> String {
+    format!(
+        "# pack: {pack}@{version} sha:{fingerprint}",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 /// `core.required-headings.headings` from a built-in doc pack.
 pub(crate) fn builtin_pack_headings(namespace: &str) -> Option<Vec<String>> {
     builtin_pack_list(namespace, "core.required-headings", "headings")
@@ -1319,33 +1409,164 @@ pub(crate) fn stamped_namespaces(root: &Path, name: &str, config_toml: &str) -> 
     selected
 }
 
-/// Segment `pack.toml` text into `(namespace, verbatim_block)` pairs in
-/// declaration order. A namespace block is the contiguous run of lines
-/// from its `[<NS>]` header through the table headers nested under it
-/// (`[<NS>."core.required-metadata"]` etc.), up to the next top-level
-/// namespace header. Preamble before the first namespace header (the
-/// `# summary:` line) is dropped. Trailing blank lines are trimmed.
-pub(crate) fn namespace_blocks(toml: &str) -> Vec<(String, String)> {
-    let mut blocks: Vec<(String, String)> = Vec::new();
-    let mut current: Option<String> = None;
+/// One namespace as it appears in a `pack.toml`: the comment run that
+/// introduces it, and its own table text.
+pub(crate) struct NsSegment {
+    /// The namespace name.
+    pub name: String,
+    /// The comment run directly above the `[<NS>]` header, newline-
+    /// terminated and verbatim; empty when there is none. Held separately
+    /// so a namespace's introduction is not counted as the *previous*
+    /// namespace's content (BUG-069).
+    pub lead: String,
+    /// The verbatim block text, trailing-trimmed.
+    pub block: String,
+}
+
+/// Segment `pack.toml` text into [`NsSegment`]s in declaration order. A
+/// namespace block is the contiguous run of lines from its `[<NS>]` header
+/// through the table headers nested under it
+/// (`[<NS>."core.required-metadata"]` etc.), up to the comment run
+/// introducing the next top-level namespace, or that header itself.
+/// Preamble before the first namespace header (the `# summary:` line) is
+/// dropped. Trailing blank lines are trimmed.
+pub(crate) fn namespace_segments(toml: &str) -> Vec<NsSegment> {
+    let mut out: Vec<NsSegment> = Vec::new();
+    let mut current: Option<NsSegment> = None;
+    // Blank and comment lines seen since the last content line. They are
+    // this block's only while a content line follows; a comment run that
+    // ends at the next header introduces *that* block instead.
+    let mut pending: Vec<&str> = Vec::new();
     for line in toml.lines() {
-        if let Some(ns) = header_namespace(line) {
-            if current.as_deref() != Some(ns.as_str()) {
-                blocks.push((ns.clone(), String::new()));
-                current = Some(ns);
+        // A non-namespace table ends the block it follows, the same way a
+        // different namespace header does — including the handover, which
+        // `config_segments` also performs here. Without it the two sides
+        // disagree about a pack shaped `[X]\nk=1\n\n# note\n[changelog]`:
+        // the pack keeps `# note` in the block and the consumer does not, so
+        // `block == canon` never holds and the block is permanently dirty.
+        if header_namespace(line).is_none() && line.trim_start().starts_with('[') {
+            if let Some(mut done) = current.take() {
+                take_lead_comments(&mut pending, Held::AfterBlock);
+                push_tail(&mut done.block, &mut pending);
+                done.block = done.block.trim_end().to_string();
+                out.push(done);
             }
+            pending.clear();
+            continue;
         }
-        if current.is_some() {
-            if let Some((_, buf)) = blocks.last_mut() {
-                buf.push_str(line);
-                buf.push('\n');
+        let starts_new = match header_namespace(line) {
+            Some(ns) => current.as_ref().map(|c| c.name != ns).unwrap_or(true),
+            None => false,
+        };
+        if starts_new {
+            let name = header_namespace(line).expect("checked above");
+            let lead = take_lead_comments(
+                &mut pending,
+                if current.is_some() {
+                    Held::AfterBlock
+                } else {
+                    Held::BeforeFirstBlock
+                },
+            );
+            if let Some(mut done) = current.take() {
+                push_tail(&mut done.block, &mut pending);
+                done.block = done.block.trim_end().to_string();
+                out.push(done);
             }
+            pending.clear();
+            current = Some(NsSegment {
+                name,
+                lead,
+                block: String::new(),
+            });
+        }
+        let Some(cur) = current.as_mut() else {
+            continue; // preamble before the first namespace header
+        };
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            pending.push(line);
+        } else {
+            push_interior(&mut cur.block, &pending);
+            pending.clear();
+            cur.block.push_str(line);
+            cur.block.push('\n');
         }
     }
-    for (_, buf) in &mut blocks {
-        *buf = buf.trim_end().to_string();
+    if let Some(mut done) = current.take() {
+        // At end of input there is no next block to claim the tail.
+        push_tail(&mut done.block, &mut pending);
+        done.block = done.block.trim_end().to_string();
+        out.push(done);
     }
-    blocks
+    out
+}
+
+/// Segment `pack.toml` text into `(namespace, verbatim_block)` pairs —
+/// [`namespace_segments`] for callers that do not need the lead comments.
+pub(crate) fn namespace_blocks(toml: &str) -> Vec<(String, String)> {
+    namespace_segments(toml)
+        .into_iter()
+        .map(|s| (s.name, s.block))
+        .collect()
+}
+
+/// What the held blank/comment lines follow — the only thing that decides
+/// whether a comment run touching the next header introduces it or trails
+/// the block before it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// The lines follow a namespace block's content.
+    AfterBlock,
+    /// The lines open the file; there is no block before them.
+    BeforeFirstBlock,
+}
+
+/// Split the comment run that introduces the *next* block off the tail of
+/// `pending`, returning it newline-terminated and leaving the rest.
+///
+/// The run qualifies only when a blank line separates it from the previous
+/// block's content — a comment that starts immediately after a key belongs
+/// to the block it follows (a commented-out option, say), not to the block
+/// after it. Before the first namespace there is no previous block, so any
+/// trailing run qualifies.
+fn take_lead_comments(pending: &mut Vec<&str>, held: Held) -> String {
+    // Lines after the last blank are the run touching the coming header;
+    // by construction every line in `pending` is blank or a comment.
+    let start = pending
+        .iter()
+        .rposition(|l| l.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    if start == pending.len() || (held == Held::AfterBlock && start == 0) {
+        return String::new();
+    }
+    let lead = pending[start..]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect::<String>();
+    pending.truncate(start);
+    lead
+}
+
+/// Append held blank/comment lines to a block because a content line
+/// follows them: they are interior to the block, blanks included (the
+/// blank between two sub-tables is part of the block's text).
+fn push_interior(block: &mut String, pending: &[&str]) {
+    for line in pending {
+        block.push_str(line);
+        block.push('\n');
+    }
+}
+
+/// Append held lines at the *end* of a block, up to and including its last
+/// comment — trailing blanks are the separator to the next block, not
+/// content. Drains what it consumed, so `pending` is left holding exactly
+/// the lines a byte-preserving caller must re-queue.
+fn push_tail(block: &mut String, pending: &mut Vec<&str>) {
+    let Some(end) = pending.iter().rposition(|l| !l.trim().is_empty()) else {
+        return;
+    };
+    push_interior(block, &pending[..=end]);
+    pending.drain(..=end);
 }
 
 /// The namespace named by a table header line, if it is a top-level
@@ -1521,8 +1742,11 @@ fn migration_recipes() -> &'static [MigrationRecipe] {
             pack: "agents",
             from_ns: "AGENTS",
             to_ns: &["CLAUDE", "GEMINI", "AGENTS"],
-            // fingerprint of the pre-split [AGENTS] block (680b40c).
-            clean_fingerprints: &["7800619f29dbf307"],
+            // fingerprints of the pre-split [AGENTS] block (680b40c): as
+            // extracted today, and as extracted before BUG-069 moved the
+            // block seam ahead of the comment introducing [SKILLS] — a
+            // config that ends at that comment still yields the old digest.
+            clean_fingerprints: &["001e05c08acd19bb", "7800619f29dbf307"],
         },
         MigrationRecipe {
             pack: "agents",
@@ -1566,6 +1790,9 @@ enum ConfigSegment {
         ns: String,
         /// The verbatim `# pack: ...` line (no trailing newline), if any.
         provenance: Option<String>,
+        /// The comment run between the provenance line and the header,
+        /// newline-terminated and verbatim; empty when there is none.
+        lead: String,
         /// The verbatim block text (`[NS] ...` lines), trailing-trimmed.
         block: String,
     },
@@ -1587,15 +1814,13 @@ fn config_segments(toml: &str) -> Vec<ConfigSegment> {
     while i < lines.len() {
         let line = lines[i];
         if let Some(ns) = header_namespace(line) {
-            // A `# pack:` comment on the immediately preceding line (with
-            // no blank line between) is this block's provenance.
-            let provenance = match segments_pending_provenance(&other) {
-                Some((before, prov)) => {
-                    other = before;
-                    Some(prov)
-                }
-                None => None,
-            };
+            // The unbroken comment run reaching this header is the block's
+            // prelude: a `# pack:` stamp at its head, then the comments
+            // introducing the namespace. Both `pack add` and `init` write
+            // that shape, so requiring the stamp to be the immediately
+            // preceding line left most fingerprints unbound (ADR-126).
+            let (before, provenance, lead) = split_block_prelude(&other);
+            other = before;
             if !other.is_empty() {
                 segments.push(ConfigSegment::Other(std::mem::take(&mut other)));
             }
@@ -1614,37 +1839,58 @@ fn config_segments(toml: &str) -> Vec<ConfigSegment> {
             block.push_str(line);
             block.push('\n');
             i += 1;
-            let mut pending_blanks = String::new();
+            let mut pending: Vec<&str> = Vec::new();
             while i < lines.len() {
                 let l = lines[i];
                 if let Some(h) = header_namespace(l) {
                     if h != ns {
                         break;
                     }
+                } else if l.trim_start().starts_with('[') {
+                    // A non-namespace table ([changelog], [ignore],
+                    // [sources.*]) is not this namespace's content — without
+                    // this the block, and its fingerprint, swallow it.
+                    break;
                 } else if parse_provenance(l).is_some() {
                     break;
                 }
-                if l.trim().is_empty() {
-                    // Hold blanks: flushed into the block only if a content
-                    // line follows (interior), else left trailing.
-                    pending_blanks.push_str(l);
-                    pending_blanks.push('\n');
+                if l.trim().is_empty() || l.trim_start().starts_with('#') {
+                    // Hold blanks and comments: flushed into the block only
+                    // if a content line follows (interior), else trailing.
+                    pending.push(l);
                 } else {
-                    block.push_str(&pending_blanks);
-                    pending_blanks.clear();
+                    push_interior(&mut block, &pending);
+                    pending.clear();
                     block.push_str(l);
                     block.push('\n');
                 }
                 i += 1;
             }
+            // A comment run reaching the next block introduces *that* block,
+            // so it is handed over rather than counted as this one's content
+            // — otherwise deleting a namespace dirties its predecessor
+            // (BUG-069).
+            // …only when a next block actually follows; at end of file the
+            // tail is this block's own (a commented-out option, say).
+            let handover = if i < lines.len() {
+                take_lead_comments(&mut pending, Held::AfterBlock)
+            } else {
+                String::new()
+            };
+            push_tail(&mut block, &mut pending);
             segments.push(ConfigSegment::Namespace {
                 ns,
                 provenance,
+                lead,
                 block: block.trim_end().to_string(),
             });
             // Trailing blanks separate this block from the next — re-queue
             // them so the next segment (or its provenance) keeps its spacing.
-            other.push_str(&pending_blanks);
+            for l in &pending {
+                other.push_str(l);
+                other.push('\n');
+            }
+            other.push_str(&handover);
             continue;
         }
         other.push_str(line);
@@ -1657,23 +1903,39 @@ fn config_segments(toml: &str) -> Vec<ConfigSegment> {
     segments
 }
 
-/// If the tail of `other` is a lone `# pack:` provenance comment (the
-/// provenance for the namespace block that follows), split it off:
-/// returns `(other_without_provenance, provenance_line)`.
-fn segments_pending_provenance(other: &str) -> Option<(String, String)> {
-    // Find the last non-empty line; it must be a provenance comment, and
-    // every line after it must be blank for it to bind to the next block.
-    let trimmed_end = other.trim_end_matches('\n');
-    let last_line = trimmed_end.lines().next_back()?;
-    parse_provenance(last_line)?;
-    // Only bind when there is no blank line between the comment and the
-    // header (i.e. the provenance is the very last line before the header).
-    if other.trim_end().ends_with(last_line) {
-        let before_len = trimmed_end.len() - last_line.len();
-        let before = trimmed_end[..before_len].to_string();
-        Some((before, last_line.to_string()))
-    } else {
-        None
+/// Split the prelude of the namespace block that follows off the tail of
+/// `other`: returns `(other_without_prelude, provenance_line, lead)`.
+///
+/// The prelude is the unbroken comment run reaching the header — a blank
+/// line ends it, so a comment separated from the header does not bind. A
+/// `# pack:` line anywhere in that run is the block's provenance; the
+/// comments after it are the block's introduction, held as `lead` so they
+/// travel with the block instead of dangling in `Other`.
+///
+/// Requiring the stamp to be the *immediately* preceding line (the earlier
+/// rule) left 3 of this repo's 4 fingerprints unbound, because both
+/// `pack add` and `init` write the stamp above the comments that introduce
+/// the namespace (ADR-126).
+fn split_block_prelude(other: &str) -> (String, Option<String>, String) {
+    let lines: Vec<&str> = other.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|l| l.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    let run = &lines[start..];
+    // `other` also carries non-namespace tables (`[ignore]`, `[sources.*]`);
+    // only an all-comment run is a prelude.
+    if run.is_empty() || run.iter().any(|l| !l.trim_start().starts_with('#')) {
+        return (other.to_string(), None, String::new());
+    }
+    let rejoin = |ls: &[&str]| ls.iter().map(|l| format!("{l}\n")).collect::<String>();
+    match run.iter().position(|l| parse_provenance(l).is_some()) {
+        Some(k) => (
+            rejoin(&lines[..start + k]),
+            Some(run[k].to_string()),
+            rejoin(&run[k + 1..]),
+        ),
+        None => (rejoin(&lines[..start]), None, rejoin(run)),
     }
 }
 
@@ -1688,6 +1950,11 @@ pub struct BlockRewrite {
     pub to_ns: Vec<String>,
     /// The provenance pack the block belongs to.
     pub pack: String,
+    /// True when the block's own text is unchanged and only its `# pack:`
+    /// line is rewritten — a v1 stamp gaining a baseline (ADR-126 §
+    /// DRF-008). Housekeeping, not drift: it never sets `pack outdated`'s
+    /// exit code, because the block is by definition already current.
+    pub stamp_only: bool,
 }
 
 /// One dirty (hand-edited) block migrate left untouched, with the diff a
@@ -1707,6 +1974,22 @@ pub struct BlockDiff {
     pub proposed: Vec<String>,
 }
 
+/// One block whose provenance carries no fingerprint, so whether its pack
+/// has moved is unanswerable (ADR-126 § DRF-001). Not drift: reported in
+/// its own category and never counted toward the exit code.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BlockUnknown {
+    /// The on-disk namespace.
+    pub namespace: String,
+    /// The provenance pack.
+    pub pack: String,
+    /// The digest that, written into this block's stamp as `sha:<value>`,
+    /// declares the installed pack to be its baseline (ADR-126 § DRF-008).
+    /// Carried on the row that reports the problem so the remedy is one
+    /// command, not a cross-reference into `pack show`.
+    pub fingerprint: String,
+}
+
 /// The result of planning a `pack migrate` (ADR-053 § PKM-002/004).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct MigratePlan {
@@ -1714,6 +1997,9 @@ pub struct MigratePlan {
     pub rewrites: Vec<BlockRewrite>,
     /// Dirty blocks left intact, surfaced as diffs.
     pub diffs: Vec<BlockDiff>,
+    /// Blocks with no stored baseline — the pack-moved question cannot be
+    /// asked of them (ADR-126). Left intact, exit code unaffected.
+    pub unknown: Vec<BlockUnknown>,
     /// Blocks already at their current shape (nothing to do).
     pub noop_count: usize,
     /// The full migrated config text (clean rewrites applied; dirty and
@@ -1754,6 +2040,7 @@ pub fn plan_migrate(config_toml: &str, root: &Path) -> MigratePlan {
             ConfigSegment::Namespace {
                 ns,
                 provenance,
+                lead,
                 block,
             } => {
                 let prov = provenance.as_deref().and_then(parse_provenance);
@@ -1761,20 +2048,23 @@ pub fn plan_migrate(config_toml: &str, root: &Path) -> MigratePlan {
                     .as_ref()
                     .map(|p| p.pack.clone())
                     .unwrap_or_else(|| owning_pack_name(&packs, &ns));
-                let stored_sha = prov.as_ref().and_then(|p| p.sha.clone());
 
                 let recipe = migration_recipes()
                     .iter()
                     .find(|r| r.pack == pack_name && r.from_ns == ns);
 
-                let outcome = classify_block(&packs, &ns, &pack_name, &block, stored_sha, recipe);
+                let outcome =
+                    classify_block(&packs, &ns, &pack_name, &block, prov.as_ref(), recipe);
                 apply_outcome(
                     &mut plan,
                     &mut new_config,
                     &ns,
                     &pack_name,
-                    provenance.as_deref(),
-                    &block,
+                    BlockText {
+                        provenance: provenance.as_deref(),
+                        lead: &lead,
+                        block: &block,
+                    },
                     outcome,
                 );
             }
@@ -1803,9 +2093,16 @@ enum BlockOutcome {
     Rewrite {
         to_ns: Vec<String>,
         targets: Vec<(String, String)>,
+        /// Only the provenance line changes; the block text is identical.
+        stamp_only: bool,
     },
     /// Dirty — leave intact, surface a diff.
     Diff { kind: String, proposed: Vec<String> },
+    /// Customized, with no stored baseline to compare the pack against —
+    /// leave intact, report separately, never count as drift (ADR-126).
+    /// Carries the pack's current digest: the one value that, asserted by
+    /// the consumer, gives the block a baseline (DRF-008).
+    UnknownBaseline { fingerprint: String },
     /// No recipe and no canonical definition (unknown/local namespace) —
     /// leave verbatim, do not count as anything.
     Untouched,
@@ -1817,9 +2114,10 @@ fn classify_block(
     ns: &str,
     pack_name: &str,
     block: &str,
-    stored_sha: Option<String>,
+    provenance: Option<&Provenance>,
     recipe: Option<&MigrationRecipe>,
 ) -> BlockOutcome {
+    let stored_sha = provenance.and_then(|p| p.sha.as_deref());
     match recipe {
         Some(r) if r.clean_fingerprints.is_empty() => {
             // 1->1 rename: clean iff reverse-substitution matches canonical.
@@ -1831,6 +2129,7 @@ fn classify_block(
                 BlockOutcome::Rewrite {
                     to_ns: vec![new.to_string()],
                     targets: vec![(owner, canon)],
+                    stamp_only: false,
                 }
             } else {
                 BlockOutcome::Diff {
@@ -1867,6 +2166,7 @@ fn classify_block(
                 BlockOutcome::Rewrite {
                     to_ns: r.to_ns.iter().map(|s| s.to_string()).collect(),
                     targets,
+                    stamp_only: false,
                 }
             } else {
                 BlockOutcome::Diff {
@@ -1882,46 +2182,75 @@ fn classify_block(
                 return BlockOutcome::Untouched;
             };
             let provenance_current = pack_name == owner;
-            match stored_sha {
-                Some(sha) if sha == fingerprint(block) => {
-                    if block == canon && provenance_current {
-                        BlockOutcome::NoOp
-                    } else {
-                        // Clean (sha matches) — restamp to canonical + current
-                        // owning pack. Covers the agents->workflow relabel.
-                        BlockOutcome::Rewrite {
-                            to_ns: vec![ns.to_string()],
-                            targets: vec![(owner, canon)],
-                        }
+
+            // Two questions, deliberately kept apart (ADR-126 § DRF-006).
+            //
+            // "Is this safe to overwrite?" is byte-equality with the pack's
+            // current text, and nothing else — it is the only condition under
+            // which re-rendering from the pack loses nothing (PKM-003).
+            if block == canon {
+                let stamp_current = match stored_sha {
+                    // A stale stamp on already-canonical text: refresh the
+                    // label, the text is a no-change rewrite.
+                    Some(sha) => sha == fingerprint(&canon),
+                    // Bare v1 provenance carries no baseline. This block is
+                    // byte-identical to the pack, so adopting the pack as its
+                    // baseline is *proved*, not assumed — restamp it. Without
+                    // this the block reports clean today and falls into the
+                    // unresolvable no-baseline category the moment its pack
+                    // moves, losing a true drift report (ADR-126 § DRF-008).
+                    //
+                    // Only for a block that already claims a pack. A block
+                    // with no `# pack:` line at all is the consumer's own; it
+                    // may happen to match a pack's text, and stamping it would
+                    // have ctxgrd claim authorship the user never granted.
+                    None => provenance.is_none(),
+                };
+                return if provenance_current && stamp_current {
+                    BlockOutcome::NoOp
+                } else {
+                    BlockOutcome::Rewrite {
+                        to_ns: vec![ns.to_string()],
+                        targets: vec![(owner, canon)],
+                        // `block == canon` reached this arm, so the only
+                        // bytes that move are the provenance line's.
+                        stamp_only: true,
                     }
-                }
+                };
+            }
+
+            // The block is customized, so it is never rewritten. The only
+            // question left is the one `pack outdated` exists to answer:
+            // "has the pack moved since this block was stamped?" The stamp
+            // *is* the pack-side baseline — `pack add` writes canonical text
+            // and hashes what it writes — so it is compared against the
+            // pack's text today, never against the consumer's (DRF-001).
+            match stored_sha {
+                // The pack has not moved. Consumer customization is not
+                // drift, however heavy (DRF-002).
+                Some(sha) if sha == fingerprint(&canon) => BlockOutcome::NoOp,
                 Some(_) => BlockOutcome::Diff {
                     kind: "internals".to_string(),
                     proposed: vec![canon],
                 },
-                None => {
-                    // Bare provenance (no fingerprint): only safe to treat as
-                    // current when the block already equals canonical AND the
-                    // provenance pack is current. Otherwise conservative-dirty.
-                    if block == canon && provenance_current {
-                        BlockOutcome::NoOp
-                    } else if block == canon {
-                        // Block is canonical but provenance pack is stale
-                        // (agents->workflow relabel for SPEC/TASK/PROMPT).
-                        BlockOutcome::Rewrite {
-                            to_ns: vec![ns.to_string()],
-                            targets: vec![(owner, canon)],
-                        }
-                    } else {
-                        BlockOutcome::Diff {
-                            kind: "internals".to_string(),
-                            proposed: vec![canon],
-                        }
-                    }
-                }
+                // No baseline: the question cannot be asked of this block.
+                // Saying "drift" would be a guess, so say so instead — and
+                // hand over the digest that would answer it, so the consumer
+                // can assert what the tool must not assume.
+                None => BlockOutcome::UnknownBaseline {
+                    fingerprint: fingerprint(&canon),
+                },
             }
         }
     }
+}
+
+/// The verbatim text of one on-disk block: the `# pack:` line it carried,
+/// the comment run introducing it, and the block itself.
+struct BlockText<'a> {
+    provenance: Option<&'a str>,
+    lead: &'a str,
+    block: &'a str,
 }
 
 /// Render one block's outcome into the running plan and config text.
@@ -1933,16 +2262,22 @@ fn apply_outcome(
     new_config: &mut String,
     ns: &str,
     pack_name: &str,
-    provenance: Option<&str>,
-    block: &str,
+    text: BlockText<'_>,
     outcome: BlockOutcome,
 ) {
-    // Re-emit a block (and its original provenance, if any) verbatim.
+    let BlockText {
+        provenance,
+        lead,
+        block,
+    } = text;
+    // Re-emit a block (its provenance and introducing comment run, if any)
+    // verbatim.
     let emit_verbatim = |out: &mut String| {
         if let Some(prov) = provenance {
             out.push_str(prov);
             out.push('\n');
         }
+        out.push_str(lead);
         out.push_str(block);
         out.push('\n');
     };
@@ -1951,11 +2286,16 @@ fn apply_outcome(
             plan.noop_count += 1;
             emit_verbatim(new_config);
         }
-        BlockOutcome::Rewrite { to_ns, targets } => {
+        BlockOutcome::Rewrite {
+            to_ns,
+            targets,
+            stamp_only,
+        } => {
             plan.rewrites.push(BlockRewrite {
                 from_ns: ns.to_string(),
                 to_ns,
                 pack: pack_name.to_string(),
+                stamp_only,
             });
             for (i, (owner, canon)) in targets.iter().enumerate() {
                 if i > 0 {
@@ -1963,6 +2303,11 @@ fn apply_outcome(
                 }
                 new_config.push_str(&provenance_comment(owner, canon));
                 new_config.push('\n');
+                // The comment run introducing the block is the consumer's,
+                // not the pack's — a clean swap keeps it.
+                if i == 0 {
+                    new_config.push_str(lead);
+                }
                 new_config.push_str(canon);
                 new_config.push('\n');
             }
@@ -1976,6 +2321,14 @@ fn apply_outcome(
                 proposed,
             });
             // Leave the dirty block (and its provenance) intact.
+            emit_verbatim(new_config);
+        }
+        BlockOutcome::UnknownBaseline { fingerprint } => {
+            plan.unknown.push(BlockUnknown {
+                namespace: ns.to_string(),
+                pack: pack_name.to_string(),
+                fingerprint,
+            });
             emit_verbatim(new_config);
         }
         BlockOutcome::Untouched => emit_verbatim(new_config),
@@ -2284,15 +2637,20 @@ pub fn render_show(pack: &Pack) -> String {
 /// human/agent to resolve.
 pub fn render_migrate_report(plan: &MigratePlan, dry_run: bool) -> String {
     let mut out = String::new();
-    if plan.rewrites.is_empty() && plan.diffs.is_empty() {
+    if plan.rewrites.is_empty() && plan.diffs.is_empty() && plan.unknown.is_empty() {
         out.push_str("Nothing to migrate — every provenance block is at its pack's current shape.\n");
         return out;
     }
 
-    if !plan.rewrites.is_empty() {
+    // A stamp-only rewrite changes no block text — it gives a v1 stamp the
+    // baseline drift detection needs. Reported apart from real swaps, and
+    // never counted as drift (ADR-126 § DRF-008).
+    let (restamps, swaps): (Vec<_>, Vec<_>) = plan.rewrites.iter().partition(|r| r.stamp_only);
+
+    if !swaps.is_empty() {
         let verb = if dry_run { "Would migrate" } else { "Migrated" };
-        out.push_str(&format!("{verb} {} block(s):\n", plan.rewrites.len()));
-        for r in &plan.rewrites {
+        out.push_str(&format!("{verb} {} block(s):\n", swaps.len()));
+        for r in &swaps {
             if r.to_ns.len() == 1 && r.to_ns[0] == r.from_ns {
                 out.push_str(&format!("  • [{}] (pack {})\n", r.from_ns, r.pack));
             } else {
@@ -2310,30 +2668,83 @@ pub fn render_migrate_report(plan: &MigratePlan, dry_run: bool) -> String {
         }
     }
 
+    if !restamps.is_empty() {
+        if !swaps.is_empty() {
+            out.push('\n');
+        }
+        let verb = if dry_run { "Would give" } else { "Gave" };
+        out.push_str(&format!(
+            "{verb} {} block(s) a baseline (stamp only — the block text is \
+             unchanged):\n",
+            restamps.len()
+        ));
+        for r in &restamps {
+            out.push_str(&format!("  • [{}] (pack {})\n", r.from_ns, r.pack));
+        }
+    }
+
     if !plan.diffs.is_empty() {
         if !plan.rewrites.is_empty() {
             out.push('\n');
         }
         out.push_str(&format!(
-            "{} block(s) hand-edited — resolve manually (left untouched):\n",
+            "{} block(s) to reconcile by hand (left untouched):\n",
             plan.diffs.len()
         ));
         for d in &plan.diffs {
-            out.push_str(&format!(
-                "\n  [{}] (pack {}, {} change)\n",
-                d.namespace, d.pack, d.kind
-            ));
+            // Word each row by what actually made it a diff. Only the
+            // `internals` arm consults the stamp; `rename`/`split` fire on a
+            // shape change and never asked whether the pack moved.
+            let why = match d.kind.as_str() {
+                "internals" => "the pack moved since this block was stamped",
+                "rename" => "the namespace was renamed",
+                "split" => "the namespace was split",
+                other => other,
+            };
+            out.push_str(&format!("\n  [{}] (pack {}) — {why}\n", d.namespace, d.pack));
             out.push_str("    on disk:\n");
             for line in d.on_disk.lines() {
                 out.push_str(&format!("      {line}\n"));
             }
-            out.push_str("    proposed:\n");
+            out.push_str("    proposed (the pack's block — it does NOT carry your edits):\n");
             for block in &d.proposed {
                 for line in block.lines() {
                     out.push_str(&format!("      {line}\n"));
                 }
             }
         }
+    }
+
+    if !plan.unknown.is_empty() {
+        if !plan.rewrites.is_empty() || !plan.diffs.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "{} block(s) carry no baseline — a pre-v2 `# pack:` stamp, or none:\n",
+            plan.unknown.len()
+        ));
+        // One line per block, carrying its digest: the earlier grouping was
+        // right while nothing here was actionable per block, but the remedy
+        // is now per block and the digest differs for each.
+        for u in &plan.unknown {
+            out.push_str(&format!(
+                "  [{}] (pack {}) — baseline it with sha:{}\n",
+                u.namespace, u.pack, u.fingerprint
+            ));
+        }
+        // No command clears these, and none should: a block reaches this
+        // state only by being customized, and nothing can recover which pack
+        // revision it was copied from. But the assertion the tool must not
+        // make, the consumer can — so name what it costs rather than only
+        // saying it is impossible (ADR-126 § DRF-008).
+        out.push_str(
+            "  No command can resolve these: no baseline was recorded when the block was\n\
+             \x20 written, so \"has the pack moved?\" has no answer, and adopting today's\n\
+             \x20 pack would be a guess ctxgrd has no standing to make. You do: writing the\n\
+             \x20 digest above into the block's `# pack:` line asserts that the installed\n\
+             \x20 pack is its baseline. Review the block against `ctxgrd pack show <pack>`\n\
+             \x20 first — the assertion is yours. They never set the exit code.\n",
+        );
     }
     out
 }
@@ -3264,17 +3675,30 @@ rules = [\"skills.frontmatter\"]
         let agents_block = &blocks.iter().find(|(n, _)| n == "AGENTS").unwrap().1;
         let skills_block = &blocks.iter().find(|(n, _)| n == "SKILLS").unwrap().1;
 
-        assert_eq!(fingerprint(agents_block), "7800619f29dbf307");
+        // The [AGENTS] digest moved when BUG-069 put the block seam ahead of
+        // the comment introducing [SKILLS]; both are kept clean-detectable.
+        assert_eq!(fingerprint(agents_block), "001e05c08acd19bb");
+        assert!(
+            !agents_block.contains("SKILLS claims"),
+            "[AGENTS] must not carry [SKILLS]'s introduction:\n{agents_block}"
+        );
         assert_eq!(fingerprint(skills_block), "f66294963c421057");
 
-        // The recipe constants must equal the re-derived fingerprints.
+        // The recipe constants must contain the re-derived fingerprints.
         let agents_recipe = migration_recipes()
             .iter()
             .find(|r| r.pack == "agents" && r.from_ns == "AGENTS")
             .unwrap();
-        assert_eq!(
-            agents_recipe.clean_fingerprints,
-            &[fingerprint(agents_block).as_str()]
+        assert!(
+            agents_recipe
+                .clean_fingerprints
+                .contains(&fingerprint(agents_block).as_str()),
+            "{:?}",
+            agents_recipe.clean_fingerprints
+        );
+        assert!(
+            agents_recipe.clean_fingerprints.contains(&"7800619f29dbf307"),
+            "the pre-BUG-069 digest stays clean-detectable"
         );
         let skills_recipe = migration_recipes()
             .iter()
@@ -3447,8 +3871,9 @@ rules = [\"core.id\"]
         let config = format!("# pack: project-docs\n{adr}\n");
         let plan = plan_migrate(&config, tmp.path());
         assert_eq!(plan.diffs, Vec::new(), "block with sub-tables is not dirty");
-        assert_eq!(plan.rewrites, Vec::new());
-        assert_eq!(plan.noop_count, 1);
+        // The bare stamp is upgraded to one carrying a baseline, but the
+        // block's own text is untouched.
+        assert!(plan.new_config.contains(&adr), "{}", plan.new_config);
     }
 
     #[test]
@@ -3505,10 +3930,14 @@ rules = [\"core.id\"]
     }
 
     #[test]
-    fn migrate_bare_already_current_block_is_a_noop() {
+    fn migrate_gives_a_bare_stamped_current_block_a_baseline() {
+        // A bare v1 provenance on a block that equals the current canonical
+        // shape. Adopting the pack as this block's baseline is *proved* —
+        // the bytes are identical — so migrate restamps rather than leaving
+        // it without one. Left bare, the block reports clean today and lands
+        // in the unresolvable no-baseline category the moment its pack moves,
+        // losing a true drift report (ADR-126 § DRF-008).
         let tmp = tempfile::tempdir().unwrap();
-        // A bare-form provenance on a block that already equals the current
-        // canonical shape: nothing to migrate.
         let claude = builtin_packs()
             .into_iter()
             .find(|p| p.name == "claude")
@@ -3516,8 +3945,313 @@ rules = [\"core.id\"]
         let canon = canonical_block(&[claude], "CLAUDEAGENTS").unwrap().1;
         let config = format!("# pack: claude\n{canon}\n");
         let plan = plan_migrate(&config, tmp.path());
-        assert_eq!(plan.rewrites, Vec::new());
         assert_eq!(plan.diffs, Vec::new());
+        assert_eq!(plan.unknown, Vec::new());
+        assert_eq!(plan.rewrites.len(), 1, "the stamp is upgraded");
+        assert!(
+            plan.new_config
+                .contains(&format!("sha:{}", fingerprint(&canon))),
+            "the new stamp carries the pack's fingerprint:\n{}",
+            plan.new_config
+        );
+        // The block's own text is byte-identical; only the stamp changed.
+        assert!(plan.new_config.contains(&canon), "{}", plan.new_config);
+        // And a second run has nothing left to do.
+        let second = plan_migrate(&plan.new_config, tmp.path());
+        assert_eq!(second.rewrites, Vec::new());
+        assert_eq!(second.noop_count, 1);
+    }
+
+    // -- drift asks "has the pack moved?" (ADR-126) ---------------------
+
+    /// A `[CLAUDEAGENTS]` block as `pack add claude` writes it, then
+    /// customized the three ways this repo's own config customizes blocks:
+    /// an `owner` the linter asked for, an added rule, an overridden path.
+    fn customized_claudeagents() -> (String, String) {
+        let claude = builtin_packs()
+            .into_iter()
+            .find(|p| p.name == "claude")
+            .unwrap();
+        let canon = canonical_block(&[claude], "CLAUDEAGENTS").unwrap().1;
+        let customized = canon
+            .replace("[CLAUDEAGENTS]\n", "[CLAUDEAGENTS]\nowner = \"developer\"\n")
+            .replace(
+                "paths = [\".claude/agents/**/*.md\"]",
+                "paths = [\"agents/**/*.md\"]",
+            )
+            .replace(
+                "rules = [\"agent.frontmatter\"]",
+                "rules = [\"agent.frontmatter\", \"core.min-docs\"]",
+            );
+        assert_ne!(customized, canon, "the customization must bite");
+        (canon, customized)
+    }
+
+    #[test]
+    fn outdated_is_silent_when_the_consumer_customized_but_the_pack_is_current() {
+        // ADR-126 § DRF-001/002: drift means "the pack moved", not "you
+        // edited it". A block stamped from the current pack and then
+        // customized has nothing to report, however heavily it was edited.
+        let tmp = tempfile::tempdir().unwrap();
+        let (canon, customized) = customized_claudeagents();
+        let config = format!("{}\n{customized}\n", provenance_comment("claude", &canon));
+        let plan = plan_migrate(&config, tmp.path());
+        assert_eq!(plan.diffs, Vec::new(), "consumer customization is not drift");
+        assert_eq!(plan.rewrites, Vec::new(), "and is never a clean swap");
+        assert_eq!(plan.unknown, Vec::new(), "the baseline is present");
+        assert_eq!(plan.noop_count, 1);
+    }
+
+    #[test]
+    fn migrate_never_rewrites_a_customized_block_whose_pack_is_current() {
+        // ADR-126 § DRF-006 / ADR-053 § PKM-003. `outdated` and `migrate`
+        // share this classifier, so "clean" must not be read as "safe to
+        // overwrite": the arm DRF-001 makes reachable is the one that
+        // re-renders from the pack. Every customization must survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let (canon, customized) = customized_claudeagents();
+        let config = format!("{}\n{customized}\n", provenance_comment("claude", &canon));
+        let plan = plan_migrate(&config, tmp.path());
+        assert!(
+            plan.new_config.contains("owner = \"developer\""),
+            "owner survives migrate:\n{}",
+            plan.new_config
+        );
+        assert!(
+            plan.new_config.contains("core.min-docs"),
+            "the added rule survives migrate:\n{}",
+            plan.new_config
+        );
+        assert!(
+            plan.new_config.contains("paths = [\"agents/**/*.md\"]"),
+            "the paths override survives migrate:\n{}",
+            plan.new_config
+        );
+    }
+
+    #[test]
+    fn the_stamp_alone_decides_drift_for_one_identical_customized_block() {
+        // The whole of DRF-001 in one test: the same customized block, twice,
+        // with the *stamp* as the only varying input. Judged against the
+        // consumer's text (the old rule) both are dirty; judged against the
+        // pack (the new rule) they differ, and only the second is drift.
+        // Held together so neither half can pass for the wrong reason.
+        let tmp = tempfile::tempdir().unwrap();
+        let (canon, customized) = customized_claudeagents();
+        let older_pack_shape = canon.replace(
+            "rules = [\"agent.frontmatter\"]",
+            "rules = [\"agent.frontmatter\", \"skills.frontmatter\"]",
+        );
+        assert_ne!(older_pack_shape, canon, "the pack must have moved");
+
+        let plan_for = |baseline: &str| {
+            let config = format!("{}\n{customized}\n", provenance_comment("claude", baseline));
+            plan_migrate(&config, tmp.path())
+        };
+
+        // Stamped from the pack as it is today: the pack has not moved.
+        let current = plan_for(&canon);
+        assert_eq!(current.diffs, Vec::new());
+        assert_eq!(current.noop_count, 1);
+
+        // Stamped from an older pack shape: it has.
+        let moved = plan_for(&older_pack_shape);
+        assert_eq!(moved.diffs.len(), 1);
+        assert_eq!(moved.diffs[0].namespace, "CLAUDEAGENTS");
+        assert_eq!(moved.diffs[0].kind, "internals");
+        assert_eq!(moved.noop_count, 0);
+
+        // Neither is ever rewritten — the block is customized (DRF-007).
+        assert_eq!(current.rewrites, Vec::new());
+        assert_eq!(moved.rewrites, Vec::new());
+    }
+
+    #[test]
+    fn outdated_reports_a_baseline_less_block_as_unknown_rather_than_drift() {
+        // ADR-126 Open Question 1: a v1 bare stamp carries no fingerprint, so
+        // "has the pack moved?" has no answer. Reporting it as drift is a
+        // lie; it belongs in its own category and must not set exit 1.
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, customized) = customized_claudeagents();
+        let config = format!("# pack: claude\n{customized}\n");
+        let plan = plan_migrate(&config, tmp.path());
+        assert_eq!(plan.diffs, Vec::new(), "no baseline is not drift");
+        assert_eq!(plan.rewrites, Vec::new());
+        // The row carries the digest that would resolve it — the only thing
+        // a consumer can act on, since no command may (ADR-126 § DRF-008).
+        // Derived from the pack here rather than pinned as a literal: the
+        // claim is "this is the classifier's operand", not "this is hex".
+        let (_, canon) = canonical_block(&discover(tmp.path()), "CLAUDEAGENTS").unwrap();
+        assert_eq!(
+            plan.unknown,
+            vec![BlockUnknown {
+                namespace: "CLAUDEAGENTS".to_string(),
+                pack: "claude".to_string(),
+                fingerprint: fingerprint(&canon),
+            }]
+        );
+    }
+
+    #[test]
+    fn provenance_binds_through_the_comment_run_above_its_block() {
+        // Requiring the stamp to be the immediately preceding line unbound 3
+        // of this repo's 4 fingerprints: `pack add` and `init` both write
+        // explanatory comments between the stamp and the header, so those
+        // blocks silently fell to the no-baseline arm.
+        let toml = "\
+# pack: research@2.0.2 sha:15fa8bf558f1e44c
+#
+# Adopted 2026-08-03. ADR-093 shipped this pack unadopted here.
+[RESEARCH]
+paths = [\"docs/research/**\"]
+";
+        let bound = config_segments(toml).into_iter().find_map(|s| match s {
+            ConfigSegment::Namespace { ns, provenance, .. } if ns == "RESEARCH" => Some(provenance),
+            _ => None,
+        });
+        assert_eq!(
+            bound.unwrap().as_deref(),
+            Some("# pack: research@2.0.2 sha:15fa8bf558f1e44c")
+        );
+    }
+
+    #[test]
+    fn a_canonical_block_stops_before_the_comment_introducing_the_next_one() {
+        // BUG-069: a block ended only at the next header, so the intake
+        // pack's [CR] block swallowed the ten-line comment introducing
+        // [FEEDBACK] — and `pack add` stamped a fingerprint over it.
+        let intake = builtin_packs()
+            .into_iter()
+            .find(|p| p.name == "intake")
+            .unwrap();
+        let cr = canonical_block(&[intake], "CR").unwrap().1;
+        assert!(
+            !cr.contains("FEEDBACK"),
+            "[CR] must not carry [FEEDBACK]'s introduction:\n{cr}"
+        );
+        assert!(cr.contains("[CR.\"core.required-headings\"]"), "{cr}");
+    }
+
+    #[test]
+    fn planning_a_migrate_of_this_repos_own_config_preserves_every_byte() {
+        // The segmentation splits a config across three sinks (`Other` text,
+        // a block's `lead`, and the block) and reassembles it. This repo's
+        // own ctxgrd.toml is the widest real input available — 20-odd blocks,
+        // stamped and bare, with comment runs, sub-tables, `[changelog]` and
+        // `[ignore]` between them. Nothing it plans may lose a byte.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let toml = fs::read_to_string(root.join("ctxgrd.toml")).unwrap();
+        let plan = plan_migrate(&toml, root);
+        assert_eq!(plan.rewrites, Vec::new(), "no rewrite: bytes must round-trip");
+        assert_eq!(plan.new_config, toml);
+    }
+
+    #[test]
+    fn a_clean_swap_keeps_the_comment_run_introducing_the_block() {
+        // The lead is the consumer's prose, not the pack's; a rewrite that
+        // re-renders the block from the pack must not drop it.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = format!(
+            "# pack: claude\n# Why this repo claims Claude's agent files.\n{}\n",
+            clean_claudecode_block()
+        );
+        let plan = plan_migrate(&config, tmp.path());
+        assert_eq!(plan.rewrites.len(), 1, "the rename is a clean swap");
+        assert!(
+            plan.new_config
+                .contains("# Why this repo claims Claude's agent files."),
+            "the introducing comment survives the swap:\n{}",
+            plan.new_config
+        );
+    }
+
+    #[test]
+    fn a_blank_line_between_sub_tables_stays_in_the_block() {
+        // Regression in this change: holding blank lines back to find the
+        // block seam dropped the blank *between* two sub-tables. Nothing
+        // comparing on-disk text to canonical can see it — both sides lose
+        // the line together — so it only surfaces against a stored stamp.
+        let toml = "[ADR]\nrules = [\"core.id\"]\n\n[ADR.\"core.allowed-values\"]\nstatus = [\"draft\"]\n";
+        assert_eq!(namespace_blocks(toml)[0].1, toml.trim_end());
+    }
+
+    #[test]
+    fn block_extraction_is_stable_against_a_stamp_an_earlier_binary_wrote() {
+        // A stored `sha:` is the one oracle that can catch an extraction
+        // change: every other comparison in this file re-derives both sides,
+        // so a change that shifts them together is invisible. This repo's
+        // [ARC42] stamp was written by `pack add` at 0.36.0 (fc8726c) and the
+        // arc42 pack has one commit in its history, so the digest below is
+        // what an untouched pack must still produce. Editing
+        // packs/arc42/pack.toml is a real reason for this to fail; changing
+        // how a block is cut out of a file is not.
+        //
+        // [ARC42] is the sole namespace in its pack and the last thing in the
+        // file, so it pins the *interior* of a block only — but its digest is
+        // independent evidence, written by a binary that predates this code.
+        let packs = discover(Path::new(env!("CARGO_MANIFEST_DIR")));
+        let (_, arc42) = canonical_block(&packs, "ARC42").expect("local arc42 pack");
+        assert_eq!(fingerprint(&arc42), "ccc0b498cc251747", "interior");
+
+        // [CR] pins the seams: it is followed by the comment run introducing
+        // [FEEDBACK]. Its digest is a forward pin, not evidence — ADR-126
+        // moved this seam deliberately, so the value is what today's rule
+        // produces. The shape assertion beside it is what carries the intent.
+        let (_, cr) = canonical_block(&packs, "CR").expect("intake pack");
+        assert!(
+            !cr.contains("FEEDBACK") && cr.ends_with("headings = [\"Summary\", \"References\"]"),
+            "[CR] ends at its own last key, not inside its neighbour:\n{cr}"
+        );
+        assert_eq!(fingerprint(&cr), "79ebf75f5c1a1492", "seam");
+    }
+
+    #[test]
+    fn a_block_stops_at_a_non_namespace_table() {
+        // Same seam, other direction: this repo's [FEEDBACK] block swallowed
+        // the entire [changelog] table, so its fingerprint covered config
+        // with nothing to do with the namespace — and editing `[changelog]`
+        // reported [FEEDBACK] as damaged.
+        let tmp = tempfile::tempdir().unwrap();
+        let toml = "\
+# pack: intake
+[FEEDBACK]
+paths = [\"docs/feedback/**\"]
+
+[changelog]
+namespaces = [\"BUG\"]
+";
+        let block = config_segments(toml)
+            .into_iter()
+            .find_map(|s| match s {
+                ConfigSegment::Namespace { ns, block, .. } if ns == "FEEDBACK" => Some(block),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!block.contains("changelog"), "{block}");
+        // And the table itself still survives the round trip.
+        let plan = plan_migrate(toml, tmp.path());
+        assert_eq!(plan.new_config, toml, "every byte preserved");
+    }
+
+    #[test]
+    fn deleting_a_namespace_and_its_intro_comment_leaves_the_predecessor_clean() {
+        // BUG-069 end-to-end: take intake exactly as `pack add` writes it,
+        // then delete [FEEDBACK] together with the comment that introduces
+        // it. [CR] was not touched, so it must stay clean.
+        let tmp = tempfile::tempdir().unwrap();
+        let intake = builtin_packs()
+            .into_iter()
+            .find(|p| p.name == "intake")
+            .unwrap();
+        let added = plan_add(&intake, "", tmp.path()).blocks_text;
+        let cut = added
+            .find("# FEEDBACK")
+            .unwrap()
+            .min(added.rfind("# pack: intake").unwrap());
+        let config = format!("{}\n", added[..cut].trim_end());
+        assert!(config.contains("[CR]") && !config.contains("[FEEDBACK]"), "{config}");
+        let plan = plan_migrate(&config, tmp.path());
+        assert_eq!(plan.diffs, Vec::new(), "deleting a neighbour is not drift");
         assert_eq!(plan.noop_count, 1);
     }
 

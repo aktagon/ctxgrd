@@ -1899,3 +1899,340 @@ fn qa_sealed_report_missing_pin_and_empty_waiver_fire() {
         "names the empty waiver:\n{stdout}"
     );
 }
+
+// -- `pack outdated`'s three states (ADR-126) ---------------------------
+
+/// A config carrying one customized block with a bare v1 stamp: the shape
+/// that reaches the no-baseline category.
+fn config_with_a_baseline_less_block(root: &Path) {
+    run(root, &["init"]);
+    run(root, &["pack", "add", "claude"]);
+    let path = root.join("ctxgrd.toml");
+    let toml = fs::read_to_string(&path).unwrap();
+    // Strip the fingerprint off CLAUDEAGENTS' stamp and customize the block,
+    // exactly as a config written before v2 provenance would look.
+    let toml = toml
+        .replace(
+            &format!("# pack: claude@{} sha:", env!("CARGO_PKG_VERSION")),
+            "# pack: claude sha-was:",
+        )
+        .replace(
+            "[CLAUDEAGENTS]\n",
+            "[CLAUDEAGENTS]\nowner = \"developer\"\n",
+        );
+    fs::write(&path, toml).unwrap();
+}
+
+#[test]
+fn outdated_does_not_set_the_exit_code_for_a_block_with_no_baseline() {
+    // DRF-008's central claim. A block whose pack-moved question cannot be
+    // asked must be reported and must NOT fail the gate — otherwise every
+    // config predating v2 provenance is permanently red, which is the defect
+    // ADR-126 exists to remove.
+    let tmp = tempfile::tempdir().unwrap();
+    config_with_a_baseline_less_block(tmp.path());
+
+    let out = run(tmp.path(), &["pack", "outdated"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("carry no baseline") && stdout.contains("CLAUDEAGENTS"),
+        "the block is reported by name:\n{stdout}"
+    );
+    assert_eq!(out.status.code(), Some(0), "…but never sets exit 1:\n{stdout}");
+    // The remedy must not name a command that cannot deliver one.
+    assert!(
+        !stdout.contains("gains one the next time"),
+        "no unactionable remedy:\n{stdout}"
+    );
+}
+
+#[test]
+fn outdated_json_separates_the_three_states_without_parsing_text() {
+    // CLAUDE.md's agent-drivability rule: an agent must be able to branch on
+    // drift / no-baseline / current from JSON alone.
+    let tmp = tempfile::tempdir().unwrap();
+    config_with_a_baseline_less_block(tmp.path());
+
+    let out = run(tmp.path(), &["pack", "outdated", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is a clean JSON stream");
+
+    // Nothing drifted: no pack moved under any of these blocks.
+    assert_eq!(json["diffs"].as_array().unwrap().len(), 0, "{json}");
+
+    // The customized bare-stamped block lands in `unknown`, carrying the pack
+    // to act on and the digest that would resolve it.
+    let unknown: Vec<(&str, &str)> = json["unknown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            (
+                u["namespace"].as_str().unwrap(),
+                u["pack"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(unknown.contains(&("CLAUDEAGENTS", "claude")), "{json}");
+    assert!(
+        json["unknown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|u| u["fingerprint"].as_str().is_some_and(|f| f.len() == 16)),
+        "every row carries the digest an agent would write back:\n{json}"
+    );
+
+    // `init`'s own [ADR]/[PRD] used to be here too — stamped by nothing, they
+    // were unresolvable in a file ctxgrd had just written (BUG-071). This
+    // assertion is the inversion of what this test originally pinned.
+    assert!(
+        !unknown.contains(&("ADR", "project-docs")),
+        "init stamps what it writes:\n{json}"
+    );
+
+    // The untouched blocks that already match their pack are stamp-only
+    // rewrites — housekeeping migrate will do, which is why exit is still 0.
+    let rewrites = json["rewrites"].as_array().unwrap();
+    assert!(!rewrites.is_empty(), "{json}");
+    assert!(
+        rewrites.iter().all(|r| r["stamp_only"] == true),
+        "no real swap is pending:\n{json}"
+    );
+}
+
+#[test]
+fn outdated_is_silent_and_clean_when_a_customization_is_the_only_divergence() {
+    // BUG-067's repro, end to end through the binary: the linter asks for
+    // `owner`, so adding it must not make the pack gate red.
+    let tmp = tempfile::tempdir().unwrap();
+    run(tmp.path(), &["init"]);
+    run(tmp.path(), &["pack", "add", "claude"]);
+    let path = tmp.path().join("ctxgrd.toml");
+    let toml = fs::read_to_string(&path)
+        .unwrap()
+        .replace("[CLAUDEAGENTS]\n", "[CLAUDEAGENTS]\nowner = \"developer\"\n");
+    fs::write(&path, toml).unwrap();
+
+    let out = run(tmp.path(), &["pack", "outdated"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        !stdout.contains("CLAUDEAGENTS"),
+        "a customized-but-current block is silent:\n{stdout}"
+    );
+
+    // And migrate leaves the edit alone (DRF-007).
+    run(tmp.path(), &["pack", "migrate"]);
+    assert!(fs::read_to_string(&path)
+        .unwrap()
+        .contains("owner = \"developer\""));
+}
+
+/// The digest a baseline-less block needs is on the row that reported it
+/// (ADR-126 § DRF-008). Without it the remedy is a cross-reference: read the
+/// pack name here, then go find the namespace in `pack show`'s array.
+#[test]
+fn outdated_json_carries_the_digest_each_baseline_less_block_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    run(tmp.path(), &["init"]);
+    run(tmp.path(), &["pack", "add", "intake"]);
+    let path = tmp.path().join("ctxgrd.toml");
+
+    // A customized block under a v1 (`sha:`-less) stamp: the one state whose
+    // pack-moved question has no answer.
+    let toml = fs::read_to_string(&path)
+        .unwrap()
+        .replace("[CR]\n", "[CR]\nowner = \"product-strategist\"\n");
+    fs::write(&path, set_stamp_sha(&toml, "CR", None)).unwrap();
+
+    let out = run(tmp.path(), &["pack", "outdated", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let plan: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("outdated emits valid JSON");
+    let cr = plan["unknown"]
+        .as_array()
+        .expect("unknown array")
+        .iter()
+        .find(|u| u["namespace"] == "CR")
+        .expect("[CR] has no baseline");
+    assert_eq!(
+        cr["fingerprint"], "79ebf75f5c1a1492",
+        "the row names the digest that would resolve it"
+    );
+}
+
+/// `docs/guides/keeping-packs-current.md` § "Blocks with no baseline" tells a
+/// reader to read the current digest and write it into the stamp. Performed
+/// literally here, because a remedy nobody executed is a remedy nobody can.
+#[test]
+fn the_guides_manual_remedy_clears_a_baseline_less_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    run(tmp.path(), &["init"]);
+    run(tmp.path(), &["pack", "add", "intake"]);
+    let path = tmp.path().join("ctxgrd.toml");
+    let toml = fs::read_to_string(&path)
+        .unwrap()
+        .replace("[CR]\n", "[CR]\nowner = \"product-strategist\"\n");
+    fs::write(&path, set_stamp_sha(&toml, "CR", None)).unwrap();
+
+    let before = String::from_utf8(run(tmp.path(), &["pack", "outdated"]).stdout).unwrap();
+    assert!(
+        before.contains("no baseline") && before.contains("CR"),
+        "precondition — [CR] is listed as baseline-less:\n{before}"
+    );
+
+    // Guide step: read the fingerprint for the namespace off `pack show`.
+    let show: serde_json::Value =
+        serde_json::from_slice(&run(tmp.path(), &["pack", "show", "intake", "--format", "json"]).stdout)
+            .unwrap();
+    let digest = show["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ns| ns["namespace"] == "CR")
+        .unwrap()["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Guide step: append it to that block's `# pack:` line as `sha:<digest>`.
+    let toml = fs::read_to_string(&path).unwrap();
+    let patched = set_stamp_sha(&toml, "CR", Some(&digest));
+    assert_ne!(patched, toml, "the stamp was rewritten");
+    fs::write(&path, &patched).unwrap();
+
+    let out = run(tmp.path(), &["pack", "outdated"]);
+    let after = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{after}");
+    assert!(
+        !after.contains("[CR]"),
+        "the remedy clears the block it was applied to:\n{after}"
+    );
+    // And clears it as *current*, not by demoting it to drift — the whole
+    // point is that a customized block with a good baseline is silent.
+    assert!(
+        !after.contains("hand-edited"),
+        "the owner edit is still not drift:\n{after}"
+    );
+}
+
+/// Rewrite the `sha:` on the `# pack:` line that stamps `[ns]` — the line
+/// immediately above it. `sha = None` reproduces a v1 stamp written before
+/// ADR-126; `Some(d)` is the manual baseline the guide describes. Only that
+/// one block's stamp moves: a whole-file replace would also restamp its
+/// neighbours with the wrong digest, which is a different test.
+fn set_stamp_sha(toml: &str, ns: &str, sha: Option<&str>) -> String {
+    let header = format!("[{ns}]");
+    let mut lines: Vec<String> = toml.lines().map(str::to_string).collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim() == header)
+        .unwrap_or_else(|| panic!("[{ns}] is in the config"));
+    let stamp = at
+        .checked_sub(1)
+        .filter(|&i| lines[i].starts_with("# pack:"))
+        .unwrap_or_else(|| panic!("[{ns}] is stamped"));
+    let bare = match lines[stamp].find(" sha:") {
+        Some(cut) => lines[stamp][..cut].to_string(),
+        None => lines[stamp].clone(),
+    };
+    lines[stamp] = match sha {
+        Some(d) => format!("{bare} sha:{d}"),
+        None => bare,
+    };
+    lines.join("\n") + "\n"
+}
+
+/// BUG-071/BUG-052: ctxgrd's own scaffold must pass ctxgrd's own gate. A
+/// virgin `init` wrote no `# pack:` stamp at all and hardcoded a `rules` array
+/// the pack had outgrown, so a project that wires `pack outdated` into CI —
+/// which `docs/ci.md` presents as supported — started red on day one. The
+/// absence of this test is why it survived thirteen months of releases.
+#[test]
+fn a_virgin_init_reports_nothing_from_pack_outdated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let init = run(tmp.path(), &["init"]);
+    assert_eq!(init.status.code(), Some(0));
+
+    let out = run(tmp.path(), &["pack", "outdated"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        !stdout.contains("no baseline") && !stdout.contains("hand-edited"),
+        "a config ctxgrd just wrote has nothing outstanding against the packs \
+         it was written from:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("up to date"),
+        "and says so positively:\n{stdout}"
+    );
+}
+
+/// The other half of BUG-052: `init` must bind what the pack binds. Asserted
+/// against the pack on disk rather than a list, so a rule added to
+/// `project-docs` tomorrow is covered without editing this test.
+#[test]
+fn init_binds_every_rule_the_owning_pack_binds() {
+    let tmp = tempfile::tempdir().unwrap();
+    run(tmp.path(), &["init"]);
+    let written = fs::read_to_string(tmp.path().join("ctxgrd.toml")).unwrap();
+
+    let pack_toml = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("packs/project-docs/pack.toml"),
+    )
+    .unwrap();
+    let pack: toml::Table = pack_toml.parse().unwrap();
+    let config: toml::Table = written.parse().expect("init writes parseable TOML");
+
+    for ns in ["ADR", "PRD"] {
+        // `core.min-docs` asserts a document exists, which is false in the
+        // repo `init` was just run on. It is offered commented instead, so
+        // first-touch stays silent (ADR-007 § DOC-001) without the rule going
+        // missing. Every other rule the pack binds must be bound.
+        let expected: Vec<&str> = pack[ns]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .filter(|r| *r != "core.min-docs")
+            .collect();
+        let actual: Vec<&str> = config[ns]["rules"]
+            .as_array()
+            .unwrap_or_else(|| panic!("init writes [{ns}].rules"))
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "[{ns}]: init must render the pack's rule list, not a parallel copy"
+        );
+    }
+
+    // The deferred rule is offered, not dropped — the reader must be able to
+    // see that the pack binds it.
+    assert!(
+        written.contains("# \"core.min-docs\","),
+        "min-docs is offered commented:\n{written}"
+    );
+
+    // And a fresh config still lints clean, which is the whole reason for
+    // the exception.
+    let out = run(tmp.path(), &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a config ctxgrd just wrote reports nothing:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // And the two things init adds that no pack does are still there
+    // (owner: ADR-076 seeds it; the commented alternative: CLAUDE.md
+    // advertises it). Both are safe now — the stamp is a pack-side digest.
+    assert!(written.contains("owner = "), "init still seeds owner");
+    assert!(
+        written.contains("Conventional minimal shape"),
+        "init still offers the Nygard four-heading alternative"
+    );
+}

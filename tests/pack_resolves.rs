@@ -31,12 +31,6 @@ const NOT_INSTALLABLE: &[(&str, &str)] = &[
         "arc42",
         "paid tier — advertised by `pack list --paid`, never compiled in (ADR-045)",
     ),
-    (
-        "port",
-        "on disk but absent from src/pack.rs's include_str! set, so it resolves \
-         only from a checkout of this repo and `pack add port` fails for anyone \
-         holding just the binary",
-    ),
 ];
 
 /// Every pack under `packs/`, by directory name.

@@ -154,6 +154,45 @@ fn soc2_json_carries_the_vocabularies_cr_008_measured_as_withheld() {
     );
 }
 
+/// Every namespace carries the fingerprint its `# pack:` stamp must match, so
+/// a reader of `pack outdated`'s baseline-less category can obtain the digest
+/// and assert the baseline themselves (ADR-126 § DRF-008). Derived from the
+/// pack set on disk, not a list — a new pack is covered the day it lands.
+#[test]
+fn every_namespace_carries_the_fingerprint_a_stamp_must_match() {
+    for pack in committed_packs() {
+        let json = show_json(&pack);
+        for ns in json["namespaces"].as_array().expect("namespaces") {
+            let name = ns["namespace"].as_str().unwrap();
+            let fp = ns["fingerprint"]
+                .as_str()
+                .unwrap_or_else(|| panic!("pack '{pack}' [{name}]: no `fingerprint` key"));
+            assert!(
+                fp.len() == 16 && fp.chars().all(|c| c.is_ascii_hexdigit()),
+                "pack '{pack}' [{name}]: fingerprint '{fp}' is not the 16-hex digest a \
+                 `sha:` stamp carries"
+            );
+        }
+    }
+}
+
+/// The emitted digest is the one the drift classifier compares a stamp
+/// against — not merely *a* hash of *something*. Pinned against the value
+/// `src/pack.rs`'s block-extraction guard already holds for `intake`'s `[CR]`,
+/// which is computed from the same canonical block the classifier reads. A
+/// digest that is stable but not this one is a remedy that silently fails.
+#[test]
+fn the_emitted_digest_is_the_one_the_classifier_compares_against() {
+    let json = show_json("intake");
+    let cr = json["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ns| ns["namespace"] == "CR")
+        .expect("intake defines [CR]");
+    assert_eq!(cr["fingerprint"], "79ebf75f5c1a1492");
+}
+
 /// PKJ-002: the serialisation is canonical, so a consumer can pin a digest it
 /// computes itself. Two invocations must be byte-identical, and object keys
 /// must be sorted — a digest over an unstable serialisation fails on

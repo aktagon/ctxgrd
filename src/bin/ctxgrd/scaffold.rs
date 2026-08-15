@@ -33,6 +33,10 @@ pub(super) struct NewDocCmd {
 #[derive(serde::Serialize, Default)]
 pub(super) struct NewJson {
     status: &'static str,
+    /// Omitted for a single-file namespace, which has no id to report
+    /// (BUG-063). Emitting one hands an agent an identifier that appears in
+    /// no document and resolves nowhere.
+    #[serde(skip_serializing_if = "String::is_empty")]
     id: String,
     path: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -74,7 +78,7 @@ impl Command for NewDocCmd {
             let rel = relative_display(&scaffold.target_path, root);
             return Ok(Outcome::Did(NewJson {
                 status: "created",
-                id: scaffold.id.to_string(),
+                id: scaffold.id.as_ref().map(ToString::to_string).unwrap_or_default(),
                 path: rel,
                 ..Default::default()
             }));
@@ -93,7 +97,7 @@ impl Command for NewDocCmd {
             }
             return Ok(Outcome::Noop(NewJson {
                 status: "exists",
-                id: scaffold.id.to_string(),
+                id: scaffold.id.as_ref().map(ToString::to_string).unwrap_or_default(),
                 path: rel,
                 ..Default::default()
             }));
@@ -134,7 +138,7 @@ impl Command for NewDocCmd {
 
         Ok(Outcome::Did(NewJson {
             status: "created",
-            id: scaffold.id.to_string(),
+            id: scaffold.id.as_ref().map(ToString::to_string).unwrap_or_default(),
             path: display_path,
             // AXI-004: the created doc is a stub with placeholders — the honest
             // next steps are to lint it and locate it on the graph.
