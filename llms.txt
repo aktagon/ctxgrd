@@ -1,0 +1,14 @@
+# ctxgrd Documentation Index
+
+> contextguard — a command-line linter for structured markdown records.
+
+## Core Documentation
+- [README.md](../README.md): Main project overview and installation.
+- [docs/namespaces.md](docs/namespaces.md): How ctxgrd identifies documents and namespaces.
+- [docs/rules.md](docs/rules.md): Built-in and external rules.
+- [docs/sources.md](docs/sources.md): External sources and the envelope model.
+- [docs/references.md](docs/references.md): Cross-reference syntax and resolution.
+- [docs/editors.md](docs/editors.md): Editor integration (LSP).
+
+## Editor Plugins
+- [editors/nvim/README.md](../editors/nvim/README.md): Neovim plugin documentation.
