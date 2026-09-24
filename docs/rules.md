@@ -99,6 +99,25 @@ Each line on stdin is a JSON object with two top-level fields:
 }
 ```
 
+A rule receives every document of its namespace, with or without an id
+(ADR-135 § ODC-007). For a path-claimed file that carries no `id:`,
+`context.id` and `context.number` are JSON `null`, and `context.location` is
+the document's address:
+
+```json
+{
+  "path": "/abs/docs/guides/getting-started.md",
+  "context": {
+    "id": null,
+    "namespace": "GUIDE",
+    "number": null,
+    "location": "docs/guides/getting-started.md",
+    "depends_on": [],
+    "metadata": { "title": "Getting started" }
+  }
+}
+```
+
 The `context.metadata` object is the **unified metadata map**: frontmatter
 keys for local files, `extra` fields for source-derived documents, with
 frontmatter winning on conflict. Rules that need metadata read from this

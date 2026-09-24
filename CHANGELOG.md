@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-09-24
+
+### Changed
+
+- One document corpus and one rule dispatch, for documents with and without an id (ADR-135)
+- A single-document namespace is declared by a bound rule, and no longer inferred from `paths` (ADR-136)
+- The port pack checks its parity claims: a commit pin, `original_ref` ancestry, Verification paths and `parity_fixtures` (ADR-138)
+
+### Fixed
+
+- A namespace cannot declare that it is id-less — the property is an accident of which rules it lists, so dropping an unrelated rule silently breaks ingestion (BUG-038)
+- `publish-release.sh` never creates the GitHub Release, so every binary build fails preflight on the first try (BUG-073)
+- The `github` and `gitlab` packs error on the very files they declare id-less and frontmatter-free, and `core.min-docs` then reports the file is absent (BUG-080)
+- A namespace holding both id'd and id-less files skips document-level rules on the id-less ones, and reports nothing (BUG-081)
+
 ## [3.0.0] — 2026-09-18
 
 ### Changed
