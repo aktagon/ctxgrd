@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-09-27
+
+### Changed
+
+- A frontmatter value can be required to be a date or a datetime (ADR-137)
+
 ## [4.0.1] — 2026-09-24
 
 ### Fixed

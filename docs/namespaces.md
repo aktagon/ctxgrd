@@ -191,6 +191,19 @@ given set. Works identically for frontmatter and source `extra` fields:
 status = ["Open", "In Progress", "Closed"]
 ```
 
+**`core.metadata-format`** — each listed key's value must match a format
+word. `date` is `YYYY-MM-DD`. `datetime` is RFC 3339 with a `Z` or
+`±hh:mm` offset. Both reject a day the calendar lacks, such as
+`2026-02-30`. A missing key is skipped, because presence is
+`core.required-metadata`'s job. `severity` is reserved for the rule's own
+severity (default `error`). Any other word is a config error:
+
+```toml
+[HANDOFF."core.metadata-format"]
+claimed_at = "datetime"
+severity = "warning"
+```
+
 ## Multiple namespaces
 
 Each namespace is its own top-level section. They are independent — paths,
@@ -317,6 +330,7 @@ namespace is undeclared there by definition) or under a `--namespace` /
 | `core.required-headings` | Yes           | Required H2 headings are present                              |
 | `core.required-metadata` | Yes           | Required metadata keys are present                            |
 | `core.allowed-values`    | Yes           | Metadata values are in their configured allow-list            |
+| `core.metadata-format`   | Yes           | Metadata values match their format word (`date`, `datetime`)  |
 
 The rules marked "No" need no parameters and can be added to any
 namespace without a sub-table. If you include a parameterized rule but
