@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [4.2.0] — 2026-09-30
+
+### Changed
+
+- Handoffs get their own pack, and required headings can apply by status (ADR-139)
+
+### Fixed
+
+- ctxgrd new files a new document beside a namespace's single-file path when paths mixes a glob and a file (BUG-083)
+
 ## [4.1.0] — 2026-09-27
 
 ### Changed

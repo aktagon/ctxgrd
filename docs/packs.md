@@ -102,8 +102,10 @@ today, so adding a rule, overriding `paths`, customizing a rule's params or
 setting `owner` is not drift, however much of the block you have rewritten
 (ADR-126). Blocks fall into three groups:
 
-- **drift** — the pack moved; the diff (your block and the pack's current shape)
-  is printed for you or an agent to reconcile by hand. Sets exit `1`.
+- **drift** — the pack moved and you edited the block; the diff (your block
+  and the pack's current shape) is printed for you or an agent to reconcile by
+  hand. Sets exit `1`. An unedited block, one that still matches its own
+  stamp, is rewritten by `pack migrate` instead (ADR-139).
 - **no baseline** — the block carries a bare `# pack: <name>` stamp, or none, so
   there is nothing to compare the pack against and the question has no answer.
   Reported by name, never as drift. A block gains a baseline the next time
@@ -152,6 +154,13 @@ parsing text.
   Path-claimed namespaces (AGENTS, SKILLS) fire immediately on adoption;
   id-claimed ones (SPEC, TASK, PROMPT) activate when you create a document.
   `pack add agents` prints a receipt that shows this split.
+- `handoff` — session handoffs (ADR-139). One path-claimed namespace,
+  `HANDOFF` (`docs/handoffs/**`), for the prompt one session writes for the
+  next. `core.required-headings` binds `statuses = ["pending", "in_progress"]`,
+  so a consumed handoff is not held to the template. It also binds
+  `code_in = ["Verification"]`, so an open handoff must give a command to run.
+  `core.file-budget` warns above 20,000 characters. The `workflow` pack
+  declares `# depends: handoff`, so `pack add workflow` adds `HANDOFF` too.
 - `guide` — end-user documentation (ADR-055). One path-claimed namespace,
   `GUIDE` (`docs/guides/**`), for the docs a *user* reads. Guides are id-less —
   the filename is the slug — and typed by the Diátaxis taxonomy via the
