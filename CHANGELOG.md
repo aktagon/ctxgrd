@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.0.0] — 2026-09-30
+
+### Fixed
+
+- A document emitted by a `[sources.*]` script is now parsed as markdown when the envelope carries no `ast`. Before, `core.required-headings`, `core.cross-ref`, `core.link-resolved` and every other rule that reads the body found nothing to check on such a document and reported it clean, with no `cfg.rule-inert`. BREAKING — a source-fed document with a missing heading, a dangling id or a broken link now reports where it previously passed (BUG-085)
+
 ## [4.2.0] — 2026-09-30
 
 ### Changed

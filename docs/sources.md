@@ -110,6 +110,10 @@ Each line of stdout must be a JSON object:
 }
 ```
 
+ctxgrd parses `body` as markdown, as it parses a local file, so heading, link and
+cross-reference rules apply to it. A relative link resolves only when `location`
+names a file under the lint root.
+
 ## The `extra` map and unified metadata
 
 The `extra` object flows into the same unified metadata map as frontmatter.
