@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.1.0] — 2026-09-30
+
+### Changed
+
+- New rule `core.supersedes-reciprocal` at warning. A record lists what it replaces in a new `supersedes` key. When that record is `accepted`, each record it names must be `superseded`, with `superseded_by` naming it back. Bound on the `project-docs` `[ADR]` and `[PRD]` blocks; run `pack migrate` to adopt it (ADR-142)
+
 ## [5.0.0] — 2026-09-30
 
 ### Fixed
