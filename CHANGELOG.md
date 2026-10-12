@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.3.0] — 2026-10-12
+
+### Changed
+
+- The `project-docs` `[ROADMAP]` block binds `core.dep-status` at warning. An initiative at `now` or `done` warns when a ROADMAP item it depends on is not `done`, or a BUG it depends on is not `fixed`. Run `pack migrate` to adopt it (ADR-143)
+- The `arc42` pack is built in. `ctxgrd pack add arc42` works with only the binary, and `pack list --paid` no longer lists it (ADR-144)
+- `project-docs` warns when a draft PRD cites no ROADMAP item, when a draft ADR cites neither a PRD nor a ROADMAP item, and when a project has no ADR. `core.dep-shape` gains `requires-any`, `statuses`, `admissibility` and `severity`. Run `pack migrate` to adopt the bindings (ADR-145)
+
+### Fixed
+
+- A pack folder that is a symbolic link, such as a skill's pack linked into `~/.ctxgrd/packs`, is discovered by `pack list` and `pack add` (BUG-090)
+
 ## [5.1.0] — 2026-09-30
 
 ### Changed
