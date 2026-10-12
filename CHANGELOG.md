@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.4.0] — 2026-10-12
+
+### Changed
+
+- New rule `core.regression-status` maps each status to what its regression test must do. `project-docs` binds it on `[BUG]` and `security` on `[VULN]`. Run `pack migrate` to adopt the bindings (ADR-146)
+
 ## [5.3.0] — 2026-10-12
 
 ### Changed
