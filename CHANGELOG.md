@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.9.0] — 2026-10-14
+
+### Changed
+
+- `pack` commands and `init` print a warning on stderr when a folder in `~/.ctxgrd/packs` has the name of a built-in pack and so hides it (ADR-147)
+- `pack install <path|git-url>[@ref]` copies a pack into `~/.ctxgrd/packs/<name>` and records its source and version; `pack outdated` lists each installed pack and says whether its source has moved (ADR-148)
+- `init --domain <name>` applies every discovered pack whose `pack.toml` declares `# domain: <name>`; `software`, the default, keeps today's `init` (ADR-149)
+- `hooks codex` and `hooks gemini` print the turn-end hook for Codex (`Stop` in `hooks.json`) and Gemini CLI (`AfterAgent` in `settings.json`) and report where it is already wired (ADR-150)
+- `core.requirement-status` checks that each `### <ID>` requirement declares a `Status:` mapped to what its test must do, and `list --format json` carries each bound document's `requirements` (ADR-151)
+
 ## [5.4.0] — 2026-10-12
 
 ### Changed
