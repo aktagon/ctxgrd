@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.11.0] — 2026-10-19
+
+### Changed
+
+- `harness export <harness>` writes a local plugin for Claude Code, Codex, Gemini CLI or Antigravity: a ctxgrd skill, the turn-end hook and, with `--domain`, that domain's packs; `lint --harness antigravity` finds the project from the payload's `workspacePaths` (ADR-152)
+- A source may print `{"warning": …}` to report a warning (`src.warning`), and `status` prints source messages on stderr; an example GitHub-issue source lets an ADR wait on an issue until it closes (ADR-153)
+
 ## [5.9.0] — 2026-10-14
 
 ### Changed

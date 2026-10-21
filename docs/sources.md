@@ -82,7 +82,8 @@ sources/jira-stub/run
 
 | Output        | Description                                                      |
 | ------------- | ---------------------------------------------------------------- |
-| stdout        | JSONL document envelopes, one per line (see below).              |
+| stdout        | JSONL document envelopes, one per line (see below), and optional |
+|               | warning lines.                                                   |
 | stderr        | Ignored by ctxgrd; use for debug output during development.      |
 | exit 0        | Ran cleanly. Envelopes on stdout are processed.                  |
 | exit non-zero | Runtime error. ctxgrd emits a `src.runtime-error` diagnostic but |
@@ -108,6 +109,15 @@ Each line of stdout must be a JSON object:
   "location": "https://jira.example.com/browse/JIRA-100",
   "extra": { "project": "AUDIT", "status": "Open", "assignee": "alice" }
 }
+```
+
+A line that is a JSON object with a string `warning` field and no `id` is a
+warning, not a document. ctxgrd reports it as `src.warning`, naming the
+source, and it never changes the exit code. A source that must fail exits
+non-zero instead.
+
+```json
+{"warning": "the cache is older than 24 hours; refresh it"}
 ```
 
 ctxgrd parses `body` as markdown, as it parses a local file, so heading, link and
@@ -182,6 +192,115 @@ curl -s --user "$JIRA_USER:$JIRA_TOKEN" \
 The wire contract is identical — only the data origin changes. Store
 credentials in the environment and load them from the shell (never hardcode
 them in the script or `ctxgrd.toml`).
+
+## GitHub issues
+
+`examples/sources/github-issues/run` lets a document wait on a GitHub issue.
+ctxgrd runs every source on every `lint`, `status` and turn-end hook, so this
+script reads only a cache file. You write the cache with `--refresh`, which
+calls `gh issue list`. ctxgrd never passes arguments to a source, so no lint
+can call `gh` (ADR-153).
+
+1. Copy the script below to `sources/github-issues/run` and make it
+   executable. Add `.ctxgrd/cache/` to `.gitignore`.
+2. Configure the source, a namespace for the issues, and what settles an
+   edge into it:
+
+   ```toml
+   [sources.github-issues]
+   # repo = "acme/app"     # default: the repository gh finds from the cwd
+   # max_age_hours = 24    # warn when the cache is older
+   # expect_min = 0        # if the repository may have no issues
+
+   [GH]
+   rules = ["core.id"]
+
+   [ADR."core.dep-status"]
+   terminal = ["accepted", "superseded"]
+   satisfied-by = { GH = ["closed"] }
+   ```
+
+3. Run `sources/github-issues/run --refresh` from the project root whenever
+   you want current issue state.
+
+An ADR then lists `GH-7` in `depends_on`. `status` reports it blocked by
+`GH-7` until a refresh records the issue as `closed`, and `core.dep-status`
+reports an `accepted` ADR that rests on an open issue.
+
+With no cache the source exits non-zero, so `lint` reports
+`src.runtime-error` and is never clean. With a cache older than
+`max_age_hours`, `lint` and `status` print a `src.warning` that names the
+refresh command. The turn-end hook stays silent on warnings, as it does for
+every warning.
+
+```sh
+#!/bin/sh
+# GitHub-issue source for ctxgrd (ADR-153). Copy this folder to
+# sources/github-issues/ in your project and activate it with a
+# [sources.github-issues] table in ctxgrd.toml.
+#
+#   run            print the cached issues as document envelopes; no network
+#   run --refresh  call `gh issue list` and rewrite the cache
+#
+# ctxgrd runs a source with no arguments, so lint, status and the turn-end
+# hook only ever read the cache. Only you run --refresh.
+#
+# Parameters, from [sources.github-issues]:
+#   namespace      id prefix, default "GH" (GH-123)
+#   cache          cache file relative to the project root,
+#                  default ".ctxgrd/cache/github-issues.jsonl"
+#   max_age_hours  warn when the cache is older than this, default 24
+#   repo           OWNER/NAME, default: the repository gh finds from the cwd
+#   limit          most issues to fetch, default 1000
+#
+# --refresh reads the same parameters from CTXGRD_SOURCE_PARAMS when it is
+# set, and uses the defaults when it is not.
+set -eu
+
+params=${CTXGRD_SOURCE_PARAMS:-'{}'}
+
+# The value of the flat string or number key $1 in $params, or $2.
+param() {
+	v=$(printf '%s' "$params" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p")
+	printf '%s' "${v:-$2}"
+}
+
+namespace=$(param namespace GH)
+cache=$(param cache .ctxgrd/cache/github-issues.jsonl)
+max_age_hours=$(param max_age_hours 24)
+repo=$(param repo '')
+limit=$(param limit 1000)
+refresh='sources/github-issues/run --refresh'
+
+if [ "${1:-}" = "--refresh" ]; then
+	envelope='.[] | {id: ("'"$namespace"'-" + (.number|tostring)), body: ("# " + .title + "\n"), location: .url, depends_on: [], extra: {title: .title, status: (.state|ascii_downcase)}}'
+	set -- issue list --state all --limit "$limit" --json number,title,state,url --jq "$envelope"
+	if [ -n "$repo" ]; then
+		set -- "$@" --repo "$repo"
+	fi
+	mkdir -p "$(dirname "$cache")"
+	tmp="$cache.tmp.$$"
+	if gh "$@" >"$tmp"; then
+		mv "$tmp" "$cache"
+		echo "github-issues: wrote $(wc -l <"$cache" | tr -d ' ') issues to $cache" >&2
+	else
+		rm -f "$tmp"
+		echo "github-issues: gh failed; $cache was left as it was" >&2
+		exit 1
+	fi
+	exit 0
+fi
+
+if [ ! -f "$cache" ]; then
+	echo "github-issues: no cache at $cache; run \`$refresh\` first" >&2
+	exit 1
+fi
+if [ -n "$(find "$cache" -mmin +"$((max_age_hours * 60))" 2>/dev/null)" ]; then
+	printf '{"warning":"%s is older than %s hours; refresh it with `%s`"}\n' \
+		"$cache" "$max_age_hours" "$refresh"
+fi
+cat "$cache"
+```
 
 ## Development tips
 
