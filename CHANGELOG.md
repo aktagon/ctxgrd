@@ -6,7 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [5.11.0] — 2026-10-19
+## [5.11.1] — 2026-10-22
+
+### Fixed
+
+- The example GitHub-issue source records an issue closed as not planned with status `not-planned`, so an ADR waiting on it stays blocked instead of becoming ready (BUG-091)
+
+## [5.11.0] — 2026-10-21
 
 ### Changed
 

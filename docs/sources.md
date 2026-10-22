@@ -225,7 +225,8 @@ can call `gh` (ADR-153).
 
 An ADR then lists `GH-7` in `depends_on`. `status` reports it blocked by
 `GH-7` until a refresh records the issue as `closed`, and `core.dep-status`
-reports an `accepted` ADR that rests on an open issue.
+reports an `accepted` ADR that rests on an open issue. An issue closed as
+not planned gets status `not-planned` instead, so the ADR stays blocked.
 
 With no cache the source exits non-zero, so `lint` reports
 `src.runtime-error` and is never clean. With a cache older than
@@ -273,8 +274,11 @@ limit=$(param limit 1000)
 refresh='sources/github-issues/run --refresh'
 
 if [ "${1:-}" = "--refresh" ]; then
-	envelope='.[] | {id: ("'"$namespace"'-" + (.number|tostring)), body: ("# " + .title + "\n"), location: .url, depends_on: [], extra: {title: .title, status: (.state|ascii_downcase)}}'
-	set -- issue list --state all --limit "$limit" --json number,title,state,url --jq "$envelope"
+	# An issue closed as not planned gets status "not-planned", which no
+	# satisfied-by list names, so whatever waits on it stays blocked.
+	status='if .stateReason == "NOT_PLANNED" then "not-planned" else (.state|ascii_downcase) end'
+	envelope='.[] | {id: ("'"$namespace"'-" + (.number|tostring)), body: ("# " + .title + "\n"), location: .url, depends_on: [], extra: {title: .title, status: ('"$status"')}}'
+	set -- issue list --state all --limit "$limit" --json number,title,state,stateReason,url --jq "$envelope"
 	if [ -n "$repo" ]; then
 		set -- "$@" --repo "$repo"
 	fi
