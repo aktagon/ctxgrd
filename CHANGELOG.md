@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.13.0] — 2026-10-26
+
+### Changed
+
+- `ctxgrd claim <ID>` takes an atomic claim on a document, `ctxgrd release <ID> --status <value>` gives it up, and `ctxgrd status` lists claimed and abandoned documents apart from ready ones. New rules `core.claim-complete` and `core.claim-stale`, bound by the `handoff` pack on `[HANDOFF]`; run `pack migrate` to adopt them (ADR-154)
+
+### Fixed
+
+- `core.commit-freshness` warns instead of erroring when the pinned document has uncommitted changes of its own alongside its changed scoped code, so the pre-commit hook no longer refuses the commit that makes `pin --bless` reachable; scoped code changed **without** the document stays an error. BREAKING — `pin --bless --force` no longer overrides the dirty-scope refusal and exits non-zero where it printed `blessed` and exited 0, because blessing HEAD while a scoped path is dirty always wrote a pin that the next lint rejected (BUG-092)
+
 ## [5.11.1] — 2026-10-22
 
 ### Fixed
