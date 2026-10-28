@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [5.14.0] — 2026-10-28
+
+### Fixed
+
+- The governance pack's `[DEC]` block now explains, in a comment that `pack add` writes into `ctxgrd.toml`, that a PRD or ADR depending on a DEC needs `satisfied-by = { DEC = ["approved"] }` on its own `core.dep-status` binding. `approved` is not in the default terminal list, so without it an accepted PRD on an approved decision fails (BUG-094)
+
 ## [5.13.0] — 2026-10-26
 
 ### Changed
