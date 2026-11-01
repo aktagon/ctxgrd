@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [6.1.0] — 2026-11-01
+
+### Changed
+
+- `ctxgrd pack migrate` now adds the pack's `summary` line to every namespace block that lacks one, including blocks you edited, and changes nothing else in the block. It lists the namespaces no pack defines, whose summary you write yourself. `pack outdated` reports a summary migrate would add (ADR-157)
+- `ctxgrd lint --harness <name>` no longer skips an unchanged tree, so the turn-end hook no longer prints `ctxgrd: skipped: unchanged since clean run` after every quiet turn. A clean harness run still records the tree, so the pre-commit run that follows skips as before (grd ADR-010 § GRD-073) (ADR-158)
+
 ## [6.0.0] — 2026-11-01
 
 ### Changed
