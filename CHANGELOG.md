@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [6.0.0] — 2026-11-01
+
+### Changed
+
+- `ctxgrd namespaces` lists each declared namespace with its paths, owner, `summary` and document count, as a table or `--format json`, and `--for <path>` names the namespace that claims a file. Every namespace block must now carry a one-line `summary`; a block without one is the error `cfg.namespace-undescribed`. Run `ctxgrd pack migrate` to take the summaries every shipped pack now carries, and add `summary = "<when to write one>"` to each block you wrote by hand (ADR-156)
+
 ## [5.14.0] — 2026-10-28
 
 ### Fixed

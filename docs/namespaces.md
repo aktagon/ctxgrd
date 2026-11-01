@@ -240,10 +240,30 @@ once.
 
 ## Coverage: who owns a namespace, and which ones you forgot
 
-Two always-on checks report what is *missing* from the config rather than
-what a document gets wrong. Both are warnings — they never change the exit
-code — and neither is listed in `[<NS>].rules`; they run on every unscoped
-lint.
+Three always-on checks report what is *missing* from the config rather than
+what a document gets wrong. None is listed in `[<NS>].rules`; they run on every
+unscoped lint. `cfg.namespace-unowned` and `cfg.namespace-undeclared` are
+warnings and never change the exit code. `cfg.namespace-undescribed` is an
+error.
+
+**`cfg.namespace-undescribed`** — every declared namespace must say when to
+write one of its documents (ADR-156):
+
+```toml
+[ADR]
+summary = "you make an architecture or technical decision; use RFC to propose one for review first"
+owner = "developer"
+paths = ["docs/adrs/**"]
+rules = ["core.frontmatter", "core.id"]
+```
+
+`summary` is one line of at most 100 characters. `ctxgrd namespaces` prints it
+beside the namespace's paths and owner, so an agent can pick the document type
+before it writes one. Every shipped pack carries a summary on each namespace.
+A block that `pack add` wrote gets it from `ctxgrd pack migrate`; a block you
+wrote by hand needs the line added. The check covers every declared namespace,
+including one that holds no document yet: the summary is what tells an agent
+to write the first one.
 
 **`cfg.namespace-unowned`** — every namespace that actually holds documents
 should name the role accountable for writing them:
@@ -311,7 +331,7 @@ ok: 213 documents · 116 rules · 0 diagnostics · 1 namespace undeclared
 The human line shows the field only when the count is nonzero; the JSON key
 is always present, so tooling can read it without probing for absence.
 
-Neither check fires in zero-config mode (no `ctxgrd.toml` at all — every
+None of the three checks fires in zero-config mode (no `ctxgrd.toml` at all — every
 namespace is undeclared there by definition) or under a `--namespace` /
 `--pack` scope (a scoped run reports one slice, not the whole config).
 
