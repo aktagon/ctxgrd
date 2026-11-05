@@ -264,6 +264,10 @@ packs/team-docs/rules/team/freshness/run  →  bundled rule code: team.freshness
 A `# summary:` comment on the first line of `pack.toml` is shown in
 `pack list`.
 
+A pack can declare a `[<NS>.briefing]` table to state what a session should
+know about its documents (ADR-159; see `ctxgrd docs namespaces`). `pack migrate`
+leaves an edited block alone, so `ctxgrd briefing` prints the table to paste.
+
 ## Discovery
 
 `pack list` and `pack show` discover packs from three sources, in order:

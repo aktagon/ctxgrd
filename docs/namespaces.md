@@ -335,6 +335,27 @@ None of the three checks fires in zero-config mode (no `ctxgrd.toml` at all — 
 namespace is undeclared there by definition) or under a `--namespace` /
 `--pack` scope (a scoped run reports one slice, not the whole config).
 
+## Briefing: what a session should know
+
+A `[<NS>.briefing]` table declares what `ctxgrd briefing` reports for a
+namespace (ADR-159). A namespace with no table reports nothing.
+
+```toml
+[ROADMAP.briefing]
+statuses = ["now", "next", "later"]   # list these documents, in this order
+counts = ["done"]                     # report these as a number
+
+[HANDOFF.briefing]
+statuses = ["pending", "in_progress"]
+findings = ["core.claim-stale"]       # list this rule's findings
+```
+
+A status outside `core.allowed-values`, a finding the namespace does not bind,
+and an unknown key each report `cfg.briefing-invalid`. The problem drops only
+that entry, and `ctxgrd lint` fails until it is fixed. To report something
+specific to your documents, write a rule and list its code under `findings`.
+`status` rows need an id, so an id-less document appears only through a finding.
+
 ## Core rules reference
 
 | Rule code                | Parameterized | What it checks                                                |

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [6.2.0] — 2026-11-05
+
+### Changed
+
+- New `ctxgrd briefing` command: a namespace declares in `[<NS>.briefing]` which statuses, counts and rule findings a session should know, and `--harness claude` emits them as SessionStart context. The `project-docs` and `handoff` packs declare ROADMAP and HANDOFF briefings (ADR-159)
+
 ## [6.1.0] — 2026-11-01
 
 ### Changed
