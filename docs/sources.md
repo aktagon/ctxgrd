@@ -99,6 +99,7 @@ Each line of stdout must be a JSON object:
 | `body`       | string          | Yes      | Document body (markdown, no frontmatter fence needed) |
 | `location`   | string          | Yes      | Canonical URL or path for diagnostics and display     |
 | `depends_on` | array of string | No       | IDs this document depends on (defaults to `[]`)       |
+| `part_of`    | array of string | No       | IDs of the containers this document is part of, such as a ROADMAP item; never blocks (defaults to `[]`, ADR-161) |
 | `extra`      | object          | No       | Arbitrary key/value metadata (defaults to `{}`)       |
 
 ```json

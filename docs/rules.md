@@ -90,6 +90,7 @@ Each line on stdin is a JSON object with two top-level fields:
     "number": 1,
     "location": "adrs/001-use-event-sourcing-for-audit.md",
     "depends_on": ["PRD-001"],
+    "part_of": [],
     "metadata": {
       "id": "ADR-001",
       "title": "Use event sourcing for the audit trail",
@@ -113,6 +114,7 @@ the document's address:
     "number": null,
     "location": "docs/guides/getting-started.md",
     "depends_on": [],
+    "part_of": [],
     "metadata": { "title": "Getting started" }
   }
 }

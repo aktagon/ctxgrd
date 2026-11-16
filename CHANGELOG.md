@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [6.4.1] — 2026-11-16
+
+### Fixed
+
+- A `.claim.lock` directory that a parallel `ctxgrd claim` removes during the walk no longer fails `lint`, `status` or `claim` with exit 2. The walker skips an entry below the root that is gone by the time it opens it; a missing `--root` still fails. The `[references]` scanner no longer counts such an entry as a walker error, so `lint` no longer prints a false `ref.scan-error` warning (BUG-099)
+
+## [6.4.0] — 2026-11-15
+
+### Changed
+
+- A document now links to the roadmap item it is part of with a new `part_of` frontmatter field, which never blocks. `depends_on` keeps meaning "waits for". The `project-docs` pack declares `[ROADMAP] linked-by = "part_of"`, so an accepted ADR or PRD that is part of a `now` item lints clean, and drops the PRD-only `satisfied-by` setting from 6.3.0. `core.dep-status` warns on a `depends_on` link that belongs in `part_of` and names the move; `core.dep-resolved` rejects a `part_of` link into a namespace that takes none. `part_of` appears in the source envelope, the rule context, and `list` and `status` JSON (BUG-098) (ADR-161)
+
+### Fixed
+
+- `ctxgrd rules core.acceptance-complete` no longer says an open item under `Open Questions` never fires. It now says the rule scans the headings in `headings`, and that the `project-docs` pack binds `[ADR]` to `Open Questions` (BUG-097)
+- An accepted ADR or PRD no longer fails `core.dep-status` on the `now` roadmap item it is part of, once its link moves from `depends_on` to the new `part_of` field. The finding on an old link now says to move it, instead of suggesting the roadmap item be marked done (BUG-098)
+
+## [6.3.0] — 2026-11-14
+
+### Changed
+
+- `status` now decides whether a dependency blocks with the same test `core.dep-status` uses: the depending namespace's `terminal` and `satisfied-by` settings, where it binds the rule. A target with no `status` no longer blocks, and a document with no `status` is reported as `untracked` instead of `ready`. Each `status --format json` row gains a `state` field naming its group in the header's words. The `project-docs` pack lets a PRD rest on a `now`, `next` or `done` ROADMAP item (BUG-096) (ADR-160)
+
+### Fixed
+
+- `status` and `lint` disagree on when a dependency is satisfied, so `status` reports false blocks (BUG-096)
+
 ## [6.2.0] — 2026-11-05
 
 ### Changed
