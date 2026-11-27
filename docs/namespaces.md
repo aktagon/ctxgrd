@@ -288,6 +288,14 @@ list, because a built-in one would go stale and over-fire. Omit the table and
 `owner` is declare-only: any string is accepted, and only a *missing* `owner`
 is reported. Declare it and a value outside the list is reported too.
 
+This namespace-level `owner` is unrelated to an `owner` frontmatter key. Nine
+packs, among them `project-docs` for ROADMAP and the compliance packs, list
+`owner` under `core.required-metadata`. That `owner` is a key each document
+must carry: the person accountable for that record. No pack sets the
+namespace-level `owner`, so adding a pack does not clear
+`cfg.namespace-unowned`. Write `owner = "<role>"` in the namespace block
+yourself.
+
 A namespace the config declares but no document claims is not reported —
 an unused shelf is not a coverage gap.
 

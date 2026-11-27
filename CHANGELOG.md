@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [6.6.0] — 2026-11-27
+
+### Changed
+
+- `[references].foreign` lists other repos. A cross-reference written `<repo>:<ID>` with a listed repo is not looked up in this run, in markdown or in scanned files, so a handoff can name another repo's ids. The `handoff` pack now binds `core.cross-ref` on `[HANDOFF]` (ADR-141)
+- New built-in `feature-map` pack. Its `FEATURE` namespace claims one file per user-facing feature under `docs/features/**`, requires the headings Reach, Sub-features, Drive, Gotchas and Behaviours, and binds `core.requirement-status`, so each `### FMP-NNN` behaviour declares a status. A repo with the pack and no feature file gets a `core.min-docs` warning (ADR-162)
+- A build log records progress and names its SPEC (ADR-166)
+
+### Fixed
+
+- The `pack add` receipt no longer says path-claimed files already exist, and it suggests `ctxgrd new` only for a namespace the pack added (BUG-003)
+- A signal that interrupts a directory read during the markdown walk no longer aborts the lint run: the walk restarts, up to three times (BUG-016)
+- `pack show` summaries for the `github`, `gitlab`, `intake`, `feature-map`, `governance` and `qa` packs no longer end with an internal decision id such as `ADR-077`, which a reader outside this repo cannot follow (BUG-019)
+- `make check` now runs clippy on test code too (`--all-targets`), so a lint in a test fails the check. It checked only the library (BUG-033)
+- `lint --recursive` names the `--root` directory itself `.` in its `== … ==` header and in the JSON `root` field, instead of an empty string (BUG-053)
+- `lint --format json` gives each diagnostic an `absolute_path` key, the lint root joined with `file`, so an editor or agent in a subdirectory can open the file without joining the two itself; `file` is unchanged (BUG-056)
+- `docs/namespaces.md` says the namespace-level `owner` is unrelated to the `owner` frontmatter key nine packs require, and that no pack supplies it (BUG-070)
+- `pack migrate` keeps a CRLF `ctxgrd.toml` CRLF, rewritten blocks included, and no longer adds a final newline the file did not have (BUG-072)
+- `make release-status` now reports a `binaries` channel: the public release's assets counted against the four platform archives and `checksums.txt`, and it fails the run when any is missing (BUG-074)
+- A rule bound on a namespace that claims a file by path and by id reports each finding once. It reported it twice (BUG-076)
+- `core.successor-link` and `core.supersedes-reciprocal` accept a `superseded_by` list, so a record two records replace can name both (BUG-086)
+- `core.link-resolved` no longer reports existing link targets as missing when `--root` is a relative path (BUG-089)
+- A `core.requires-link` target that is a folder now gets a `cfg.requires-link-folder` warning naming the namespace and target. The rule checks only file targets, so such a binding never fired, and ctxgrd said nothing (BUG-095)
+- `init` and `new` now suggest `ctxgrd lint` as the next step. They suggested `ctxgrd check`, which is not a command (BUG-100)
+- `new --format json` now reports the id exactly as it writes it into the file (`ADR-001`), not the unpadded form (`ADR-1`) (BUG-101)
+- The `pin --bless` refusal on uncommitted scoped changes no longer tells you to pass `--force`, which has overridden nothing since BUG-092 (BUG-102)
+- The `briefing` hint now lists only statuses the namespace's `core.allowed-values` allows, so pasting it no longer causes `cfg.briefing-invalid` (BUG-103)
+
 ## [6.4.1] — 2026-11-16
 
 ### Fixed

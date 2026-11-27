@@ -91,6 +91,27 @@ const FOO: &str = "ADR-9999"; // ctxgrd: ignore-line
 const supersededTopic = "ADR-9999"
 ```
 
+## Ids from another repo
+
+A document or scanned file often names an id that lives in another repo, such
+as a sibling project's change request. Declare that repo's name and write the
+id with it as a prefix:
+
+```toml
+[references]
+foreign = ["wrkgrd"]
+```
+
+```markdown
+Implement wrkgrd:CR-017 before this change.
+```
+
+`core.cross-ref` does not look up `wrkgrd:CR-017` in this repo, in markdown
+bodies or in scanned files. A name that is not declared is checked like any
+other token, so a misspelt `wrkgdr:CR-017` still reports. A name starts with a
+lowercase letter, then lowercase letters, digits, `.`, `-` or `_`. Anything
+else in `foreign` is a `cfg.references-invalid` error.
+
 ## Namespace-prefix filter
 
 ctxgrd only checks tokens whose namespace prefix is _known_: either
